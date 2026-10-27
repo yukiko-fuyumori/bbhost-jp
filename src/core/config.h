@@ -125,6 +125,8 @@ struct GameFolders {
     std::string base, update;
 };
 GameFolders config_game_folders(const std::string& app0);
+// Enforced by startup and setup, independently of plugins or config overrides.
+std::string config_game_edition_error(const std::string& app0);
 // The game's version, from sce_sys/param.sfo (the update folder's when it has
 // one): APP_VER ("01.09") and CATEGORY ("gp" the game with an update, "gd"
 // without); both empty when the file cannot be read. `update` is the update

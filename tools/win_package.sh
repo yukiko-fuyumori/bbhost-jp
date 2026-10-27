@@ -21,7 +21,8 @@ fi
 if [ -n "$(git -c core.excludesFile=/dev/null status --porcelain --untracked-files=no 2>/dev/null)" ]; then
     rev="$rev+"
 fi
-name=bbhost-win-$rev
+[ "$(cat "$(dirname "$exe")/bbhost-edition.txt")" = jp-only ] || { echo "Windows must be Japanese-only" >&2; exit 1; }
+name=bbhost-win-jp-only-$rev
 dir=$out/$name
 rm -rf "$dir"
 mkdir -p "$dir/data" "$dir/build"
@@ -50,7 +51,7 @@ fi
 sed -e 's#^app0 = .*#app0 = "C:/Games/CUSA03014"#' \
     -e 's#^eboot = .*#eboot = "./eboot-109-decrypted.bin"#' \
     -e 's#^skip_intro = false#skip_intro = true#' bbhost.example.toml > "$dir/bbhost.example.toml"
-tools/package_japanese.sh "$dir"
+tools/package_japanese.sh "$dir" "$(dirname "$exe")"
 cp docs/japanese-release.md "$dir/README.txt"
 
 # The launcher that keeps a log (tools/win/run-bbhost.bat); CRLF for cmd and

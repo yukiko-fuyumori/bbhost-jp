@@ -12,12 +12,15 @@ mkdir -p "$out"
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 (cd "$work" && tar xzf "$lin_tgz")
 ldir=$(ls -d "$work"/bbhost-linux-* | head -1)
+[ "$(cat "$ldir/edition.txt")" = jp-only ] || { echo "Steam Deck releases must use the Japanese-only build" >&2; exit 1; }
 name=$(basename "$ldir" | sed 's/^bbhost-linux-/bbhost-steamdeck-/')
 cp "$sd/bbhost-steamdeck.toml" "$sd/STEAMDECK.md" "$ldir/"
 sed -i 's/^cfg=\${BBHOST_CONFIG:-bbhost.toml}/cfg=${BBHOST_CONFIG:-bbhost-steamdeck.toml}/' "$ldir/run-bbhost.sh"
 grep -q 'bbhost-steamdeck.toml' "$ldir/run-bbhost.sh" || { echo "run-bbhost.sh: config line not found"; exit 1; }
-sed -i 's/^  bbhost.example.toml lists every setting./  bbhost.example.toml lists every setting; STEAMDECK.md has the Steam Deck steps./' "$ldir/README-linux.txt"
-grep -q 'STEAMDECK.md' "$ldir/README-linux.txt" || { echo "README-linux.txt: settings line not found"; exit 1; }
+cat >> "$ldir/README-linux.txt" <<'EOF'
+
+Steam Deck の起動設定は bbhost-steamdeck.toml、操作手順は STEAMDECK.md を参照してください。
+EOF
 find "$ldir" -type d -exec chmod 755 {} + && find "$ldir" -type f -exec chmod 644 {} +
 chmod 755 "$ldir/bbhost" "$ldir/run-bbhost.sh"
 mv "$ldir" "$work/$name"

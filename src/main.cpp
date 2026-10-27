@@ -3,6 +3,7 @@
 #include "decomp/decomp.h"
 #include "engine/mouse_camera.h"
 #include "core/config.h"
+#include "bbhost_edition.h"
 #include "core/host_clock.h"
 #include "core/portable.h"
 #include "core/thunk.h"
@@ -931,6 +932,7 @@ int main(int argc, char** argv) {
 #else
     const bool compile_session = false;
 #endif
+    host_log("BBHOST_EDITION_PROFILE=" BBHOST_EDITION_PROFILE);
     HostConfig cfg;
     std::string err;
     if (!config_load(argc, argv, &cfg, &err)) {
@@ -1046,16 +1048,12 @@ int main(int argc, char** argv) {
     // Only the 1.09 build runs: every patch, hook and engine layout is an
     // address in it, and another version fails far from the cause. A tester's
     // eboot of another version (2026-09-29) died before its first frame, on a
-    // path pointer of 0xffffffff in the file layer. BBHOST_ANY_EBOOT=1 starts one
-    // anyway, without the patches.
+    // path pointer of 0xffffffff in the file layer. Edition-restricted builds
+    // also require this exact executable; there is no environment override.
     if (image.sha256 != kEboot109Sha256) {
-        const char* any = std::getenv("BBHOST_ANY_EBOOT");
-        if (!(any && any[0] == '1')) {
-            std::fputs(config_eboot_help(cfg, image.sha256, kEboot109Sha256).c_str(), stderr);
-            std::fflush(stderr);
-            return 3;
-        }
-        host_log("BBHOST_ANY_EBOOT=1: starting an eboot that is not 1.09");
+        std::fputs(config_eboot_help(cfg, image.sha256, kEboot109Sha256).c_str(), stderr);
+        std::fflush(stderr);
+        return 3;
     }
     sampler_start(image.mem.slide, image.mem.slide + image.mem.size);  // BBHOST_SAMPLE
     perf_meter_start(image.mem.slide, image.mem.slide + image.mem.size, image.sha256 == kEboot109Sha256);  // which stage limits

@@ -89,7 +89,7 @@ every shader in the game's shader bundles.
 
 | Target or script | Produces |
 |---|---|
-| `cmake --build build-win --target package-win` | `build/win/bbhost-win-<rev>.zip`, and the unstripped `.debug.exe` for symbolising crash reports |
+| `cmake --build build-win --target package-win` | `build/win/bbhost-win-jp-only-<rev>.zip`, and the unstripped `.debug.exe` for symbolising crash reports |
 | `tools/package_linux.sh <bbhost> <outdir>` | a Linux tarball (built with `tools/linux_portable_build.sh` for a portable binary) |
 | `tools/package_steamdeck.sh` | the Linux package with the Steam Deck's settings |
 | `tools/package_plugins.sh` | the official plugins with their signatures |

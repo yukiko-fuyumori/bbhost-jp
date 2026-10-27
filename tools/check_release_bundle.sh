@@ -8,7 +8,8 @@
 # publish job runs it on what it is about to sign.
 #   tools/check_release_bundle.sh DIR     (dist/release)
 set -eu
-d=${1:?usage: tools/check_release_bundle.sh DIR}
+d=${1:?usage: tools/check_release_bundle.sh DIR [--allow-personal-eu]}
+allow_personal=${2:-}
 fail() { echo "release bundle: $*" >&2; exit 1; }
 if ls "$d" | grep -i playtest; then fail "a playtest kit is among the assets"; fi
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
@@ -51,6 +52,19 @@ while IFS= read -r exe; do
     for l in LICENSE.TXT LICENSE-Apache-2.0-LLVM.txt ThirdPartyNotices.txt LICENSE-SPIRV-Tools.txt; do
         [ -f "$b/licenses/dxc/$l" ] || fail "${b#"$work"/}: no licenses/dxc/$l"
     done
+    profile=$(cat "$b/edition.txt") || fail "missing edition profile"
+    case "$profile" in
+        jp-only) ;;
+        eu-personal)
+            [ "$allow_personal" = --allow-personal-eu ] || fail "personal EU build in public release assets"
+            [ "$(basename "$exe")" = bbhost ] || fail "personal EU build must be Linux"
+            ;;
+        *) fail "unknown edition profile: $profile" ;;
+    esac
+    case "$(basename "$b")" in *"-$profile-"*) ;; *) fail "archive name does not identify edition $profile";; esac
+    strings -a "$exe" | grep -qxF "BBHOST_EDITION_PROFILE=$profile" || fail "executable edition mismatch"
+    case "$exe" in *.exe) region_plugin=$b/plugins/region_switch.dll ;; *) region_plugin=$b/plugins/region_switch.so ;; esac
+    strings -a "$region_plugin" | grep -qxF "BBHOST_REGION_PLUGIN_PROFILE=$profile" || fail "plugin edition mismatch"
     # Both platforms retain the complete supplied pack, including the other
     # platform's original binaries, while loading their rebuilt JP plugin.
     pack=$b/compat/jp-eu-v020

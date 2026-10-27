@@ -1,6 +1,14 @@
 # bbhost 日本語版の使い方
 
-bbhost 0.2.21 を基に、日本版 Bloodborne The Old Hunters（CUSA03014）を標準とする、日本語専用の Windows x64 / Linux x86-64 版です。日本版のオンライン動作は利用者により確認済みです（2026年10月27日）。接続先は非公式の The Hunter's Dream サーバーです。
+bbhost 0.2.21 を基に、日本版 Bloodborne The Old Hunters（CUSA03014）専用の、日本語のみの Windows x64 / Linux x86-64 版です。日本版のオンライン動作は利用者により確認済みです（2026年10月27日）。接続先は非公式の The Hunter's Dream サーバーです。
+
+## 対応するゲーム版
+
+通常の Windows / Linux 配布物（`jp-only`）は、元の `sce_sys/param.sfo` が日本版 Old Hunters の `TITLE_ID = CUSA03014`、`USER_DEFINED_PARAM_1 = 0` である場合にのみ起動します。欧州版、北米版、他の日本版、識別情報がない・壊れたデータは拒否します。別フォルダーの更新データにも同じ条件を適用し、版の混在を拒否します。
+
+設定画面では理由を日本語で表示し、プレイとシェーダーの事前コンパイルを無効にします。コマンドライン・ヘッドレス起動でも、プラグインやゲームコードを読み込む前に同じ検査を行います。プラグインを無効にする、入れ替える、設定や環境変数を変える方法では解除できません。`BBHOST_ANY_EBOOT` による実行ファイルのハッシュ検査の回避も無効です。
+
+ゲーム版は原本のメタデータで識別します。全ゲームファイルの真正性を証明するものではありません。個人用の EU GOTY 互換版は別の Linux 実行ファイル・アーカイブ（`eu-personal`）として用意します。
 
 ## 用意するもの
 
@@ -64,7 +72,7 @@ F10 の「パフォーマンス表示」を有効にすると、画面の右上�
 
 原本の説明書には作成時点の「日本版は未検証」という記録が残っています。現在の日本版のオンライン動作は利用者により確認済みです。原本のハッシュを維持するため、当時の記録を改変していません。
 
-欧州 GOTY 版（CUSA03173）を使う場合のみ、ゲームを終了して同梱の `install_plugin.py --edition eu --platform windows|linux --plugins-dir <対象のpluginsフォルダー>` で対応するプラグインに切り替えます。日本版用と欧州版用を同時に読み込ませないでください。古い `jp-eu-online-selectors.toml` は同じパッチと重複するため退避します。
+原本には欧州版用プラグインも含まれていますが、本体の日本版専用制限を解除するものではありません。欧州 GOTY 版（CUSA03173）には、別途作成する個人用 Linux 配布物を使用します。古い `jp-eu-online-selectors.toml` は同じパッチと重複するため退避します。
 
 原本の HTTP インストーラーは特定の旧カスタムソース専用です。この統合版には実行しません。今後の更新に対してハッシュ確認を外して適用しないでください。
 
@@ -100,6 +108,8 @@ cmake --build build-win --target package-win -j4
 ```
 
 Windows には Clang と mingw-w64 が必要です。Linux の配布用ビルドは `tools/linux_portable_build.sh` または Ubuntu 24.04 上の `tools/ci_build.sh` を使用します。通常のローカルビルドは、そのマシンの glibc、SDL3、FFmpeg などに依存します。実際の依存関係は Linux 配布物の `README-linux.txt` 末尾に記載されます。
+
+CMake の既定値は `BBHOST_PERSONAL_EU=OFF`（日本版専用）です。個人用 EU 互換版は Linux でのみ `BBHOST_PERSONAL_EU=ON` を指定して別のビルド先に作成します。ポータブル版では `BBHOST_PERSONAL_EU=ON tools/linux_portable_build.sh` を実行すると `build-linux-portable/build-eu-personal/` に生成します。標準版のビルド先と混在しません。
 
 パッケージ作成は `tools/package_linux.sh <bbhostのパス> <出力先>`、`tools/win_package.sh <bbhost.exeのパス> <出力先>` です。両方とも互換パック全体、プラグイン、日本語説明書、ライセンスを含めます。
 

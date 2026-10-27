@@ -31,6 +31,9 @@
 # ownership (ext4, xfs, btrfs; not NFS, where dpkg's chown fails).
 set -eu
 cd "$(dirname "$0")/.."
+BBHOST_PERSONAL_EU=${BBHOST_PERSONAL_EU:-OFF}
+case "$BBHOST_PERSONAL_EU" in ON|OFF) ;; *) echo "BBHOST_PERSONAL_EU must be ON or OFF" >&2; exit 1;; esac
+export BBHOST_PERSONAL_EU
 SRC=$PWD
 W=$SRC/build-linux-portable
 ROOTFS=${LINUX_ROOTFS:-$W/rootfs}
@@ -79,7 +82,7 @@ if [ "${1:-}" != --inside ]; then
         mount --rbind /sys "$R/sys"
         mkdir -p "$R/src" && mount --bind "$SRC" "$R/src"
         exec chroot "$R" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            HOME=/root DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 BBHOST_GIT_REV="$BBHOST_GIT_REV" PORTABLE_TARGETS="${PORTABLE_TARGETS:-}" \
+            HOME=/root DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 BBHOST_GIT_REV="$BBHOST_GIT_REV" PORTABLE_TARGETS="${PORTABLE_TARGETS:-}" BBHOST_PERSONAL_EU="$BBHOST_PERSONAL_EU" \
             bash /src/tools/linux_portable_build.sh --inside
     ' sh "$ROOTFS" "$SRC"
 fi
@@ -133,11 +136,13 @@ sed -i 's/ -latomic/ -l:libatomic.a/' "$P"/lib/pkgconfig/*.pc
 # bbhost. pkg-config sees only the prefix's ffmpeg; the static archives'
 # private libraries (-lm, -lpthread) come with libstdc++'s.
 export PKG_CONFIG_PATH=$P/lib/pkgconfig
-cmake -S /src -B "$W/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DCMAKE_PREFIX_PATH="$P" -DVulkan_INCLUDE_DIR="$P/include" \
+B=$W/build
+[ "$BBHOST_PERSONAL_EU" = OFF ] || B=$W/build-eu-personal
+cmake -S /src -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DBBHOST_PERSONAL_EU="$BBHOST_PERSONAL_EU" -DCMAKE_PREFIX_PATH="$P" -DVulkan_INCLUDE_DIR="$P/include" \
     -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc -fuse-ld=lld" \
-    -DCMAKE_MODULE_LINKER_FLAGS="-static-libgcc -fuse-ld=lld" > "$W/bbhost-configure.log"
-grep -E "^-- bbhost" "$W/bbhost-configure.log" || true
-cmake --build "$W/build" --target bbhost bb_plugin_region_switch bb_plugin_hello bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_debug_menu ${PORTABLE_TARGETS:-} -j"$(nproc)" > "$W/bbhost-build.log" 2>&1 \
-    || { grep -E "error|undefined" "$W/bbhost-build.log" | head -30; exit 1; }
-echo "portable build: $W/build/bbhost"
+    -DCMAKE_MODULE_LINKER_FLAGS="-static-libgcc -fuse-ld=lld" > "$B-configure.log"
+grep -E "^-- bbhost" "$B-configure.log" || true
+cmake --build "$B" --target bbhost bb_plugin_region_switch bb_plugin_hello bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_debug_menu ${PORTABLE_TARGETS:-} -j"$(nproc)" > "$B-build.log" 2>&1 \
+    || { grep -E "error|undefined" "$B-build.log" | head -30; exit 1; }
+echo "portable build: $B/bbhost"

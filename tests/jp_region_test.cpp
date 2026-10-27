@@ -31,6 +31,15 @@ static bool active() {
 }
 static unsigned char sfo[256];
 static int patches,overlays,allowed=1;
+#if BBHOST_PERSONAL_EU
+static constexpr const char* title="CUSA03173";
+static constexpr const char* other_title="CUSA03014";
+static constexpr unsigned region=13, expected_overlays=1;
+#else
+static constexpr const char* title="CUSA03014";
+static constexpr const char* other_title="CUSA03173";
+static constexpr unsigned region=0, expected_overlays=0;
+#endif
 static char mode[8]="JP";
 static void logger(const char *fmt,...){va_list a;va_start(a,fmt);vprintf(fmt,a);puts("");va_end(a);}
 static const char* config(const char *key){assert(!strcmp(key,"region_switch.region"));return mode;}
@@ -39,7 +48,10 @@ static int is109(void){return 1;}
 static int r(uint64_t a,void *d,size_t n){(void)a;memset(d,0xcc,n);return 0;}
 static int p(uint64_t a,const void *exp,const void *data,size_t n){(void)a;assert(n==6&&((const unsigned char*)exp)[0]==0xcc&&((const unsigned char*)data)[0]==0xb8);patches++;return 0;}
 static int game_file(const char *path,const void **ptr,size_t *n){assert(!strcmp(path,"/sce_sys/param.sfo"));*ptr=sfo;*n=256;return 0;}
-static int overlay(const char *name,const char *path,const void *data,size_t n){(void)name;(void)path;(void)data;(void)n;overlays++;return 0;}
+static int overlay(const char *name,const char *path,const void *data,size_t n){assert(!strcmp(name,"region_switch") && !strcmp(path,"/sce_sys/param.sfo") && n==sizeof(sfo));
+ const auto* bytes=static_cast<const unsigned char*>(data);
+ assert(bytes[128]==0 && bytes[129]==0 && bytes[130]==0 && bytes[131]==0);
+ assert(!memcmp(bytes+144,title,10));overlays++;return 0;}
 static void w16(size_t o,uint16_t v){sfo[o]=(uint8_t)v;sfo[o+1]=v>>8;}
 static void w32(size_t o,uint32_t v){for(unsigned i=0;i<4;i++)sfo[o+i]=(uint8_t)(v>>(8*i));}
 static void make_sfo(void){
@@ -49,12 +61,12 @@ static void make_sfo(void){
  w16(36,21);w16(38,0x0204);w32(40,10);w32(44,16);w32(48,16);
  memcpy(sfo+52,"USER_DEFINED_PARAM_1",sizeof("USER_DEFINED_PARAM_1"));
  memcpy(sfo+73,"TITLE_ID",9);
- w32(128,0);memcpy(sfo+144,"CUSA03014",10);
+ w32(128,region);memcpy(sfo+144,title,10);
 }
 int main(int argc,char**argv){
  assert(argc==2);make_sfo();
- if(!strcmp(argv[1],"wrong-title"))memcpy(sfo+144,"CUSA03173",10);
- if(!strcmp(argv[1],"wrong-region"))w32(128,13);
+ if(!strcmp(argv[1],"wrong-title"))memcpy(sfo+144,other_title,10);
+ if(!strcmp(argv[1],"wrong-region"))w32(128,region==0 ? 13 : 0);
  if(!strcmp(argv[1],"wrong-eboot"))allowed=0;
  if(!strcmp(argv[1],"off"))strcpy(mode,"OFF");
  using Entry = int (*)(const API*);
@@ -78,7 +90,7 @@ int main(int argc,char**argv){
  int status=img(&a);
  assert(!memcmp(before,sfo,sizeof(sfo)));
  if(!strcmp(argv[1],"success")) {
-   assert(!status && patches==12 && overlays==0 && active());
+   assert(!status && patches==12 && overlays==expected_overlays && active());
  } else if(!strcmp(argv[1],"off")){
    assert(!status && patches==0 && overlays==0 && !active());
  } else {

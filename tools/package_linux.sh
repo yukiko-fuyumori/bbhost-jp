@@ -26,7 +26,9 @@ fi
 if [ -n "$(git -c core.excludesFile=/dev/null status --porcelain --untracked-files=no 2>/dev/null)" ]; then
     rev="$rev+"
 fi
-name=bbhost-linux-$rev
+profile=$(cat "$(dirname "$bin")/bbhost-edition.txt")
+case "$profile" in jp-only|eu-personal) ;; *) echo "invalid edition profile" >&2; exit 1;; esac
+name=bbhost-linux-$profile-$rev
 dir=$out/$name
 rm -rf "$dir"
 mkdir -p "$dir/data" "$dir/logs" "$dir/plugins" "$dir/build"
@@ -37,7 +39,11 @@ tools/package_plugins.sh "$(dirname "$bin")/plugins" "$dir/plugins"
 objcopy --strip-debug "$bin" "$dir/bbhost" 2>/dev/null || llvm-objcopy --strip-debug "$bin" "$dir/bbhost"
 chmod +x "$dir/bbhost"
 cp "$bin" "$out/$name.debug"
-cp bbhost.example.toml "$dir/bbhost.example.toml"
+if [ "$profile" = eu-personal ]; then
+    sed -e 's/CUSA03014/CUSA03173/g' -e 's/日本版 Old Hunters/欧州 GOTY（個人用）/g' bbhost.example.toml > "$dir/bbhost.example.toml"
+else
+    cp bbhost.example.toml "$dir/bbhost.example.toml"
+fi
 # The HLSL path's compiler beside the binary, where bbhost looks first.
 tools/fetch_dxc.sh linux "$dir"
 dxc_tag=$(cat third_party/dxc/VERSION)
@@ -79,8 +85,8 @@ exit "${PIPESTATUS[0]}"
 EOF
 chmod +x "$dir/run-bbhost.sh"
 
-tools/package_japanese.sh "$dir"
-cp docs/japanese-release.md "$dir/README-linux.txt"
+tools/package_japanese.sh "$dir" "$(dirname "$bin")"
+cp "$dir/導入手順_日本語.md" "$dir/README-linux.txt"
 cat >> "$dir/README-linux.txt" <<EOF
 
 この Linux ビルドの実行時依存関係:

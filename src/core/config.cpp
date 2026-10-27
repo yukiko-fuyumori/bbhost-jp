@@ -1,5 +1,6 @@
 #include "core/config.h"
 #include "core/sfo.h"
+#include "core/game_edition.h"
 #include "log.h"
 #include "bbhost_version.h"
 
@@ -815,6 +816,8 @@ std::string config_setup_help(const HostConfig& c) {
     if (!dir_exists(c.app0)) return "bbhost: ゲームフォルダーが見つかりません: " + c.app0 + "\n";
     if (!dir_exists(c.app0 + "/dvdroot_ps4"))
         return "bbhost: dvdroot_ps4 を含む親フォルダーを指定してください: " + c.app0 + "\n";
+    if (const auto error = config_game_edition_error(c.app0); !error.empty())
+        return "bbhost: " + error + "\n";
     return {};
 }
 
@@ -870,6 +873,11 @@ GameFolders config_game_folders(const std::string& app0) {
     return g;
 }
 
+std::string config_game_edition_error(const std::string& app0) {
+    const GameFolders g = config_game_folders(app0);
+    return game_edition_error(g.base, g.update);
+}
+
 App0Version config_app0_version(const std::string& app0) {
     App0Version v;
     const GameFolders g = config_game_folders(app0);
@@ -891,10 +899,11 @@ bool config_write_template(const std::string& path) {
     if (!out) {
         return false;
     }
+    out << "# " << game_edition_name() << "\n";
     out << R"toml(# bbhost 日本語版の設定。ゲームと復号済み eboot の場所を指定してください。
 # 相対パスはこのファイルの場所を基準にします。Windows でも / を使用できます。
 [paths]
-# 日本版 Old Hunters (CUSA03014)、更新 1.09、dvdroot_ps4 を含むフォルダー。
+# このビルドに対応する版、更新 1.09、dvdroot_ps4 を含むフォルダー。
 app0 = "PATH-TO-THE-GAME-DUMP"
 # SHA-256: 941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7
 eboot = "PATH-TO-THE-EBOOT"

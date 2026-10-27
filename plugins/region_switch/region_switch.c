@@ -55,9 +55,24 @@ _Static_assert(offsetof(BbHostApi,game_file)==0x148,"game_file API offset");
 _Static_assert(offsetof(BbHostApi,overlay_file)==0x150,"overlay API offset");
 #define BB_OPT_CHOICE 4u
 #define BB_PLUGIN_OPT_IN 1u
+#if BBHOST_PERSONAL_EU
+#define EDITION_TITLE "CUSA03173"
+#define EDITION_REGION 13u
+#define EDITION_LABEL "欧州 GOTY 互換・個人用 Linux"
+#define EDITION_VERSION "2.2.0-eu-personal"
+#define EDITION_PROFILE "eu-personal"
+#define EDITION_DESCRIPTION "欧州 GOTY CUSA03173 を日本語 UI で使用します。地域情報の変更はメモリー内のみです。"
+#else
+#define EDITION_TITLE "CUSA03014"
+#define EDITION_REGION 0u
+#define EDITION_LABEL "日本版 + 欧州オンライン"
+#define EDITION_VERSION "2.2.0-jp"
+#define EDITION_PROFILE "jp-only"
+#define EDITION_DESCRIPTION "日本版 CUSA03014 のデータを維持し、欧州オンラインへ接続します。本体の HTTP 修正を使用します。"
+#endif
 EXPORT const BbPluginInfo bb_plugin_info={
-  12,0,"region_switch","日本版 + 欧州オンライン","2.1.0-jp",
-  "Community", "日本版 CUSA03014 のデータを維持し、欧州オンラインへ接続します。本体の HTTP 修正を使用します。"
+  12,0,"region_switch",EDITION_LABEL,EDITION_VERSION,
+  "Community", EDITION_DESCRIPTION
 };
 EXPORT const BbOption bb_plugin_options[]={
   {BB_OPT_CHOICE,"region","ゲーム地域","JP は日本語データで欧州オンラインを使用します。OFF で変更を無効にします。","JP",0,0,"JP|OFF"},
@@ -66,6 +81,7 @@ EXPORT const BbOption bb_plugin_options[]={
 static const BbHostApi *g_api;
 static int g_jp;
 static unsigned char g_sfo[65536];
+static size_t g_region_offset;
 static const unsigned char g_fix[6]={0xb8,0x02,0x00,0x00,0x00,0x90};
 static const uint64_t g_sites[12]={
   0x023e450dull,0x023b86b3ull,0x01d5e537ull,0x0227d9e1ull,
@@ -78,12 +94,11 @@ static int eq(const char *a,const char *b){if(!a||!b)return 0;while(*a&&*b){if(*
 static size_t len(const char *s){size_t n=0;while(s[n])n++;return n;}
 static uint16_t rd16(const unsigned char *p){return (uint16_t)(p[0]|(p[1]<<8));}
 static uint32_t rd32(const unsigned char *p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
-/* Read a param.sfo entry only after checking every offset and its data type.
- * This variant NEVER rewrites the Japanese game's region/title metadata. */
+/* Validate native metadata for this compiled edition. JP never overlays it. */
 static int jp_native_sfo(const unsigned char *b, size_t n, uint32_t *region) {
   static const char rkey[]="USER_DEFINED_PARAM_1";
   static const char tkey[]="TITLE_ID";
-  static const char jp_title[]="CUSA03014";
+  static const char jp_title[]=EDITION_TITLE;
   if(n<20 || rd32(b)!=0x46535000u)return 0;
   uint32_t keys=rd32(b+8),data=rd32(b+12),count=rd32(b+16);
   if(keys<20 || keys>=n || data>=n || count>(n-20)/16)return 0;
@@ -95,7 +110,7 @@ static int jp_native_sfo(const unsigned char *b, size_t n, uint32_t *region) {
     if(k>=n || v>n || vmax>n-v || vlen>vmax)continue;
     if(n-k>=sizeof(rkey) && same(b+k,rkey,sizeof(rkey)) &&
        rd16(b+e+2)==0x0404 && vlen>=4){
-      *region=rd32(b+v);got_region=1;
+      *region=rd32(b+v);g_region_offset=v;got_region=1;
     }
     if(n-k>=sizeof(tkey) && same(b+k,tkey,sizeof(tkey)) &&
        vlen>=sizeof(jp_title)-1 && same(b+v,jp_title,sizeof(jp_title)-1) &&
@@ -103,7 +118,7 @@ static int jp_native_sfo(const unsigned char *b, size_t n, uint32_t *region) {
       got_title=1;
     }
   }
-  return got_region && got_title && *region==0;
+  return got_region && got_title && *region==EDITION_REGION;
 }
 
 /* Key-table record scanner, strictly matching unique initial values. */
@@ -204,6 +219,7 @@ EXPORT int bb_plugin_init(const BbHostApi *api){
     return 1;
  }
  g_api=api;
+ api->log("BBHOST_REGION_PLUGIN_PROFILE=" EDITION_PROFILE);
  const char *region=api->config("region_switch.region");
  g_jp=!eq(region,"OFF")&&!eq(region,"EU")&&!eq(region,"US");
  if(!g_jp){UNSETENV("BBHOST_JP_EU_ACTIVE");api->log("region_switch: OFF; no changes");return 0;}
@@ -211,7 +227,7 @@ EXPORT int bb_plugin_init(const BbHostApi *api){
      api->log("region_switch: failed to set game language/HTTP compatibility marker");
      return 1;
  }
- api->log("region_switch: JP native game data selected; EU online compatibility enabled automatically");
+ api->log("region_switch: %s selected; EU online compatibility enabled automatically",EDITION_TITLE);
  return 0;
 }
 EXPORT int bb_plugin_image(const BbHostApi *api){
@@ -229,10 +245,13 @@ EXPORT int bb_plugin_image(const BbHostApi *api){
  }
  cp(g_sfo,file,size);
  if(!jp_native_sfo(g_sfo,size,&original)){
-   g_api->log("region_switch: requires native Japanese CUSA03014 SFO with USER_DEFINED_PARAM_1=0 (found %u)",original);
+   g_api->log("region_switch: requires native %s SFO with USER_DEFINED_PARAM_1=%u (found %u)",EDITION_TITLE,EDITION_REGION,original);
    UNSETENV("BBHOST_JP_EU_ACTIVE");return 1;
  }
- g_api->log("region_switch: Japanese CUSA03014 SFO verified, left unchanged");
+ g_api->log("region_switch: native %s SFO verified, original files left unchanged",EDITION_TITLE);
+#if BBHOST_PERSONAL_EU
+ if(!g_api->overlay_file){UNSETENV("BBHOST_JP_EU_ACTIVE");return 1;}
+#endif
  /* Runtime patches, identical addresses on Windows and Linux. */
  int written=0,already=0;
  for(size_t i=0;i<12;i++){
@@ -250,8 +269,18 @@ EXPORT int bb_plugin_image(const BbHostApi *api){
    written++;
  }
  g_api->log("region_switch: EU online selectors %d written, %d already present (12 total)",written,already);
- /* No overlay for native JP files: Japanese SFO stays entirely original. */
+#if BBHOST_PERSONAL_EU
+ /* The supplied EU compatibility behavior, only in the personal Linux build.
+  * No file in the user's dump is modified. */
+ for(size_t i=0;i<4;i++)g_sfo[g_region_offset+i]=0;
+ if(g_api->overlay_file("region_switch","/sce_sys/param.sfo",g_sfo,size)){
+   g_api->log("region_switch: failed to install in-memory EU compatibility overlay");
+   UNSETENV("BBHOST_JP_EU_ACTIVE");return 1;
+ }
+ g_api->log("region_switch: personal EU compatibility overlay, region 13 -> 0");
+#else
  g_api->log("region_switch: Japanese game metadata preserved (no SFO overlay)");
+#endif
  if(patch_buttons())g_api->log("region_switch: Japanese Cross/Circle keyboard mapping installed");
  else g_api->log("region_switch: keyboard binding layout not matched; mappings unchanged");
  g_api->log("region_switch: EU-online bootstrap requires compatible BBHost HTTP implementation");

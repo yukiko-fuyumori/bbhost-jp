@@ -1,6 +1,18 @@
 cmake_minimum_required(VERSION 3.20)
 project(bbhost LANGUAGES C CXX)
 
+option(BBHOST_PERSONAL_EU "Build the separate personal EU GOTY Linux edition" OFF)
+if(BBHOST_PERSONAL_EU AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "The personal EU edition is only available for Linux.")
+endif()
+set(BBHOST_EDITION_PROFILE "jp-only")
+if(BBHOST_PERSONAL_EU)
+  set(BBHOST_EDITION_PROFILE "eu-personal")
+endif()
+configure_file(cmake/bbhost_edition.h.in gen/bbhost_edition.h)
+file(WRITE ${CMAKE_BINARY_DIR}/bbhost-edition.txt "${BBHOST_EDITION_PROFILE}\n")
+message(STATUS "bbhost: game edition profile ${BBHOST_EDITION_PROFILE}")
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -65,7 +77,7 @@ add_executable(bbhost
   src/host/win_crash.cpp
   src/host/plugins.cpp
   src/core/tls_rewrite.cpp
-  src/core/config.cpp
+  src/core/config.cpp src/core/game_edition.cpp
   src/engine/image_text.cpp
   src/core/sha256.cpp
   src/core/sfo.cpp
@@ -229,6 +241,7 @@ function(bb_plugin name)
   endif()
 endfunction()
 add_library(bb_plugin_region_switch MODULE plugins/region_switch/region_switch.c)
+target_compile_definitions(bb_plugin_region_switch PRIVATE BBHOST_PERSONAL_EU=$<BOOL:${BBHOST_PERSONAL_EU}>)
 set_target_properties(bb_plugin_region_switch PROPERTIES OUTPUT_NAME region_switch PREFIX ""
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins)
 
@@ -570,13 +583,13 @@ if(UNIX)
   target_include_directories(image_file_test PRIVATE src)
   target_link_libraries(image_file_test PRIVATE ZLIB::ZLIB)
   add_test(NAME image_file_test COMMAND image_file_test)
-  add_executable(config_test tests/config_test.cpp src/core/config.cpp src/core/sfo.cpp)
+  add_executable(config_test tests/config_test.cpp src/core/config.cpp src/core/game_edition.cpp src/core/sfo.cpp)
   target_include_directories(config_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_compile_definitions(config_test PRIVATE CONFIG_MUTANTS)  # the play-log migration's mutants
   add_dependencies(config_test bbhost_version)
   add_test(NAME config_test COMMAND config_test)
   # The session's online rules: a gameplay patch manifest makes them say modded.
-  add_executable(ruleset_test tests/ruleset_test.cpp src/core/config.cpp src/core/sfo.cpp)
+  add_executable(ruleset_test tests/ruleset_test.cpp src/core/config.cpp src/core/game_edition.cpp src/core/sfo.cpp)
   target_include_directories(ruleset_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_compile_definitions(ruleset_test PRIVATE BB_PATCHES_DIR="${CMAKE_SOURCE_DIR}/patches")
   add_dependencies(ruleset_test bbhost_version)
@@ -945,6 +958,10 @@ else()
 endif()
 
 # Japanese fork: glyph rendering and JP/EU request policy, without game data.
+add_executable(game_edition_test tests/game_edition_test.cpp src/core/game_edition.cpp src/core/config.cpp src/core/sfo.cpp)
+target_include_directories(game_edition_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+add_dependencies(game_edition_test bbhost_version)
+add_test(NAME game_edition_test COMMAND game_edition_test)
 add_executable(japanese_font_test tests/japanese_font_test.cpp src/host/overlay_font.cpp src/host/japanese_font.cpp)
 target_include_directories(japanese_font_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
 add_test(NAME japanese_font_test COMMAND japanese_font_test)
@@ -962,6 +979,7 @@ add_test(NAME jp_eu_http_test COMMAND jp_eu_http_test)
 if(WIN32 OR UNIX)
   add_executable(jp_region_test tests/jp_region_test.cpp)
   target_include_directories(jp_region_test PRIVATE src include)
+  target_compile_definitions(jp_region_test PRIVATE BBHOST_PERSONAL_EU=$<BOOL:${BBHOST_PERSONAL_EU}>)
   target_link_libraries(jp_region_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(jp_region_test bb_plugin_region_switch)
   foreach(case success off wrong-title wrong-region wrong-eboot)

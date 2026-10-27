@@ -1,5 +1,6 @@
 #include "host/japanese_font.h"
 #include "host/launcher.h"
+#include "core/game_edition.h"
 
 #include "bbhost_version.h"
 #include "core/sha256.h"
@@ -403,6 +404,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::Begin("setup", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 
         ImGui::Text("bbhost %s - 設定", BBHOST_VERSION);
+        ImGui::TextDisabled("%s", game_edition_name());
         ImGui::TextDisabled("%s に保存しました。すべての bbhost で共有されます。", config_user_file().c_str());
         if (!reason.empty()) ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.30f, 1.0f), "%s", reason.c_str());
         // While the Updates box is checked: one check, on a thread of its own
@@ -418,6 +420,16 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 
         const std::string app0 = f[kApp0].str();
         const bool app0_ok = is_dir(app0 + "/dvdroot_ps4");
+        // Refresh on path edits and periodically if metadata changes on disk.
+        static std::string edition_path, edition_error;
+        static auto edition_at = std::chrono::steady_clock::time_point{};
+        const auto edition_now = std::chrono::steady_clock::now();
+        if (edition_path != app0 || edition_now - edition_at > std::chrono::seconds(1)) {
+            edition_path = app0;
+            edition_error = config_game_edition_error(app0);
+            edition_at = edition_now;
+        }
+        const bool edition_ok = app0_ok && edition_error.empty();
         // The tabs above the buttons: the game's settings, and the plugins.
         const float footer = ImGui::GetFrameHeightWithSpacing() * 4.2f;
         bool game_tab = false;
@@ -563,7 +575,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                             "。実行しなければプレイ中にコンパイルします。")
                                                .c_str());
                     ImGui::PopTextWrapPos();
-                    ImGui::BeginDisabled(!app0_ok || !eboot.ok);
+                    ImGui::BeginDisabled(!edition_ok || !eboot.ok);
                     if (ImGui::Button("今すぐコンパイル##advice")) start_compile();
                     ImGui::EndDisabled();
                     ImGui::Separator();
@@ -632,7 +644,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 }
                 ImGui::SeparatorText("今すぐコンパイル");
                 if (!cv.running) {
-                    ImGui::BeginDisabled(!app0_ok || !eboot.ok);
+                    ImGui::BeginDisabled(!edition_ok || !eboot.ok);
                     if (ImGui::Button("今すぐシェーダーをコンパイル")) start_compile();
                     ImGui::EndDisabled();
                     ImGui::SameLine();
@@ -699,7 +711,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ImGui::AlignTextToFramePadding();
             ImGui::TextColored(warn, "%s.", advice.why.c_str());
             ImGui::SameLine();
-            ImGui::BeginDisabled(!app0_ok || !eboot.ok);
+            ImGui::BeginDisabled(!edition_ok || !eboot.ok);
             if (ImGui::SmallButton("今すぐコンパイル##main")) {
                 start_compile();
                 select_shaders_tab = true;
@@ -709,7 +721,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ImGui::TextDisabled("%s（任意）", advice.time.c_str());
         }
         ImGui::SeparatorText("ゲームファイル");
-        path_row("ゲームフォルダー (dvdroot_ps4 を含むフォルダー)", kApp0, true, "C:/Games/Bloodborne/CUSA03014");
+        path_row("ゲームフォルダー (dvdroot_ps4 を含むフォルダー)", kApp0, true, BBHOST_PERSONAL_EU ? "C:/Games/Bloodborne/CUSA03173" : "C:/Games/Bloodborne/CUSA03014");
         status_line(app0_ok, "dvdroot_ps4 を確認しました",
                     app0.empty()           ? "未設定"
                     : !is_dir(app0)        ? "フォルダーが存在しません"
@@ -717,6 +729,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                            ? "dvdroot_ps4 自体ではなく、その親フォルダーを選んでください"
                                            : "dvdroot_ps4 がありません");
         if (app0_ok) {
+            status_line(edition_ok, game_edition_name(), edition_error);
             // Its version: the 1.09 update's files copied over it, or in an
             // update folder beside it (core/config.h), or the game stops when
             // it reads one. A warning, not a stop: Play stays on.
@@ -865,7 +878,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::TextDisabled("一度だけ開くには --setup を付けて起動します。");
         ImGui::Spacing();
         const bool compiling = compile_job.running();
-        const bool can_play = app0_ok && eboot.ok && !compiling;
+        const bool can_play = edition_ok && eboot.ok && !compiling;
         ImGui::BeginDisabled(!can_play);
         const bool play = ImGui::Button("プレイ", ImVec2(140 * scale, 0)) || (test && !std::strcmp(test, "play") && ++frames > 30);
         ImGui::EndDisabled();
@@ -900,10 +913,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ImGui::TextDisabled("コンパイル完了後にプレイできます（シェーダータブ）。");
         } else if (!can_play) {
             ImGui::SameLine();
-            ImGui::TextDisabled("プレイにはゲームフォルダーと 1.09 の eboot が必要です。");
+            ImGui::TextDisabled("対応する版のゲームフォルダーと 1.09 の eboot が必要です。");
         }
         if (!saved_note.empty()) ImGui::TextDisabled("%s", saved_note.c_str());
-        if (play && can_play && save()) {
+        if (play && can_play && config_game_edition_error(f[kApp0].str()).empty() && save()) {
             result = LauncherResult::Play;
             done = true;
         }
