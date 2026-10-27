@@ -441,33 +441,33 @@ void flush_summary_locked(const char* tag) {
 
 // The performance overlay's two lines (perf_meter_glance), from the last second.
 std::mutex g_glance_mu;
-char g_glance[2][96];  // under g_glance_mu
+char g_glance[2][kPerfMeterLineBytes];  // under g_glance_mu
 bool g_glance_set = false;
 
 const char* player_name(Stage s) {
     switch (s) {
-    case Stage::kMain: return "main thread";
-    case Stage::kGx: return "GX workers";
-    case Stage::kRender: return "render thread";
-    case Stage::kCp: return "command processor";
-    case Stage::kRecord: return "recorder";
+    case Stage::kMain: return "メインスレッド";
+    case Stage::kGx: return "GX ワーカー";
+    case Stage::kRender: return "描画スレッド";
+    case Stage::kCp: return "コマンド処理";
+    case Stage::kRecord: return "コマンド記録";
     case Stage::kGpu: return "GPU";
-    case Stage::kPresent: return "presenter";
-    case Stage::kCapped: return "frame cap";
-    case Stage::kStall: return "loading or stalls";
-    default: return "nothing in particular";
+    case Stage::kPresent: return "画面表示";
+    case Stage::kCapped: return "FPS 上限";
+    case Stage::kStall: return "ロード・待機";
+    default: return "特になし";
     }
 }
 
 // "Limit: GX workers 100% | next: command processor 85%" and
 // "main 5.1 ms  GX 4.6  waits 1.8 | CP 85%  GPU 48%".
 void set_glance(const bottleneck::Window& w, const bottleneck::Verdict& v) {
-    char a[96], b[96], next[48] = "";
-    if (v.next != Stage::kNone && v.next_load >= 0) std::snprintf(next, sizeof(next), " | next: %s %.0f%%", player_name(v.next), v.next_load * 100.0);
+    char a[kPerfMeterLineBytes] = {}, b[kPerfMeterLineBytes] = {}, next[128] = "";
+    if (v.next != Stage::kNone && v.next_load >= 0) std::snprintf(next, sizeof(next), " | 次点: %s %.0f%%", player_name(v.next), v.next_load * 100.0);
     if (v.limit_load >= 0) {
-        std::snprintf(a, sizeof(a), "Limit: %s %.0f%%%s", player_name(v.limit), v.limit_load * 100.0, next);
+        std::snprintf(a, sizeof(a), "制限要因: %s %.0f%%%s", player_name(v.limit), v.limit_load * 100.0, next);
     } else {
-        std::snprintf(a, sizeof(a), "Limit: %s%s", player_name(v.limit), next);
+        std::snprintf(a, sizeof(a), "制限要因: %s%s", player_name(v.limit), next);
     }
     const double n = w.flips > 0 ? w.flips : 1.0;
     const double spin = w.gx_spin_ms >= 0 ? w.gx_spin_ms : 0.0;
@@ -480,9 +480,9 @@ void set_glance(const bottleneck::Window& w, const bottleneck::Verdict& v) {
     pct_or_dash(v.load[static_cast<int>(Stage::kCp)], cp, sizeof(cp));
     pct_or_dash(v.load[static_cast<int>(Stage::kGpu)], gpu, sizeof(gpu));
     if (own >= 0 && w.gx_spin_ms >= 0) {
-        std::snprintf(b, sizeof(b), "main %.1f ms  GX %.1f  waits %.1f | CP %s  GPU %s", own, spin / n, w.main_wait_ms / n, cp, gpu);
+        std::snprintf(b, sizeof(b), "メイン %.1f ms  GX %.1f  待機 %.1f | CP %s  GPU %s", own, spin / n, w.main_wait_ms / n, cp, gpu);
     } else if (own >= 0) {
-        std::snprintf(b, sizeof(b), "main %.1f ms  waits %.1f | CP %s  GPU %s", own, w.main_wait_ms / n, cp, gpu);
+        std::snprintf(b, sizeof(b), "メイン %.1f ms  待機 %.1f | CP %s  GPU %s", own, w.main_wait_ms / n, cp, gpu);
     } else {
         std::snprintf(b, sizeof(b), "CP %s  GPU %s", cp, gpu);
     }
@@ -755,7 +755,7 @@ void perf_meter_want() {
     if (g_state.load(std::memory_order_relaxed) == 1) run_locked(", for the performance overlay");
 }
 
-bool perf_meter_glance(char (&line1)[96], char (&line2)[96]) {
+bool perf_meter_glance(char (&line1)[kPerfMeterLineBytes], char (&line2)[kPerfMeterLineBytes]) {
     std::lock_guard<std::mutex> lk(g_glance_mu);
     if (!g_glance_set) return false;
     std::memcpy(line1, g_glance[0], sizeof(line1));

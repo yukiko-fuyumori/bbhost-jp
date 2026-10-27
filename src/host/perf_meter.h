@@ -29,6 +29,7 @@
 // does the performance overlay (F10).
 // BBHOST_PERF_SUMMARY_S sets the summary's period (60).
 
+#include <cstddef>
 #include <cstdint>
 
 // main(), once the configuration is final: the guest image's range and
@@ -51,7 +52,9 @@ void perf_meter_exit();
 // last second's verdict as two short lines - what limits and what is next,
 // then the main loop's frame split and the command processor's and the
 // GPU's loads. False before the meter has had a second.
-bool perf_meter_glance(char (&line1)[96], char (&line2)[96]);
+// UTF-8 Japanese labels need more bytes than the original ASCII display.
+constexpr std::size_t kPerfMeterLineBytes = 256;
+bool perf_meter_glance(char (&line1)[kPerfMeterLineBytes], char (&line2)[kPerfMeterLineBytes]);
 // The overlay is on: starts the meter if it is not running because tooling is
 // off (BBHOST_PERF_METER=0 still keeps it off). Cheap once it runs.
 void perf_meter_want();

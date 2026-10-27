@@ -1,0 +1,148 @@
+--- a/src/hle/http.cpp
++++ b/src/hle/http.cpp
+@@ -113,8 +113,14 @@
+ int g_http_next = 1;
+ std::unordered_map<int, HttpObj> g_http;
+ std::unordered_set<HttpEpoll*> g_http_eps;
+-// One bootstrap per online cycle, rearmed after successful game login or HTTP reset.
+-static std::atomic<bool> g_jp_eu_reconnect_bootstrap_armed{true};
++// A bounded series of eligible server-status bootstrap attempts.  The game can
++// return to the title screen without calling sceHttpTerm or successfully logging
++// in, so a one-shot flag would permanently break in-process reconnection.
++// All accesses are under g_http_mu, including the reset in sceHttpTerm.
++std::deque<std::chrono::steady_clock::time_point> g_jp_eu_bootstrap_history;
++constexpr auto kJpEuBootstrapMinInterval = std::chrono::seconds(1);
++constexpr auto kJpEuBootstrapWindow = std::chrono::minutes(1);
++constexpr std::size_t kJpEuBootstrapMaxPerWindow = 12;
+ 
+ int http_alloc(HttpKind kind, int parent) {
+     const int id = g_http_next++;
+@@ -233,6 +239,35 @@
+         scheme = cfg.online_scheme;
+     }
+     return scheme + "://" + host + rest;
++}
++
++// Separate from the reconnect bootstrap: a Japanese-region play-log PUT can
++// contain an empty S3 bucket. Only accept the exact play-log key structure.
++std::string rewrite_jp_eu_missing_s3_playlog(const std::string& url, int method) {
++    const char* marker = std::getenv("BBHOST_JP_EU_ACTIVE");
++    constexpr const char* missing_bucket = "https://.s3.amazonaws.com/";
++    if (!marker || std::strcmp(marker, "1") != 0 || method != 4 ||
++        url.rfind(missing_bucket, 0) != 0)
++        return url;
++
++    const std::string key = url.substr(std::strlen(missing_bucket));
++    const bool date_ok = key.size() > 9 && key[8] == '/' &&
++        std::all_of(key.begin(), key.begin() + 8, [](unsigned char c) {
++            return std::isdigit(c) != 0;
++        });
++    const bool name_ok = date_ok && std::all_of(key.begin() + 9, key.end(),
++        [](unsigned char c) {
++            return std::isalnum(c) != 0 || c == '_' || c == '-' || c == '.';
++        });
++    if (!name_ok)
++        return url;
++
++    const HostConfig& cfg = config();
++    const std::string host = cfg.online_host.empty() ?
++        "thehuntersdream.com" : cfg.online_host;
++    const std::string scheme = cfg.online_scheme.empty() ?
++        "http" : cfg.online_scheme;
++    return scheme + "://" + host + ":18671/" + key;
+ }
+ 
+ #if defined(BBHOST_HAVE_CURL)
+@@ -368,18 +403,14 @@
+     std::vector<std::uint8_t> body;
+     host_log("http: no libcurl at build time; %s fails", url.c_str());
+ #endif
+-    // A successful online login concludes this connection cycle. Arm exactly
+-    // one fresh EU ss.info bootstrap for a later in-process reconnect.
+-    // The game's login endpoint is observed as POST /basic_utils/login.
++    // Login success is useful to trace, but must not be the only way to allow
++    // another server-status request: failed logins and title-screen returns also
++    // have to be able to retry.  The bounded retry window is independent.
+     if (!err && method == 1 && status == 200 &&
+         url.find("/basic_utils/login") != std::string::npos) {
+         const char* marker = std::getenv("BBHOST_JP_EU_ACTIVE");
+-        if (marker && std::strcmp(marker, "1") == 0) {
+-            const bool was_armed = g_jp_eu_reconnect_bootstrap_armed.exchange(
+-                true, std::memory_order_acq_rel);
+-            if (!was_armed)
+-                host_log("jp-eu-unified: reconnect bootstrap armed after successful online login");
+-        }
++        if (marker && std::strcmp(marker, "1") == 0)
++            host_log("jp-eu-unified: online login OK (bounded bootstrap retries available)");
+     }
+     if (g_http_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(g_http_delay_ms));
+     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+@@ -415,9 +446,8 @@
+ GUEST_ABI int hle_http_term() {
+     std::lock_guard<std::mutex> lock(g_http_mu);
+     g_http.clear();
+-    // Re-arm if the game tears down and reinitializes its HTTP subsystem.
+-    // This is safe even if no subsequent online request occurs.
+-    g_jp_eu_reconnect_bootstrap_armed.store(true, std::memory_order_release);
++    // A completely new HTTP context starts a fresh bounded retry window.
++    g_jp_eu_bootstrap_history.clear();
+     return 0;
+ }
+ GUEST_ABI int hle_http_create_template(int ctx, const char* ua, int ver, int proxy) {
+@@ -574,22 +604,33 @@
+     r.url = url ? url : "";
+     r.content_len = len;
+     r.resp = std::make_shared<Response>();
+-    // One-shot configuration bootstrap. Deliberately never replace other URLs.
++    // Only the JP/EU plugin's otherwise-empty GETs may bootstrap EU ss.info.
++    // This is a bounded *retry*, not an unconditional substitution for all
++    // empty URLs: one per second, at most 12 per rolling minute.  Returning to
++    // the title screen does not require a successful login to unlock retries.
+     const char* jp_eu_marker = std::getenv("BBHOST_JP_EU_ACTIVE");
+     if (jp_eu_marker && std::strcmp(jp_eu_marker, "1") == 0 && method == 0 && r.url.empty()) {
+         HttpObj* base = http_get(conn, HttpKind::Conn);
+         HttpObj* tmpl = base ? http_get(base->parent, HttpKind::Tmpl) : nullptr;
+         if (base && base->url.empty() && tmpl && tmpl->jp_eu_online) {
+-            bool armed = true;
+-            if (g_jp_eu_reconnect_bootstrap_armed.compare_exchange_strong(
+-                    armed, false, std::memory_order_acq_rel)) {
++            const auto now = std::chrono::steady_clock::now();
++            while (!g_jp_eu_bootstrap_history.empty() &&
++                   now - g_jp_eu_bootstrap_history.front() >= kJpEuBootstrapWindow)
++                g_jp_eu_bootstrap_history.pop_front();
++            const bool too_soon = !g_jp_eu_bootstrap_history.empty() &&
++                now - g_jp_eu_bootstrap_history.back() < kJpEuBootstrapMinInterval;
++            const bool budget_exhausted =
++                g_jp_eu_bootstrap_history.size() >= kJpEuBootstrapMaxPerWindow;
++            if (!too_soon && !budget_exhausted) {
++                g_jp_eu_bootstrap_history.push_back(now);
+                 r.url = "https://thehuntersdream.com:20443/bb-eu/ss.info";
+-                host_log("jp-eu-unified: bootstrap EU ss.info request=%d (initial/reconnect)", id);
++                host_log("jp-eu-unified: bootstrap EU ss.info request=%d (bounded retry %zu/%zu)",
++                         id, g_jp_eu_bootstrap_history.size(), kJpEuBootstrapMaxPerWindow);
+             } else {
+-                // Never blindly rewrite later empty requests in the same cycle.
+-                static unsigned suppressed = 0; // g_http_mu held here
+-                if (suppressed++ < 12)
+-                    host_log("jp-eu-unified: empty EU GET left untouched request=%d (bootstrap not armed)", id);
++                static unsigned suppressed = 0;  // g_http_mu held here
++                if (suppressed++ < 32)
++                    host_log("jp-eu-unified: empty EU GET left untouched request=%d (%s)",
++                             id, too_soon ? "retry cooldown" : "retry budget exhausted");
+             }
+         }
+     }
+@@ -704,6 +745,13 @@
+         url = rewrite_url(r->url);
+         rewritten = url != r->url;
+         method = r->method;
++        // Keep play-log repair separate from region/bootstrap retries.
++        const std::string repaired = rewrite_jp_eu_missing_s3_playlog(url, method);
++        if (repaired != url) {
++            url = repaired;
++            rewritten = true;
++            host_log("jp-eu-unified: repaired missing-bucket play-log PUT request=%d", id);
++        }
+         content_len = r->content_len;
+         eff = effective_locked(id);
+         resp = r->resp;

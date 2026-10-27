@@ -11,3 +11,10 @@
 *.bndb binary
 *.7z binary
 *.zip binary
+
+*.ttf binary
+*.so binary
+*.dll binary
+
+# Preserve the supplied compatibility archive byte-for-byte, including patch context.
+compat/jp-eu-v020/** -whitespace

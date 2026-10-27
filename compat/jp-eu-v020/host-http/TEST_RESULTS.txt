@@ -1,0 +1,5 @@
+Validation results on 2026-10-26:
+- C++20 syntax checked with GCC and libcurl headers (stubbed BBHost APIs; not a full BBHost build): PASS
+- C++ harness: first bootstrap; cooldown; retry without login; rolling minute budget; non-GET/explicit URL exclusion; S3 PUT rewrite; marker off; HTTP reset: PASS
+- Tested against running BBHost or Bloodborne: NO
+- Windows compilation/integration: NOT VERIFIED
