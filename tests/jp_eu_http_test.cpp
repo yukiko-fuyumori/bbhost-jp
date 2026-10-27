@@ -40,8 +40,17 @@ int main() {
     assert(g_jp_eu_bootstrap_history.empty());
     conn = connection("unrelated");
     assert(request().empty());
-    conn = connection(eu, "https://example.invalid/");
-    assert(request().empty());
+    conn = connection(eu, "https://example.invalid:18671/blood_messenger/message_area?area=1");
+    assert(request(1) == "https://example.invalid:18671/blood_messenger/message_area?area=1");
+    assert(request(1, "/tomb_messenger/message_area?area=2") ==
+           "https://example.invalid:18671/tomb_messenger/message_area?area=2");
+    assert(request(1, "https://other.invalid/explicit?q=1") == "https://other.invalid/explicit?q=1");
+    assert(g_jp_eu_bootstrap_history.empty());
+    conn = connection(eu, "https://[::1]:18671?old=1");
+    assert(request(1, "/blood_messenger/message_area?area=3") ==
+           "https://[::1]:18671/blood_messenger/message_area?area=3");
+    assert(request(1, "unsupported-target") == "unsupported-target");
+    assert(request(1, "//other.invalid/path") == "//other.invalid/path");
     const std::string broken = "https://.s3.amazonaws.com/20261026/play-log_01.bin";
     test_config.online_host = "example.invalid";
     test_config.online_scheme = "https";
@@ -53,6 +62,9 @@ int main() {
     }
     active(false);
     assert(rewrite_jp_eu_missing_s3_playlog(broken, 4) == broken);
+    conn = connection(eu, "https://example.invalid:18671/blood_messenger/message_area");
+    assert(request(1) == "https://example.invalid:18671/blood_messenger/message_area");
+    assert(request(1, "/tomb_messenger/message_area") == "https://example.invalid:18671/tomb_messenger/message_area");
     conn = connection(jp);
     assert(g_http[g_http[conn].parent].ua == jp);
     assert(request().empty());
@@ -63,4 +75,14 @@ int main() {
     conn = connection(jp);
     assert(request() == info);
     active(false);
+    assert(resolve_request_url("", "/blood_messenger/message_area") == "/blood_messenger/message_area");
+    assert(resolve_request_url("https://", "/blood_messenger/message_area") == "/blood_messenger/message_area");
+    assert(resolve_request_url("ftp://example.invalid/file", "/path") == "/path");
+    assert(std::string(online_trace_route("https://user:secret@example.invalid:18671/blood_messenger/message_area?token=secret#fragment")) ==
+           "/blood_messenger/message_area");
+    assert(std::string(online_trace_route("/tomb_messenger/message_area?area=1")) == "/tomb_messenger/message_area");
+    assert(online_trace_route("https://example.invalid/auth/device/token?secret=1") == nullptr);
+    assert(online_trace_route("https://example.invalid/?next=/blood_messenger/message_area") == nullptr);
+    assert(online_trace_route("https://example.invalid/blood_messenger/message_area/private") == nullptr);
+    assert(online_trace_route("https://example.invalid") == nullptr);
 }

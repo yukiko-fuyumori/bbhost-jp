@@ -219,6 +219,31 @@ Effective effective_locked(int req_id) {
     return e;
 }
 
+// The game can pass an empty URL or an origin-form path on an existing connection.
+std::string resolve_request_url(const std::string& base, const std::string& target) {
+    if (target.empty()) return base;
+    if (target[0] != '/' || target.rfind("//", 0) == 0) return target;
+    const auto scheme = base.find("://");
+    if (scheme == std::string::npos || (base.substr(0, scheme) != "http" && base.substr(0, scheme) != "https"))
+        return target;
+    const auto end = base.find_first_of("/?#", scheme + 3);
+    if (scheme + 3 == base.size() || end == scheme + 3) return target;
+    return base.substr(0, end) + target;
+}
+
+// Return fixed route names only; never include query values or response contents.
+const char* online_trace_route(const std::string& url) {
+    const auto scheme = url.find("://");
+    const auto start = scheme == std::string::npos ? 0 : url.find_first_of("/?#", scheme + 3);
+    if (start == std::string::npos) return nullptr;
+    const std::string path = url.substr(start, url.find_first_of("?#", start) - start);
+    for (const char* route : {"/blood_messenger/message_area", "/blood_messenger/exist_messages",
+                              "/blood_messenger/evaluation", "/tomb_messenger/message_area",
+                              "/wandering_ghost/get", "/chair_messenger/get"})
+        if (path == route) return route;
+    return nullptr;
+}
+
 // online.host replaces the official hostnames; online.scheme forces http/https.
 std::string rewrite_url(const std::string& url) {
     const HostConfig& cfg = config();
@@ -431,6 +456,11 @@ void perform(const std::string& url, int method, const Effective& eff, std::vect
         host_log("http: %s %s -> %ld (%zu bytes, %.0f ms)%s", method == 1 ? "POST" : method == 4 ? "PUT" : "GET", url.c_str(), status,
                  body.size(), ms, err ? " error" : "");
     }
+    if (const char* trace = std::getenv("BBHOST_ONLINE_TRACE"); trace && !std::strcmp(trace, "1")) {
+        if (const char* route = online_trace_route(url))
+            host_log("online-data: method=%d route=%s status=%ld error=%d bytes=%zu elapsed_ms=%.0f",
+                     method, route, status, err, body.size(), ms);
+    }
     std::lock_guard<std::mutex> lk(resp->mu);
     resp->status = status;
     resp->error = err;
@@ -607,13 +637,15 @@ GUEST_ABI int hle_http_connect_url(int tmpl, const char* url, int) {
 }
 GUEST_ABI int hle_http_request_url(int conn, int method, const char* url, std::uint64_t len) {
     std::lock_guard<std::mutex> lock(g_http_mu);
-    if (!http_get(conn, HttpKind::Conn)) {
+    const HttpObj* connection = http_get(conn, HttpKind::Conn);
+    if (!connection) {
         return kHttpInvalidId;
     }
+    const std::string target = resolve_request_url(connection->url, url ? url : "");
     const int id = http_alloc(HttpKind::Req, conn);
     HttpObj& r = g_http[id];
     r.method = method;
-    r.url = url ? url : "";
+    r.url = target;
     r.content_len = len;
     r.resp = std::make_shared<Response>();
     // Bootstrap only the JP/EU plugin's empty GETs: one per second, 12 per minute.

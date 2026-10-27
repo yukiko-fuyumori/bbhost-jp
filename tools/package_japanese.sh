@@ -23,3 +23,4 @@ guide=docs/japanese-release.md
 cp "$guide" "$dest/導入手順_日本語.md"
 
 cp docs/trophies.md "$dest/トロフィー.md"
+cp docs/online-diagnostics.md "$dest/オンライン診断.md"
