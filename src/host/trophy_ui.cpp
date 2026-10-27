@@ -87,7 +87,7 @@ void trophy_notice_draw(float dw, float dh) {
     const float x = 24*s, y = 28*s, width = std::min(560*s, dw - 48*s), h = 102*s;
     host_overlay_rect(x, y, width, h, fade(0x15191ff0));
     host_overlay_rect(x, y, 4*s, h, fade(colour(item.grade)));
-    // A simple cup drawn by the existing overlay; no copyrighted image assets.
+    // Draw the cup with overlay primitives.
     const float cx = x+26*s, cy = y+28*s;
     host_overlay_rect(cx, cy, 34*s, 24*s, fade(colour(item.grade)));
     host_overlay_tri(cx, cy+24*s, cx+34*s, cy+24*s, cx+17*s, cy+35*s, fade(colour(item.grade)));

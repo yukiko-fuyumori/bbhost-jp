@@ -40,6 +40,8 @@ constexpr int kInvalidId = static_cast<int>(0x8055160au);
 constexpr int kAlreadyUnlocked = static_cast<int>(0x8055160cu);
 constexpr int kAutomaticPlatinum = static_cast<int>(0x8055160du);
 constexpr int kNotRegistered = static_cast<int>(0x8055160fu);
+constexpr int kContextLimit = static_cast<int>(0x80551623u);
+constexpr int kHandleLimit = static_cast<int>(0x80551624u);
 constexpr int kIoError = static_cast<int>(0x80551600u);
 GUEST_ABI int create_context(int* ctx, int user, unsigned label, std::uint64_t options);
 GUEST_ABI int create_handle(int* handle);

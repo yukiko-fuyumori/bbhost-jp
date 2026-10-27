@@ -23,8 +23,7 @@ Snapshot read(const std::filesystem::path& file);
 enum class Status { Ok, AlreadyUnlocked, InvalidId, AutomaticPlatinum, IoError };
 struct Unlock { Status status; int platinum = -1; };
 
-// One store per running game. Existing bbhost trophies.txt files remain usable.
-// Writes preserve their contents, back up the original once, and replace atomically.
+// Preserves legacy records; backs up once and replaces atomically.
 class Store {
 public:
     void open(const std::filesystem::path& file);

@@ -129,10 +129,8 @@ std::mutex g_http_mu;
 int g_http_next = 1;
 std::unordered_map<int, HttpObj> g_http;
 std::unordered_set<HttpEpoll*> g_http_eps;
-// A bounded series of eligible server-status bootstrap attempts.  The game can
-// return to the title screen without calling sceHttpTerm or successfully logging
-// in, so a one-shot flag would permanently break in-process reconnection.
-// All accesses are under g_http_mu, including the reset in sceHttpTerm.
+// Retry across title-screen returns without requiring a login or HTTP reset.
+// Protected by g_http_mu.
 std::deque<std::chrono::steady_clock::time_point> g_jp_eu_bootstrap_history;
 constexpr auto kJpEuBootstrapMinInterval = std::chrono::seconds(1);
 constexpr auto kJpEuBootstrapWindow = std::chrono::minutes(1);
@@ -419,9 +417,7 @@ void perform(const std::string& url, int method, const Effective& eff, std::vect
     std::vector<std::uint8_t> body;
     host_log("http: no libcurl at build time; %s fails", url.c_str());
 #endif
-    // Login success is useful to trace, but must not be the only way to allow
-    // another server-status request: failed logins and title-screen returns also
-    // have to be able to retry.  The bounded retry window is independent.
+    // Login logging does not control the bootstrap retry window.
     if (!err && method == 1 && status == 200 &&
         url.find("/basic_utils/login") != std::string::npos) {
         const bool marker = jp_eu_active();
@@ -620,10 +616,7 @@ GUEST_ABI int hle_http_request_url(int conn, int method, const char* url, std::u
     r.url = url ? url : "";
     r.content_len = len;
     r.resp = std::make_shared<Response>();
-    // Only the JP/EU plugin's otherwise-empty GETs may bootstrap EU ss.info.
-    // This is a bounded *retry*, not an unconditional substitution for all
-    // empty URLs: one per second, at most 12 per rolling minute.  Returning to
-    // the title screen does not require a successful login to unlock retries.
+    // Bootstrap only the JP/EU plugin's empty GETs: one per second, 12 per minute.
     const bool jp_eu_marker = jp_eu_active();
     if (jp_eu_marker && method == 0 && r.url.empty()) {
         HttpObj* base = http_get(conn, HttpKind::Conn);
@@ -709,10 +702,7 @@ GUEST_ABI int hle_http_delete_connection(int id) {
     return 0;
 }
 
-// int sceHttpSendRequest(int reqId, const void* postData, size_t size)
-// Diagnostic only. Observe completed HTTP requests after perform(), regardless of
-// whether they were sent on BBHost's async worker thread or a blocking thread.
-// Never print tokens, upload object names, or the response body.
+// Log completion on either send path without tokens, object names or bodies.
 void jp_eu_log_completed_http(int req_id, const std::string& url, int method,
                               const std::shared_ptr<Response>& resp) {
     const bool eu_info =
@@ -741,6 +731,7 @@ void jp_eu_log_completed_http(int req_id, const std::string& url, int method,
     }
 }
 
+// int sceHttpSendRequest(int reqId, const void* postData, size_t size)
 GUEST_ABI int hle_http_send(int id, const void* post, std::uint64_t size) {
     std::string url;
     int method;

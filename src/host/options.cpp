@@ -133,7 +133,7 @@ Setting g_set[kSettingCount] = {
     // shared GPU memory (host/window.cpp, host_gpu_memory_glance).
     {"memory_counter", "メモリー表示", {"Off", "On"}, 0,
      "ビデオメモリー使用量、解放可能なキャッシュ、GPU が参照するゲームメモリーを表示します。Windows では後者が共有 GPU メモリーに相当します。", false},
-    // Keep 0.2.21's meter and saved option key while localizing its display.
+    // Preserve the saved option key.
     {"perf_overlay", "パフォーマンス表示", {"Off", "On"}, 0,
      "FPS を制限している処理と各処理の負荷を表示します。GPU、メインスレッド、GX、コマンド処理、FPS 上限などを確認できます。", false},
     // The follow camera's vertical field of view, LockCamParam's camFovY

@@ -65,8 +65,7 @@ while IFS= read -r exe; do
     strings -a "$exe" | grep -qxF "BBHOST_EDITION_PROFILE=$profile" || fail "executable edition mismatch"
     case "$exe" in *.exe) region_plugin=$b/plugins/region_switch.dll ;; *) region_plugin=$b/plugins/region_switch.so ;; esac
     strings -a "$region_plugin" | grep -qxF "BBHOST_REGION_PLUGIN_PROFILE=$profile" || fail "plugin edition mismatch"
-    # Both platforms retain the complete supplied pack, including the other
-    # platform's original binaries, while loading their rebuilt JP plugin.
+    # Preserve the supplied pack alongside the rebuilt edition-specific plugin.
     pack=$b/compat/jp-eu-v020
     [ -f "$pack/SHA256SUMS.txt" ] || fail "${b#"$work"/}: no compatibility pack"
     (cd "$pack" && sha256sum -c SHA256SUMS.txt >/dev/null) || fail "${b#"$work"/}: altered compatibility pack"

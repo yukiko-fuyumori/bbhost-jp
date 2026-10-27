@@ -940,7 +940,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         );
         SDL_RenderClear(ren);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
-        // Test-only screenshot before presentation; never captures game data.
+        // Capture the setup test's final frame.
         if (test && done) {
             if (const char* shot = std::getenv("BBHOST_SETUP_SCREENSHOT")) {
                 if (SDL_Surface* pixels = SDL_RenderReadPixels(ren, nullptr)) {

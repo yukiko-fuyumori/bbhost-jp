@@ -1,9 +1,6 @@
 #define _GNU_SOURCE
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * BBHost 1.09 JP Old Hunters CUSA03014: native Japanese files + EU online selectors.
- * One shared source for Linux x86-64 and Windows x64.
- * Japanese-edition online operation confirmed by the user (2026-10-27).
- * BBHost plugin ABI: https://github.com/droogie/bbhost/blob/master/include/bbhost_plugin.h
+ * BBHost 1.09: EU online selectors for JP releases and personal EU Linux builds.
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -270,8 +267,7 @@ EXPORT int bb_plugin_image(const BbHostApi *api){
  }
  g_api->log("region_switch: EU online selectors %d written, %d already present (12 total)",written,already);
 #if BBHOST_PERSONAL_EU
- /* The supplied EU compatibility behavior, only in the personal Linux build.
-  * No file in the user's dump is modified. */
+ /* Personal EU build: overlay metadata in memory, leaving the dump intact. */
  for(size_t i=0;i<4;i++)g_sfo[g_region_offset+i]=0;
  if(g_api->overlay_file("region_switch","/sce_sys/param.sfo",g_sfo,size)){
    g_api->log("region_switch: failed to install in-memory EU compatibility overlay");

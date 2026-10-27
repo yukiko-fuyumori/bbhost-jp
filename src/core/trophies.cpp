@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Trophy IDs, grades, hidden flags and platinum membership checked against
-// ayozetr/bloodborne_linux scripts/trophies.py (804651e4, GPL-2.0-or-later).
-// Storage and UI integration are native bbhost code; Japanese descriptions are
-// written for this fork. No game assets or trophy decryption keys are bundled.
+// Catalog reference: ayozetr/bloodborne_linux scripts/trophies.py
+// (804651e4, GPL-2.0-or-later). See docs/trophies.md for provenance.
 #include "core/trophies.h"
 
 #include <algorithm>

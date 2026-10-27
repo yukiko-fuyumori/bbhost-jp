@@ -1047,11 +1047,7 @@ int main(int argc, char** argv) {
     if (!load_orbis_elf(eboot, &image)) {
         return 1;
     }
-    // Only the 1.09 build runs: every patch, hook and engine layout is an
-    // address in it, and another version fails far from the cause. A tester's
-    // eboot of another version (2026-09-29) died before its first frame, on a
-    // path pointer of 0xffffffff in the file layer. Edition-restricted builds
-    // also require this exact executable; there is no environment override.
+    // Patches, hooks and engine layouts require this exact 1.09 executable.
     if (image.sha256 != kEboot109Sha256) {
         std::fputs(config_eboot_help(cfg, image.sha256, kEboot109Sha256).c_str(), stderr);
         std::fflush(stderr);

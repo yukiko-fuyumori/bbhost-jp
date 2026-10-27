@@ -960,7 +960,7 @@ else()
     USES_TERMINAL)
 endif()
 
-# Japanese fork: glyph rendering and JP/EU request policy, without game data.
+# Japanese release tests; no game files required.
 add_executable(trophies_test tests/trophies_test.cpp src/core/trophies.cpp src/hle/trophy.cpp)
 target_include_directories(trophies_test PRIVATE src)
 find_package(Threads REQUIRED)
@@ -976,8 +976,7 @@ add_test(NAME japanese_font_test COMMAND japanese_font_test)
 add_executable(jp_eu_http_test tests/jp_eu_http_test.cpp src/core/futex.cpp src/core/portable.cpp)
 target_include_directories(jp_eu_http_test PRIVATE src include ${CMAKE_BINARY_DIR}/gen)
 add_dependencies(jp_eu_http_test bbhost_version)
-# Only the request construction/policy code is exercised; discard the networking
-# entry points so this test cannot accidentally contact a real server.
+# Discard networking entry points from the request-policy test.
 target_compile_options(jp_eu_http_test PRIVATE -ffunction-sections -fdata-sections)
 target_link_options(jp_eu_http_test PRIVATE -Wl,--gc-sections)
 if(WIN32)

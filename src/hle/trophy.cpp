@@ -34,25 +34,28 @@ int result(trophies::Status status) {
 GUEST_ABI int create_context(int* ctx, int, unsigned, std::uint64_t) {
     if (!ctx) return kInvalidArgument;
     std::lock_guard lock(context_mutex);
-    if (contexts >= static_cast<int>(registered.size())) return static_cast<int>(0x80551606u);
+    if (contexts >= static_cast<int>(registered.size())) return kContextLimit;
     *ctx = ++contexts;
     return 0;
 }
 GUEST_ABI int create_handle(int* handle) {
     if (!handle) return kInvalidArgument;
     std::lock_guard lock(context_mutex);
-    if (handles >= 4) return static_cast<int>(0x80551606u);
+    if (handles >= 4) return kHandleLimit;
     *handle = ++handles;
     return 0;
 }
 GUEST_ABI int register_context(int ctx, int handle, std::uint64_t) {
     if (const int error = validate(ctx, handle, false)) return error;
+    const auto award = trophies::runtime().reconcile_platinum(std::time(nullptr));
+    if (award.status == trophies::Status::IoError) {
+        host_log("trophies: %s", trophies::runtime().snapshot().error.c_str());
+        return kIoError;
+    }
     {
         std::lock_guard lock(context_mutex);
         registered[ctx - 1] = true;
     }
-    const auto award = trophies::runtime().reconcile_platinum(std::time(nullptr));
-    if (award.status == trophies::Status::IoError) host_log("trophies: %s", trophies::runtime().snapshot().error.c_str());
     return result(award.status);
 }
 GUEST_ABI int unlock(int ctx, int handle, int id, int* platinum) {

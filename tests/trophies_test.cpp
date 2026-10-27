@@ -86,9 +86,14 @@ int main() {
     hle_register_trophies(); assert(imports.size() == 6);
     int ctx = 0, handle = 0;
     assert(create_context(nullptr, 1, 0, 0) == kInvalidArgument);
+    assert(create_handle(nullptr) == kInvalidArgument);
     assert(create_context(&ctx, 1, 0, 0) == 0 && create_handle(&handle) == 0);
     int platinum = 123;
     assert(unlock(ctx, handle, 14, &platinum) == kNotRegistered && platinum == -1);
+    trophies::runtime().open(root);
+    assert(register_context(ctx, handle, 0) == kIoError);
+    assert(unlock(ctx, handle, 14, &platinum) == kNotRegistered);
+    trophies::runtime().open(root / "api.txt");
     assert(register_context(ctx, handle, 0) == 0);
     assert(unlock(-1, handle, 14, &platinum) == kInvalidContext);
     assert(unlock(ctx, -1, 14, &platinum) == kInvalidHandle);
@@ -117,6 +122,12 @@ int main() {
     for (int i = 1; i < 34; ++i) if (i != 14) assert(unlock(ctx, handle, i, &platinum) == 0);
     assert(platinum == 0);
     assert(game_info(ctx, handle, &gd, &progress) == 0 && progress.platinum == 1 && progress.trophies == 34);
+    for (int i = 1; i < 8; ++i) assert(create_context(&ctx, 1, 0, 0) == 0);
+    ctx = 123;
+    assert(create_context(&ctx, 1, 0, 0) == static_cast<int>(0x80551623u) && ctx == 123);
+    for (int i = 1; i < 4; ++i) assert(create_handle(&handle) == 0);
+    handle = 123;
+    assert(create_handle(&handle) == static_cast<int>(0x80551624u) && handle == 123);
     fs::remove_all(root);
     std::cout << "PASS: persistence, backup, duplicate/concurrent unlocks, platinum, DLC, notifications, I/O failures, guest ABI\n";
 }
