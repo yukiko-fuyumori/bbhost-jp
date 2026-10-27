@@ -1,5 +1,7 @@
 #include "host/japanese_font.h"
 #include "host/ingame_menu.h"
+#include "host/trophy_ui.h"
+#include "core/config.h"
 
 #if defined(BBHOST_HAVE_SDL3)
 #include "host/gpu.h"
@@ -41,6 +43,7 @@ bool g_vk_ready = false;
 VkFormat g_format = VK_FORMAT_UNDEFINED;
 std::uint32_t g_images = 0;
 PluginUi g_ui;
+TrophyUi g_trophy_ui;
 std::chrono::steady_clock::time_point g_last;
 
 ImGuiKey key_of(SDL_Keycode k) {
@@ -267,8 +270,18 @@ bool build_frame(VkExtent2D extent) {
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(size, ImGuiCond_Always);
     bool keep = true;
-    if (ImGui::Begin("プラグイン  (F9 / Esc で閉じる)", &keep, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
-        plugin_ui_draw(g_ui, scale);
+    if (ImGui::Begin("メニュー  (F9 / Esc で閉じる)", &keep, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+        if (ImGui::BeginTabBar("##game_menu")) {
+            if (ImGui::BeginTabItem("プラグイン")) {
+                plugin_ui_draw(g_ui, scale);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("トロフィー")) {
+                trophy_ui_draw(g_trophy_ui, config().data);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
     }
     ImGui::End();
     if (!keep) g_open.store(false);

@@ -1,5 +1,6 @@
 #include "host/japanese_font.h"
 #include "host/launcher.h"
+#include "host/trophy_ui.h"
 #include "core/game_edition.h"
 
 #include "bbhost_version.h"
@@ -309,6 +310,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // does, then closes once the server has answered.
     const char* test = std::getenv("BBHOST_SETUP_TEST");
     int frames = 0;
+    TrophyUi trophy_ui;
+    bool trophy_tab = test && !std::strcmp(test, "trophies");
     // link: starts a Discord link as its button does and, once the code is
     // up, cancels it and closes.
     const std::string test_create = test && !std::strncmp(test, "create:", 7) ? test + 7 : "";
@@ -677,6 +680,12 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("トロフィー", nullptr, trophy_tab ? ImGuiTabItemFlags_SetSelected : 0)) {
+                trophy_ui_draw(trophy_ui, f[kData].str().empty() ? config_default_data_dir() : f[kData].str(),
+                               ImGui::GetContentRegionAvail().y - footer);
+                trophy_tab = false;
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem("プラグイン", nullptr, pflags)) {
                 plugin_ui_draw(plugin_ui, scale, ImGui::GetContentRegionAvail().y - footer);
                 plugin_seen = true;
@@ -885,7 +894,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::SameLine();
         if (ImGui::Button("保存", ImVec2(140 * scale, 0))) save();
         ImGui::SameLine();
-        if (ImGui::Button("終了", ImVec2(140 * scale, 0)) || (test && !std::strcmp(test, "quit") && ++frames > 30)) done = true;
+        if (ImGui::Button("終了", ImVec2(140 * scale, 0)) || (test && (!std::strcmp(test, "quit") || !std::strcmp(test, "trophies")) && ++frames > 30)) done = true;
         if (test_link && ++frames > 30) {
             if (!test_created) {
                 test_created = true;

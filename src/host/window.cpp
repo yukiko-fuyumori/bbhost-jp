@@ -13,6 +13,7 @@
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/overlay.h"
+#include "host/trophy_ui.h"
 #include "host/perf_meter.h"
 #include "host/present_pass.h"
 #include "host/ingame_menu.h"
@@ -2313,6 +2314,13 @@ bool host_window_pump() {
     // The frame's overlay, whole, to the presenter: a present never sees one
     // half rebuilt. Nothing on it (no counter, pointer, box or screen) and the
     // presenter's pass draws nothing over the picture.
+    {
+        float width, height;
+        { std::lock_guard lock(g_mouse_mu);
+          width = g_display_w ? float(g_display_w) : 1920.f;
+          height = g_display_h ? float(g_display_h) : 1080.f; }
+        trophy_notice_draw(width, height);
+    }
     host_overlay_commit();
     // BBHOST_MOUSE_LOG=1: the pointer as the host sees it, for bringing it up
     // before there is a consumer. This **consumes** the edges, the wheel and

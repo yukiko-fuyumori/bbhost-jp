@@ -78,6 +78,7 @@ add_executable(bbhost
   src/host/plugins.cpp
   src/core/tls_rewrite.cpp
   src/core/config.cpp src/core/game_edition.cpp
+  src/core/trophies.cpp
   src/engine/image_text.cpp
   src/core/sha256.cpp
   src/core/sfo.cpp
@@ -141,6 +142,7 @@ add_executable(bbhost
   src/host/japanese_font.cpp
   src/host/present_pass.cpp
   src/host/ingame_menu.cpp
+  src/host/trophy_ui.cpp
   src/host/options.cpp
   src/host/updater.cpp
   src/host/update_verify.cpp
@@ -178,6 +180,7 @@ add_executable(bbhost
   src/hle/http.cpp
   src/hle/ajm.cpp
   src/hle/system.cpp
+  src/hle/trophy.cpp
   src/host/label_landing.cpp
 )
 
@@ -958,6 +961,11 @@ else()
 endif()
 
 # Japanese fork: glyph rendering and JP/EU request policy, without game data.
+add_executable(trophies_test tests/trophies_test.cpp src/core/trophies.cpp src/hle/trophy.cpp)
+target_include_directories(trophies_test PRIVATE src)
+find_package(Threads REQUIRED)
+target_link_libraries(trophies_test PRIVATE Threads::Threads)
+add_test(NAME trophies_test COMMAND trophies_test)
 add_executable(game_edition_test tests/game_edition_test.cpp src/core/game_edition.cpp src/core/config.cpp src/core/sfo.cpp)
 target_include_directories(game_edition_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
 add_dependencies(game_edition_test bbhost_version)

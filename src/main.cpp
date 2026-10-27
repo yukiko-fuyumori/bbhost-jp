@@ -3,6 +3,7 @@
 #include "decomp/decomp.h"
 #include "engine/mouse_camera.h"
 #include "core/config.h"
+#include "core/trophies.h"
 #include "bbhost_edition.h"
 #include "core/host_clock.h"
 #include "core/portable.h"
@@ -1025,6 +1026,7 @@ int main(int argc, char** argv) {
                      "the game stops when it reads a file only the update has.",
                      v.app_ver.c_str());
     }
+    trophies::runtime().open(std::filesystem::u8path(cfg.data) / "trophies.txt");
     hle_fs_set_roots(cfg.app0.c_str(), cfg.data.empty() ? nullptr : cfg.data.c_str(),
                      cfg.tmp.empty() ? nullptr : cfg.tmp.c_str(), eboot,
                      cfg.mods.empty() ? nullptr : cfg.mods.c_str());

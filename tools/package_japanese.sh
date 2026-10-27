@@ -21,3 +21,5 @@ cp third_party/mplus/LICENSE "$dest/licenses/mplus/LICENSE"
 guide=docs/japanese-release.md
 [ "$profile" = jp-only ] || guide=docs/personal-eu-release.md
 cp "$guide" "$dest/導入手順_日本語.md"
+
+cp docs/trophies.md "$dest/トロフィー.md"

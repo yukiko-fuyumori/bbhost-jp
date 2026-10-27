@@ -73,6 +73,7 @@ while IFS= read -r exe; do
     case "$exe" in *.exe) plugin=region_switch.dll ;; *) plugin=region_switch.so ;; esac
     [ -f "$b/plugins/$plugin" ] || fail "${b#"$work"/}: no active JP plugin"
     [ -f "$b/licenses/mplus/LICENSE" ] || fail "${b#"$work"/}: no Japanese font licence"
+    [ -f "$b/トロフィー.md" ] || fail "${b#"$work"/}: no trophy instructions"
     [ -f "$b/導入手順_日本語.md" ] || fail "${b#"$work"/}: no Japanese instructions"
     for want in 'region_switch = true' 'region = "JP"'; do
         tr -d '\r' < "$b/bbhost.example.toml" | grep -qxF "$want" || fail "${b#"$work"/}: lacks $want"

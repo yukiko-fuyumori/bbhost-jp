@@ -9,6 +9,7 @@ bbhost 0.2.21 の変更を取り込んだ、Bloodborne を Windows x64 と Linux
 ゲームデータ、復号済み eboot、セーブ、認証情報は含みません。自分で用意した更新 1.09 適用済みのゲームと、対応する復号済み ELF が必要です。
 
 - [日本語の導入・操作・ビルド手順](docs/japanese-release.md)
+- [ローカルトロフィー](docs/trophies.md)
 - [個人用 Linux・欧州 GOTY 互換版](docs/personal-eu-release.md)
 - [提供された互換パック全体](compat/jp-eu-v020/README.md)
 - [上流の技術概要（英語、参考資料）](README.upstream.md)
