@@ -10,7 +10,6 @@ bbhost 0.2.21 の変更を取り込んだ、Bloodborne を Windows x64 と Linux
 
 - [日本語の導入・操作・ビルド手順](docs/japanese-release.md)
 - [ローカルトロフィー](docs/trophies.md)
-- [個人用 Linux・欧州 GOTY 互換版](docs/personal-eu-release.md)
 - [提供された互換パック全体](compat/jp-eu-v020/README.md)
 - [上流の技術概要（英語、参考資料）](README.upstream.md)
 - [ライセンス](LICENSE)
