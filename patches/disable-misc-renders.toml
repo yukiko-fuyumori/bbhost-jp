@@ -7,10 +7,12 @@
 # drawn.
 [patch]
 name = "disable-misc-renders"
+title = "Disable Misc. Renders"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "追加描画先４つと対応する描画処理を省略 (Kyo)"
 enabled = false
-order = 132
+order = 22
+live = false
 
 # call 0x2666420 -> xor eax, eax
 [site.target-a]

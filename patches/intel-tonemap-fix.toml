@@ -1,0 +1,21 @@
+# Intel Black Tonemap Fix: Kyo's patch for 1.09, from the shadPS4 patch list
+# (Bloodborne.xml), byte for byte: 1 sites, 6 bytes.
+#
+# The list's note:
+# Fixes the black tonemap colors, most notable in DLC areas when using Intel
+# CPU.
+#
+# Off until turned on: the setup window's Patches tab, the patch menu in the
+# game (F9), or `intel-tonemap-fix = true` under [patches] in bbhost.toml.
+[patch]
+name = "intel-tonemap-fix"
+title = "Intel 向け黒い色調の修正"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Intel CPU 使用時に、特に DLC エリアで発生する黒い色調を修正します。"
+enabled = false
+order = 210
+
+[site.s000]
+address = "0x025843e5"
+expect = "0f 84 3a 01 00 00"
+bytes = "90 90 90 90 90 90"

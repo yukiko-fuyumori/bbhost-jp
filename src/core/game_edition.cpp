@@ -3,17 +3,14 @@
 
 #include <map>
 
-const char* game_edition_name(GameEdition edition) {
-    return edition == GameEdition::JapaneseOldHunters
-        ? "日本版 Old Hunters（CUSA03014）専用"
-        : "欧州 GOTY 版（CUSA03173）専用・個人用 Linux";
+const char* game_edition_name() {
+    return "日本版 Old Hunters（CUSA03014）専用";
 }
 
-std::string game_edition_error(const std::string& base, const std::string& update, GameEdition edition) {
-    const bool jp = edition == GameEdition::JapaneseOldHunters;
-    const char* title = jp ? "CUSA03014" : "CUSA03173";
-    const unsigned region = jp ? 0 : 13;
-    const std::string prefix = std::string("このビルドは ") + game_edition_name(edition) + " です。";
+std::string game_edition_error(const std::string& base, const std::string& update) {
+    const char* title = "CUSA03014";
+    const unsigned region = 0;
+    const std::string prefix = std::string("このビルドは ") + game_edition_name() + " です。";
     const auto check = [&](const std::string& folder) -> std::string {
         const std::string path = folder + "/sce_sys/param.sfo";
         std::map<std::string, SfoValue> values;

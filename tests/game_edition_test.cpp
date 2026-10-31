@@ -43,10 +43,10 @@ int main(int argc, char** argv) {
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     const auto base = root / "game", update = root / "game-UPDATE";
     const auto jp = metadata("CUSA03014", 0), eu = metadata("CUSA03173", 13);
-    for (auto edition : {GameEdition::JapaneseOldHunters, GameEdition::EuropeanGoty}) {
-        const auto& valid = edition == GameEdition::JapaneseOldHunters ? jp : eu;
-        const auto& other = edition == GameEdition::JapaneseOldHunters ? eu : jp;
-        const auto check = [&] { return game_edition_error(base.string(), "", edition).empty(); };
+    {
+        const auto& valid = jp;
+        const auto& other = eu;
+        const auto check = [&] { return game_edition_error(base.string(), "").empty(); };
         assert(!check());
         write_sfo(base, valid); assert(check());
         write_sfo(base, other); assert(!check());
@@ -66,15 +66,15 @@ int main(int argc, char** argv) {
           f.seekp(16); f.write("\xff\xff\xff\xff", 4); }
         assert(!check());
         write_sfo(base, valid); write_sfo(update, valid);
-        assert(game_edition_error(base.string(), update.string(), edition).empty());
+        assert(game_edition_error(base.string(), update.string()).empty());
         write_sfo(update, other);
-        assert(!game_edition_error(base.string(), update.string(), edition).empty());
+        assert(!game_edition_error(base.string(), update.string()).empty());
         fs::remove(update / "sce_sys/param.sfo");
-        assert(!game_edition_error(base.string(), update.string(), edition).empty());
+        assert(!game_edition_error(base.string(), update.string()).empty());
         fs::remove_all(base); fs::remove_all(update);
     }
-    const auto& valid = BBHOST_PERSONAL_EU ? eu : jp;
-    const auto& other = BBHOST_PERSONAL_EU ? jp : eu;
+    const auto& valid = jp;
+    const auto& other = eu;
     write_sfo(base, valid);
     const auto eboot = root / "eboot.elf";
     std::ofstream(eboot) << "fixture; executable hash is checked separately";

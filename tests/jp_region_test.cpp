@@ -31,15 +31,9 @@ static bool active() {
 }
 static unsigned char sfo[256];
 static int patches,overlays,allowed=1;
-#if BBHOST_PERSONAL_EU
-static constexpr const char* title="CUSA03173";
-static constexpr const char* other_title="CUSA03014";
-static constexpr unsigned region=13, expected_overlays=1;
-#else
 static constexpr const char* title="CUSA03014";
 static constexpr const char* other_title="CUSA03173";
 static constexpr unsigned region=0, expected_overlays=0;
-#endif
 static char mode[8]="JP";
 static void logger(const char *fmt,...){va_list a;va_start(a,fmt);vprintf(fmt,a);puts("");va_end(a);}
 static const char* config(const char *key){assert(!strcmp(key,"region_switch.region"));return mode;}

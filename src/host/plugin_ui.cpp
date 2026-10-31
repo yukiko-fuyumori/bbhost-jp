@@ -1,3 +1,4 @@
+#define IMGUI_DEFINE_MATH_OPERATORS
 #include "host/plugin_ui.h"
 
 #include "bbhost_plugin.h"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -20,6 +22,7 @@ const char* choice_label(const std::string& value) {
         {"story", "物語順"}, {"random", "ランダム"}, {"same area", "同じエリア"},
         {"whole game", "全エリア"}, {"evenly", "均等"}, {"like the original", "原作準拠"},
         {"none", "なし"}, {"a few", "少数"}, {"many", "多数"}, {"OFF", "無効"},
+        {"A Call Beyond", "彼方への呼びかけ"}, {"Blacksky Eye", "夜空の瞳"},
         {"JP", "日本語 + 欧州オンライン"}, {"EU", "欧州"}
     };
     for (const auto& [key, label] : labels) if (value == key) return label;
@@ -49,9 +52,32 @@ std::string random_seed() {
     return text;
 }
 
+// A small rounded label beside the title, its text on the title's line.
 void badge(const char* text, ImVec4 colour) {
     ImGui::SameLine();
-    ImGui::TextColored(colour, "[%s]", text);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const ImVec2 pad(ImGui::GetFontSize() * 0.45f, ImGui::GetFontSize() * 0.1f);
+    const ImVec2 p = ImGui::GetCursorScreenPos() - ImVec2(0, pad.y);
+    dl->AddRectFilled(p, p + ts + pad * 2, ImGui::GetColorU32(ImVec4(colour.x, colour.y, colour.z, 0.16f)), ts.y * 0.5f + pad.y);
+    dl->AddText(p + pad, ImGui::GetColorU32(colour), text);
+    ImGui::Dummy(ImVec2(ts.x + pad.x * 2, ts.y));
+}
+
+// A setting's help: in a bubble over the setting, and over the (?) after it.
+void help(const std::string& text) {
+    auto bubble = [&] {
+        if (ImGui::BeginItemTooltip()) {
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24.0f);
+            ImGui::TextUnformatted(text.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+    };
+    bubble();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    bubble();
 }
 
 // One setting's widget. `value` is what the config holds (or the default);
@@ -61,6 +87,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
     ImGui::PushID(id.c_str());
     const bool later = ui.in_game && !o.live && o.type != BB_OPT_ACTION && o.type != BB_OPT_HEADING;
     const std::string label = o.label + (later ? "  （次回起動時）" : "");
+    bool helped = false;  // the widget put its help after something of its own
     const std::string value = plugins_option_value(p, o);
     const float width = 260 * scale;
     switch (o.type) {
@@ -126,6 +153,8 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
         const bool active = ImGui::IsItemActive();
         // A seed: a new one at the click, shown in the box and saved.
         if (o.key == "seed") {
+            if (!o.help.empty()) help(o.help);
+            helped = true;
             ImGui::SameLine();
             if (ImGui::Button("ランダムなシード")) {
                 it->second = random_seed();
@@ -140,25 +169,27 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
         ImGui::BeginDisabled(!can);
         if (ImGui::Button(o.label.c_str(), ImVec2(width, 0))) plugins_run_action(p.name, o.key);
         ImGui::EndDisabled();
+        // Why it cannot be pressed, in its bubble with its help.
         if (!can) {
-            ImGui::SameLine();
-            ImGui::TextDisabled(ui.in_game ? "（プラグインを有効にして再起動）" : "（ゲーム中のプラグインメニューで操作）");
+            if (ImGui::BeginItemTooltip()) {
+                ImGui::TextUnformatted(ui.in_game ? "プラグインを有効にして再起動してください。" : "ゲーム中のプラグインメニューで操作します。");
+                if (!o.help.empty()) ImGui::TextDisabled("%s", o.help.c_str());
+                ImGui::EndTooltip();
+            }
+            helped = true;
         }
         break;
     }
     default:
         break;
     }
-    if (!o.help.empty() && o.type != BB_OPT_HEADING) {
-        ImGui::Indent(16 * scale);
+    if (!o.help.empty() && o.type == BB_OPT_HEADING) {
+        // A heading's words say what the settings under it are for: shown.
         ImGui::PushTextWrapPos(0.0f);
         ImGui::TextDisabled("%s", o.help.c_str());
         ImGui::PopTextWrapPos();
-        ImGui::Unindent(16 * scale);
-    } else if (!o.help.empty()) {
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("%s", o.help.c_str());
-        ImGui::PopTextWrapPos();
+    } else if (!o.help.empty() && !helped) {
+        help(o.help);
     }
     ImGui::PopID();
 }
@@ -193,48 +224,73 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
     ImGui::BeginDisabled(busy || config().update_source.empty());
     if (ImGui::Button("公式プラグインの最新版を取得")) updater::fetch_plugins(config_user_dir() + "/plugins");
     ImGui::EndDisabled();
+    ImGui::SetItemTooltip("最新リリースの署名済みプラグインを取得します。");
     ImGui::SameLine();
     if (ImGui::Button("再スキャン")) plugin_ui_refresh(ui);
+    ImGui::SetItemTooltip("プラグインを再スキャンします。");
     ImGui::SameLine();
+    // At the right of the line.
+    const char* every_label = "起動時に毎回表示";
+    const float every_w = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(every_label).x;
+    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - every_w));
     bool every = config_value("plugins.show_settings") == "true";
-    if (ImGui::Checkbox("起動時にプラグイン設定を表示", &every)) {
+    if (ImGui::Checkbox(every_label, &every)) {
         config_set_values(config_user_file(), {{"plugins", "show_settings", every ? "true" : "false"}});
         config_value_set("plugins.show_settings", every ? "true" : "false");
     }
+    ImGui::SetItemTooltip("起動時にプラグイン設定を表示します。");
     if (const std::string st = updater::plugins_status(); !st.empty()) ImGui::TextDisabled("%s", st.c_str());
 
     const float h = height > 0 ? height : ImGui::GetContentRegionAvail().y;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ImGui::GetFontSize() * 0.6f, ImGui::GetFontSize() * 0.6f));
     ImGui::BeginChild("##list", ImVec2(230 * scale, h), ImGuiChildFlags_Borders);
+    ImGui::PopStyleVar();
     if (ui.plugins.empty()) {
         ImGui::PushTextWrapPos(0.0f);
         ImGui::TextDisabled("プラグインがありません。上から取得するか、%s/plugins に配置してください。", config_user_dir().c_str());
         ImGui::PopTextWrapPos();
     }
+    // Each plugin a row: a dot, lit when it is on, and its title.
+    const float fs = ImGui::GetFontSize(), row_h = std::round(fs * 1.8f);
     for (std::size_t i = 0; i < ui.plugins.size(); ++i) {
         const PluginEntry& p = ui.plugins[i];
-        std::string line = p.title + (p.enabled ? "" : "  （無効）");
-        if (ImGui::Selectable(line.c_str(), ui.selected == static_cast<int>(i))) ui.selected = static_cast<int>(i);
+        ImGui::PushID(static_cast<int>(i));
+        const ImVec2 at = ImGui::GetCursorScreenPos();
+        if (ImGui::Selectable("##row", ui.selected == static_cast<int>(i), 0, ImVec2(0, row_h))) ui.selected = static_cast<int>(i);
+        ImGui::SetItemTooltip("%s", p.enabled ? "有効" : "無効");
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec4 dot = p.bad_signature ? ImVec4(0.95f, 0.35f, 0.40f, 1.0f) : p.enabled ? ImVec4(0.37f, 0.89f, 0.67f, 1.0f) : ImVec4(0.5f, 0.5f, 0.6f, 0.6f);
+        dl->AddCircleFilled(at + ImVec2(fs * 0.55f, row_h * 0.5f), fs * 0.22f, ImGui::GetColorU32(dot));
+        dl->AddText(at + ImVec2(fs * 1.3f, (row_h - fs) * 0.5f), ImGui::GetColorU32(p.enabled ? ImGuiCol_Text : ImGuiCol_TextDisabled),
+                    p.title.c_str());
+        ImGui::PopID();
     }
     ImGui::EndChild();
     ImGui::SameLine();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(fs * 1.0f, fs * 0.8f));
     ImGui::BeginChild("##details", ImVec2(0, h), ImGuiChildFlags_Borders);
+    ImGui::PopStyleVar();
     if (!ui.plugins.empty()) {
         PluginEntry& p = ui.plugins[static_cast<std::size_t>(ui.selected)];
-        ImGui::Text("%s", p.title.c_str());
+        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.3f);
+        ImGui::TextUnformatted(p.title.c_str());
+        ImGui::PopFont();
         if (!p.version.empty()) {
             ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
             ImGui::TextDisabled("%s", p.version.c_str());
         }
-        if (p.official) badge("official", ImVec4(0.45f, 0.80f, 0.45f, 1.0f));
-        else if (p.bad_signature) badge("署名が一致しないため読み込みません", ImVec4(0.95f, 0.35f, 0.30f, 1.0f));
-        else badge("署名なし", ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
-        if (p.flags & BB_PLUGIN_GAMEPLAY) badge("ゲーム内容を変更", ImVec4(0.95f, 0.70f, 0.30f, 1.0f));
+        if (p.official) badge("official", ImVec4(0.37f, 0.89f, 0.67f, 1.0f));
+        else if (p.bad_signature) badge("署名が一致しないため読み込みません", ImVec4(0.95f, 0.35f, 0.40f, 1.0f));
+        else badge("署名なし", ImVec4(0.65f, 0.66f, 0.78f, 1.0f));
+        if (p.flags & BB_PLUGIN_GAMEPLAY) badge("ゲーム内容を変更", ImVec4(1.0f, 0.54f, 0.78f, 1.0f));
         if (!p.author.empty()) ImGui::TextDisabled("作者: %s - %s", p.author.c_str(), p.file.c_str());
         if (!p.description.empty()) {
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(p.description.c_str());
             ImGui::PopTextWrapPos();
         }
+        ImGui::Spacing();
         ImGui::BeginDisabled(p.bad_signature);
         bool on = p.enabled;
         if (ImGui::Checkbox("有効", &on)) {

@@ -7,6 +7,7 @@ inline const char* host_japanese_value(const char* value) {
     if (!std::strcmp(value, "On")) return "有効";
     if (!std::strcmp(value, "Off")) return "無効";
     if (!std::strcmp(value, "Uncapped")) return "無制限";
+    if (!std::strcmp(value, "Display-Limited")) return "画面に合わせる";
     if (!std::strcmp(value, "Original")) return "原作";
     if (!std::strcmp(value, "Auto")) return "自動";
     if (!std::strcmp(value, "Keyboard")) return "キーボード";
