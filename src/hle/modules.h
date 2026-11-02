@@ -116,6 +116,9 @@ bool hle_gx_arena_covers_marker(std::uint64_t va, std::uint64_t bytes);  // a ra
 bool hle_gnm_arena_monitor();  // BBHOST_ARENA_MONITOR=1
 // The buttons the last scePadRead handed the game (system.cpp).
 std::uint32_t hle_pad_delivered_buttons();
+// How long ago (seconds) Cross or Circle last went down in what the game was
+// handed; a large value when neither has been pressed (system.cpp).
+double hle_pad_confirm_press_age();
 std::string hle_av_stats();     // " movie-frames=N movie-audio-chunks=N"
 std::string hle_audio_stats();  // " audio-port<h>=<writes>" per open port  // " op:count" per CP packet that forced a flush
 void hle_gnm_exec_stats(std::uint64_t* packets, std::uint64_t* writes);
@@ -152,6 +155,8 @@ void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool record
 // timeline (BBHOST_FLIP_TIMELINE=1).
 std::uint64_t hle_video_note_flip_call(std::int64_t arg);
 std::uint64_t hle_video_flip_count();
+// Whether the game registered `va` as a display buffer (any port; lock-free).
+bool hle_video_is_display_buffer(std::uint64_t va);
 std::uint64_t hle_video_last_tick_ns();  // steady-clock ns of the last vblank tick (diagnostics)
 // A test harness asked the run to end as BBHOST_EXIT_SECONDS ends one (the
 // `exit` request of BBHOST_TEST_REQUESTS): the exit reports and the cache

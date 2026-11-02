@@ -1,7 +1,7 @@
 # bbhost 日本語版の設定。ゲームと復号済み eboot の場所を指定してください。
 # 相対パスはこのファイルの場所を基準にします。Windows でも / を使用できます。
 [paths]
-# 日本版 Old Hunters (CUSA03014)、更新 1.09、dvdroot_ps4 を含むフォルダー。
+# このビルドに対応する版、更新 1.09、dvdroot_ps4 を含むフォルダー。
 app0 = "PATH-TO-THE-GAME-DUMP"
 # SHA-256: 941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7
 eboot = "PATH-TO-THE-EBOOT"
@@ -32,7 +32,14 @@ fps_cap = 30
 headless = false
 
 [startup]
-skip_intro = false
+skip_intro = true
+setup_animations = true
+# メニュー文字の倍率（100〜400%）。F10 の設定が優先されます。
+setup_text_size = 100
+
+[world]
+# 死亡時の表示を SKILL ISSUE に変更します。
+skill_issue = false
 
 [plugins]
 region_switch = true

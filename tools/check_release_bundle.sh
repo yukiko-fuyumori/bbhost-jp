@@ -8,8 +8,7 @@
 # publish job runs it on what it is about to sign.
 #   tools/check_release_bundle.sh DIR     (dist/release)
 set -eu
-d=${1:?usage: tools/check_release_bundle.sh DIR [--allow-personal-eu]}
-allow_personal=${2:-}
+d=${1:?usage: tools/check_release_bundle.sh DIR}
 fail() { echo "release bundle: $*" >&2; exit 1; }
 if ls "$d" | grep -i playtest; then fail "a playtest kit is among the assets"; fi
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
@@ -55,10 +54,6 @@ while IFS= read -r exe; do
     profile=$(cat "$b/edition.txt") || fail "missing edition profile"
     case "$profile" in
         jp-only) ;;
-        eu-personal)
-            [ "$allow_personal" = --allow-personal-eu ] || fail "personal EU build in public release assets"
-            [ "$(basename "$exe")" = bbhost ] || fail "personal EU build must be Linux"
-            ;;
         *) fail "unknown edition profile: $profile" ;;
     esac
     case "$(basename "$b")" in *"-$profile-"*) ;; *) fail "archive name does not identify edition $profile";; esac

@@ -102,6 +102,8 @@ enum SettingId {
     kFivePlayers,
     kSkillIssue,
     kMenuTextSize,
+    kMenuHue,
+    kMenuVibrance,
     kSettingCount,
 };
 
@@ -293,6 +295,17 @@ Setting g_set[kSettingCount] = {
     {"menu_text_size", "メニューの文字サイズ", {"100%", "125%", "150%", "175%", "200%", "250%", "300%", "350%", "400%"}, 0,
      "F9・F10・設定画面の文字とメニューを拡大します。100% が標準です。画面に収まらない場合はスクロールします。",
      false},
+    // The colours of the same menus (launcher_ui recolour): 0 degrees and 0 percent
+    // are their own blue and violet. Hue turns every colour in them round the
+    // colour wheel but the green, amber and red that mean ok, a warning and a
+    // problem; vibrance takes colour out (-100%: black and white) or adds it.
+    {"menu_hue", "メニューの色相",
+     {"-165°", "-150°", "-135°", "-120°", "-105°", "-90°", "-75°", "-60°", "-45°", "-30°", "-15°", "0°", "+15°", "+30°", "+45°", "+60°", "+75°", "+90°", "+105°", "+120°", "+135°", "+150°", "+165°", "+180°"},
+     11, "設定画面と F9・F10 の色相を調整します。0 度は標準の青と紫です。",
+     false},
+    {"menu_vibrance", "メニューの鮮やかさ",
+     {"-100%", "-90%", "-80%", "-70%", "-60%", "-50%", "-40%", "-30%", "-20%", "-10%", "0%", "+10%", "+20%", "+30%", "+40%", "+50%", "+60%", "+70%", "+80%", "+90%", "+100%"},
+     10, "メニューの色の鮮やかさです。-100% は白黒、0% は標準、+100% は最大です。", false},
 };
 
 const Row g_rows[] = {
@@ -304,6 +317,8 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kMemoryCounter},
     {Row::Option, nullptr, kPerfOverlay},
     {Row::Option, nullptr, kMenuTextSize},
+    {Row::Option, nullptr, kMenuHue},
+    {Row::Option, nullptr, kMenuVibrance},
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
     {Row::Option, nullptr, kCameraHeight},
@@ -678,7 +693,9 @@ void apply(int id) {
         case kSkillIssue:
             break;  // read by the loader before any of this exists
         case kMenuTextSize:
-            break;  // the menus read it every frame (host_opt_menu_text_scale)
+        case kMenuHue:
+        case kMenuVibrance:
+            break;  // the menus read them every frame (host_opt_menu_text_scale, host_opt_menu_colour)
         default: break;
     }
 }
@@ -1519,6 +1536,16 @@ float host_opt_menu_text_scale() {
     const Setting& s = g_set[kMenuTextSize];
     const int i = std::clamp(s.index, 0, static_cast<int>(s.values.size()) - 1);
     return static_cast<float>(std::atoi(s.values[static_cast<std::size_t>(i)])) / 100.0f;
+}
+
+void host_opt_menu_colour(float* hue_degrees, float* vibrance) {
+    const auto value = [](SettingId id) {
+        const Setting& s = g_set[id];
+        const int i = std::clamp(s.index, 0, static_cast<int>(s.values.size()) - 1);
+        return static_cast<float>(std::atoi(s.values[static_cast<std::size_t>(i)]));
+    };
+    *hue_degrees = value(kMenuHue);
+    *vibrance = value(kMenuVibrance) / 100.0f;
 }
 
 int host_opt_index(const char* key) {

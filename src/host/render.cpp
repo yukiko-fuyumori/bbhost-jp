@@ -9,6 +9,8 @@
 #include "engine/gx_state.h"
 #include "engine/loading.h"
 #include "host/clip_control.h"
+#include "host/copy_census.h"
+#include "host/full_write.h"
 #include "host/gpu_internal.h"
 #include "host/gs_emit_gate.h"
 #include "host/heap_compact.h"
@@ -71,6 +73,37 @@ bool hs_constant_factors(const gcn::Program& p, float out[6]);
 }  // namespace
 
 namespace gpu {
+// BBHOST_COPY_ELIDE_MUTANT (checks of BBHOST_COPY_ELIDE=compare, never for play): =1 a
+// draw's attachments are left out of the copy ledger, so a source drawn into while its
+// copy is pending is not made first - compare mode must find the differences; =2 a draw
+// proven to write all of its target (copy_elide_decide_locked) is drawn with its scissor
+// a row short, =3 with its first triangle only - its coverage canary must find the texels
+// left; =4 an exact point copy (copy_elide_point_copy_locked) is drawn with its scissor a
+// row short - the compare of its target with its source must find the row.
+const int g_elide_mutant = [] {
+    const char* e = std::getenv("BBHOST_COPY_ELIDE_MUTANT");
+    return e && e[0] >= '1' && e[0] <= '4' ? e[0] - '0' : 0;
+}();
+// BBHOST_RT_DCC (on unless 0): colour targets made with their view formats listed (rt_image).
+bool rt_dcc_listed() {
+    static const bool listed = [] {
+        const char* e = std::getenv("BBHOST_RT_DCC");
+        return !(e && e[0] == '0');
+    }();
+    return listed;
+}
+// BBHOST_COPY_ELIDE: 0 every copy made where asked (the default), 1 copies left unmade, 2 compare (below, with the ledger).
+// BBHOST_COPY_ELIDE as set - 0, 1, compare (2) - or -1 when it is not (copy_elide_decide: the device's default).
+int copy_elide_env() {
+    static const int mode = [] {
+        const char* e = std::getenv("BBHOST_COPY_ELIDE");
+        if (!e || !*e) return -1;
+        if (std::strcmp(e, "compare") == 0) return 2;
+        return std::atoi(e) == 1 ? 1 : 0;
+    }();
+    return mode;
+}
+int copy_elide_mode();  // below (g_copy_elide)
 bool dump_rt_locked(RtImage& r, const char* path);
 bool rt_float_max_locked(RtImage& r, float* out3);
 void apply_pending_clear(RtImage& r);
@@ -1708,6 +1741,10 @@ std::uint64_t g_max_rt_bytes = 0;
 std::unordered_set<std::uint64_t> g_htile_bases;
 
 void destroy_rt_image(RtImage& r) {
+    if (copy_census::on()) copy_census::retire(r.base);
+    // A pending copy out of it is made from this image (destroyed once the work in
+    // flight has run); one into it is never made (BBHOST_COPY_ELIDE).
+    if (copy_elide_live() && rt_at_locked(r.base) == &r) copy_elide_touch_locked(r.base, copy_elide::kRetire);
     if (r.view_clear) {
         r.view_clear = r.view_clear_load = false;
         ++g_vc_dropped;
@@ -1812,6 +1849,7 @@ bool take_pending_htile(std::uint64_t key, RtImage& r) {
         return false;
     }
     r.htile_clear_pending = true;
+    if (copy_census::on()) copy_census::touch(r.base, copy_census::kTouchClear, "HTILE fill");
     const float depth = htile_word_depth(it->second.word);
     std::memcpy(&r.htile_clear_depth, &depth, 4);
     r.htile_clear_stencil = it->second.stencil_clear;
@@ -1870,6 +1908,7 @@ void rt_written(RtImage& r) {
     r.written_ms = ms;
     r.written_seq = hle_gnm_cp_job_seq();
     r.last_write = ++g_rt_writes;
+    if (copy_census::on()) copy_census::rt_written(r);
 }
 // The generation of the live GX texture whose memory a target or snapshot
 // made at `base` starts in (0: none): the target is that resource's image.
@@ -1979,6 +2018,41 @@ void rt_take_generation(RtImage& r, std::uint32_t gen) {
 
 RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std::uint32_t height, bool depth,
                   std::uint32_t layers = 1, std::uint64_t slice_bytes = 0, std::uint32_t gen = 0) {
+    // Copies left unmade (BBHOST_COPY_ELIDE): a draw binding a pending copy's source
+    // or destination as an attachment writes it (the copy made first). Any other
+    // lookup (a clear token's) that replaces the image of either - the old image's
+    // pixels carried into one of another format or more layers, or let go - has
+    // the copy made first too: the carry then moves the right pixels, and the
+    // source's old image is the one the copy reads.
+    if (copy_elide_live()) {
+        if (t_elide_lookup) {
+            // An attachment of an in-order draw: noted for its decision (copy_elide_bound_locked) while the lookup keeps
+            // the target; one it replaces (another shape) or makes over a snapshot has the copy made first, as below.
+            if (g_elide_mutant != 1) {
+                const auto it = g_rts.find(base);
+                const RtImage* r = it != g_rts.end() ? &it->second : nullptr;
+                if (r && r->format == format && r->width == width && r->height == height && r->layers >= layers && r->depth == depth) {
+                    copy_elide_bound_locked(base);
+                } else {
+                    copy_elide_touch_locked(base, copy_elide::kWrite);
+                }
+            }
+        } else if (copy_elide_hides(base) || g_elide.is_src(base)) {
+            const RtImage* r = rt_at_locked(base);
+            if (!r || r->format != format || r->width != width || r->height != height || r->layers < layers || r->depth != depth) {
+                static int logs = 0;  // under g.mu
+                if (logs < 16) {
+                    ++logs;
+                    host_log("copy elision: a lookup of 0x%llx as %ux%u f%d x%u%s replaces the image of a pending copy's %s (%ux%u f%d x%u): "
+                             "the copy made first (flip %llu)",
+                             static_cast<unsigned long long>(base), width, height, static_cast<int>(format), layers, depth ? " depth" : "",
+                             g_elide.is_src(base) ? "source" : "destination", r ? r->width : 0, r ? r->height : 0, r ? static_cast<int>(r->format) : 0,
+                             r ? r->layers : 0, static_cast<unsigned long long>(hle_video_flip_count()));
+                }
+                copy_elide_touch_locked(base, copy_elide::kWrite);
+            }
+        }
+    }
     // An image this one replaces whose last write was a fill (RtImage::
     // fill_last): the new image starts with that fill if it covers it. The
     // blood layers' small targets move between sizes as well as between sRGB
@@ -2119,10 +2193,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     // compressed: on a Steam Deck at the seed's spawn, 1.5% less GPU time
     // (18.95/18.97 against 19.22/19.29 ms a frame). A view outside the list
     // reads a copy (render_target_view). BBHOST_RT_DCC=0: mutable with no list.
-    static const bool listed = [] {
-        const char* e = std::getenv("BBHOST_RT_DCC");
-        return !(e && e[0] == '0');
-    }();
+    const bool listed = rt_dcc_listed();
     VkFormat view_formats[5];
     VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
     if (listed && !depth) {
@@ -2295,6 +2366,7 @@ bool g_target_memo_hit = false;  // whether target_image's last answer came from
 // pending clears and the write stamp. Also for a draw that takes the answers
 // of the draw before it in its run (BBHOST_RUN_BATCH, draw_impl).
 void target_hit(RtImage& rt, std::uint32_t res_gen) {
+    if (t_elide_lookup && copy_elide_live() && g_elide_mutant != 1) copy_elide_bound_locked(rt.base);  // bound as an attachment (rt_image)
     if (res_gen) ++g_draw_gen_same;
     apply_pending_clear(rt);
     rt_written(rt);
@@ -3271,29 +3343,27 @@ thread_local std::uint32_t t_masked_blend_changed = 0, t_masked_blend_blending =
 std::atomic<std::uint64_t> g_masked_blend_pipelines{0}, g_masked_blend_blending{0};
 
 // BBHOST_LVP_BLEND_SPLIT (host/lvp_split.h), on unless 0, on lavapipe
-// (VK_DRIVER_ID_MESA_LLVMPIPE) only: whether this draw starts a command buffer
-// of its own - a pipeline without colour attachments was bound earlier in the
-// command buffer being recorded, and drawing every colour slot with slot 0's
-// blend state would change what this draw writes. A draw without colour
-// targets marks the command buffer. The count of such splits is in the exit
-// report.
+// (VK_DRIVER_ID_MESA_LLVMPIPE) only: what this draw does to the command buffer
+// being recorded. A draw without colour targets marks it (kLvpMark, where it
+// is not marked yet); a later draw starts a command buffer of its own
+// (kLvpSplit) where drawing every colour slot with slot 0's blend state would
+// change what it writes. It only reads: the caller marks and splits. The count
+// of such splits is in the exit report.
 std::atomic<std::uint64_t> g_lvp_splits{0};
 std::uint64_t g_lvp_depth_only_serial = ~0ull;  // the recording a depth-only pipeline was bound in
-bool lvp_blend_split(const DrawState& s) {
+enum LvpBlend : int { kLvpNone, kLvpMark, kLvpSplit };
+LvpBlend lvp_blend_split(const DrawState& s) {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_LVP_BLEND_SPLIT");
         return !(e && e[0] == '0');
     }();
-    if (!on || g.driver_id != VK_DRIVER_ID_MESA_LLVMPIPE) return false;
+    if (!on || g.driver_id != VK_DRIVER_ID_MESA_LLVMPIPE) return kLvpNone;
     int count = 0;
     for (int t = 0; t < 8; ++t) {
         if (s.color[t]) count = t + 1;
     }
-    if (!count) {
-        g_lvp_depth_only_serial = g.record_serial;
-        return false;
-    }
-    if (g_lvp_depth_only_serial != g.record_serial) return false;
+    if (!count) return g_lvp_depth_only_serial != g.record_serial ? kLvpMark : kLvpNone;
+    if (g_lvp_depth_only_serial != g.record_serial) return kLvpNone;
     LvpSlot slot[8];
     for (int t = 0; t < count; ++t) {
         if (!s.color[t]) continue;
@@ -3312,7 +3382,7 @@ bool lvp_blend_split(const DrawState& s) {
         }
         if (!o.blend) o.eq = 0;
     }
-    return lvp_blend_collapse_changes(slot, count);
+    return lvp_blend_collapse_changes(slot, count) ? kLvpSplit : kLvpNone;
 }
 
 GfxFixedState fixed_state(const DrawState& s) {
@@ -3512,6 +3582,24 @@ std::uint32_t vertex_packing_of(std::uint32_t w3, VkFormat format) {
 // Vulkan vertex input for one GX draw: the translator's elements,
 // the pipeline's bindings and attributes (attribute n is element n, at
 // location n), and each binding's buffer and offset.
+// How a vertex element's bytes reach the GPU (plan_vertex_input): copy elision's phase 2 reads a quad's positions only
+// where they are the bytes the GPU reads.
+enum VertexServed : std::uint8_t {
+    kServedUnknown,
+    kServedHandle,    // a GX buffer's device-local copy, by handle (GX on Vulkan)
+    kServedHeap,      // GX's upload heap, in place (stage 1c: the copy holds the bytes until the GPU is done)
+    kServedVersion,   // a copy version (a renamed buffer's copy)
+    kServedWindow,    // the draw's CPU-written window, copied as the draw records
+    kServedMirror,    // the buffer shadow's device-local mirror
+    kServedSnapshot,  // a snapshot of a ring the game rewrites, copied as the draw records
+    kServedStaged,    // copied into device memory for this draw
+    kServedInPlace,   // read in place from guest memory
+    kServedKinds
+};
+inline const char* vertex_served_name(int k) {
+    static const char* const names[kServedKinds] = {"unknown", "handle", "heap", "copy version", "window", "mirror", "snapshot", "staged", "in place"};
+    return k >= 0 && k < kServedKinds ? names[k] : "?";
+}
 struct VertexInputPlan {
     std::vector<gcn::VertexElement> elements;
     std::vector<VkVertexInputBindingDescription> bindings;
@@ -3520,6 +3608,7 @@ struct VertexInputPlan {
     VkDeviceSize offset[16] = {};
     std::uint64_t va[16] = {};  // guest address of each binding's first byte (draw captures copy from there)
     std::uint64_t hash = 0;     // pipeline identity: elements, bindings and attributes
+    std::uint8_t served[16] = {};  // by element (its location): VertexServed
 };
 std::uint64_t vertex_plan_hash(const VertexInputPlan& p) {
     std::uint64_t h = fnv1a("vertex input", 12);
@@ -7946,6 +8035,9 @@ void note_oob_compute_slot(std::uint32_t slot, const std::string& name) {
     g_oob_names[slot].insert("CS " + name);
 }
 }  // namespace gpu
+
+// BBHOST_RUN_COMMIT=compare's totals (defined with the run commit, below).
+static void run_compare_log();
 namespace {
 void replan_recorded_vertex_input(gpu::VertexInputPlan& p, bool tess_native);  // defined with pack_vertex_input
 }  // namespace
@@ -10499,6 +10591,454 @@ void note_feedback_loops(const DrawState& s, const StageImages* stages, int nsta
     g_pass.written |= mine;
 }
 
+// BBHOST_COPY_CENSUS (host/copy_census.h): what a draw read and wrote, and
+// the game's copy pass (PointSampleColor1 / PointSampleColorClamp1 under
+// ScreenSpaceQuadShader) as a copy of its first pixel-shader image into its
+// first colour target. The attachments first: a draw that samples a copy of
+// an image it draws into reads it after the image changed.
+bool census_point_copy(const std::string& name) {
+    return name.size() >= 17 && name.compare(0, 9, "0b0acf50+") == 0 && (name.compare(9, 8, "f7229091") == 0 || name.compare(9, 8, "ccbf44a6") == 0);
+}
+// The channels a colour format has (bits of a write mask).
+std::uint32_t format_channels(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_UINT:
+        case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT:
+            return 0x1;
+        case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_UINT:
+        case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32_UINT:
+            return 0x3;
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_R5G6B5_UNORM_PACK16:
+            return 0x7;
+        default:
+            return 0xf;
+    }
+}
+// Whether the pixel shader may discard (OpKill, OpTerminateInvocation, OpDemoteToHelperInvocation) and whether it has
+// control flow (a conditional branch or a switch: its output store might not run on every path).
+//
+// Control flow is no obstacle when every colour output is stored whole in the
+// block that holds the module's one OpReturn: one function (no calls), no
+// OpUnreachable, so every fragment that is not discarded ends in that block -
+// structured control flow merges every path before the function's return.
+void spirv_discard_branches(const std::vector<std::uint32_t>& spirv, bool& discard, bool& branches) {
+    discard = branches = false;
+    if (spirv.size() < 5) {
+        discard = branches = true;  // not known
+        return;
+    }
+    std::unordered_set<std::uint32_t> outputs;  // Output variables with a Location (the colour outputs)
+    std::unordered_set<std::uint32_t> located;
+    for (std::size_t i = 5; i < spirv.size();) {
+        const std::uint32_t n = spirv[i] >> 16, op = spirv[i] & 0xffff;
+        if (n == 0 || i + n > spirv.size()) break;
+        if (op == 71 && n >= 3 && spirv[i + 2] == 30) located.insert(spirv[i + 1]);  // OpDecorate .. Location
+        if (op == 59 && n >= 4 && spirv[i + 3] == 3) outputs.insert(spirv[i + 2]);   // OpVariable .. Output
+        i += n;
+    }
+    bool conditional = false, calls = false, unreachable = false;
+    int functions = 0, returns = 0;
+    std::uint32_t block = 0, return_block = 0;
+    std::unordered_map<std::uint32_t, std::uint32_t> stored_in;  // output -> the last block with a whole store to it
+    for (std::size_t i = 5; i < spirv.size();) {
+        const std::uint32_t n = spirv[i] >> 16, op = spirv[i] & 0xffff;
+        if (n == 0 || i + n > spirv.size()) break;
+        if (op == 252 || op == 4416 || op == 5380) discard = true;  // OpKill, OpTerminateInvocation, OpDemoteToHelperInvocation
+        if (op == 250 || op == 251) conditional = true;               // OpBranchConditional, OpSwitch
+        if (op == 54) ++functions;                                    // OpFunction
+        if (op == 57) calls = true;                                   // OpFunctionCall
+        if (op == 255) unreachable = true;                            // OpUnreachable
+        if (op == 248 && n >= 2) block = spirv[i + 1];                // OpLabel
+        if (op == 253 || op == 254) {                                 // OpReturn, OpReturnValue
+            ++returns;
+            return_block = block;
+        }
+        if (op == 62 && n >= 3 && outputs.count(spirv[i + 1]) && located.count(spirv[i + 1])) stored_in[spirv[i + 1]] = block;  // OpStore
+        i += n;
+    }
+    if (!conditional) return;
+    bool final_stores = functions == 1 && !calls && !unreachable && returns == 1;
+    for (const std::uint32_t o : outputs) {
+        if (!located.count(o)) continue;
+        const auto it = stored_in.find(o);
+        if (it == stored_in.end() || it->second != return_block) final_stores = false;
+    }
+    branches = !final_stores;
+}
+// The screen-space quads' vertex shaders - ScreenSpaceQuadShader (0b0acf50) and
+// FXAA.vpo (dc609f83), read from their code: each exports pos0 from v4..v7 as the
+// vertex element left them, before any other instruction.
+bool known_quad_vs(const std::string& name) {
+    return name.size() >= 9 && (name.compare(0, 9, "0b0acf50+") == 0 || name.compare(0, 9, "dc609f83+") == 0);
+}
+// Why a known quad's positions could not be read, once a pipeline and reason (the phase 2 census).
+void note_quad_unknown(const std::string& name, const char* why, std::uint64_t detail) {
+    static std::set<std::pair<std::string, const char*>> said;  // under g.mu
+    if (said.size() < 32 && said.emplace(name, why).second) {
+        host_log("copy census: %s: the quad's positions not read (%s, 0x%llx)", name.c_str(), why, static_cast<unsigned long long>(detail));
+    }
+}
+// Vertex v's value of element e as the vertex input reads it (a 32-bit float attribute, one component a channel), with
+// the record's DST_SEL applied; null when it cannot be read, with why.
+const char* read_vertex_element(const VertexInputPlan& vi, const gcn::VertexElement& e, std::uint32_t v, float out[4]) {
+    if (e.location >= vi.attributes.size() || e.packed) return "element packed or past the attributes";
+    const VkVertexInputAttributeDescription& a = vi.attributes[e.location];
+    // 32-bit float components: an SFLOAT attribute, or a 32-bit integer one (the host converts in the shader) whose
+    // record says FLOAT (word 3: data format [18:15] 32/32_32/32_32_32/32_32_32_32, number format [14:12] 7).
+    std::uint32_t comps = 0;
+    switch (a.format) {
+        case VK_FORMAT_R32G32B32A32_SFLOAT: comps = 4; break;
+        case VK_FORMAT_R32G32B32_SFLOAT: comps = 3; break;
+        case VK_FORMAT_R32G32_SFLOAT: comps = 2; break;
+        case VK_FORMAT_R32_SFLOAT: comps = 1; break;
+        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: comps = 4; break;
+        case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT: comps = 3; break;
+        case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: comps = 2; break;
+        case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: comps = 1; break;
+        default: return "attribute format";
+    }
+    const std::uint32_t dfmt = (e.w3 >> 15) & 0xf, nfmt = (e.w3 >> 12) & 7;
+    const std::uint32_t record_comps = dfmt == 4 ? 1 : dfmt == 11 ? 2 : dfmt == 13 ? 3 : dfmt == 14 ? 4 : 0;
+    if (nfmt != 7 || record_comps != comps) return "not 32-bit float data";
+    const VkVertexInputBindingDescription* b = nullptr;
+    for (const VkVertexInputBindingDescription& bd : vi.bindings) {
+        if (bd.binding == a.binding) b = &bd;
+    }
+    if (!b || a.binding >= 16 || !vi.va[a.binding] || b->inputRate != VK_VERTEX_INPUT_RATE_VERTEX) return "binding";
+    const std::uint64_t at = vi.va[a.binding] + static_cast<std::uint64_t>(v) * b->stride + a.offset;
+    if (!hle_kernel_va_mapped(at, comps * 4)) return "not mapped";
+    float c[4] = {0, 0, 0, 1};
+    std::memcpy(c, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), comps * 4);
+    // DST_SEL (the record's word 3) picks each of x, y, z, w: 0, 1, or a fetched component (absent ones 0, 0, 0, 1).
+    const float fetched[4] = {c[0], comps > 1 ? c[1] : 0.0f, comps > 2 ? c[2] : 0.0f, comps > 3 ? c[3] : 1.0f};
+    for (int k = 0; k < 4; ++k) {
+        const std::uint32_t sel = (e.w3 >> (3 * k)) & 7;
+        out[k] = sel == 0 ? 0.0f : sel == 1 ? 1.0f : sel >= 4 ? fetched[sel - 4] : std::nanf("");
+    }
+    return nullptr;
+}
+// Whether element e's bytes for vertices first .. first + n - 1, as read_vertex_element reads them from guest memory, are
+// the bytes the GPU reads for the draw: GX's upload heap (stage 1c holds them until the GPU is done with them); a GX
+// buffer's device-local copy by handle (GX on Vulkan keeps no dynamic buffer, made it from these bytes and retires it at
+// any write GX hears of - a Map, an update, a GPU copy - so the draw's resolve found it current; not one bound after its
+// buffer's end, plan_vertex_input); memory read in place or through a mirror that
+// the buffer shadow does not count as rewritten - the host's own reason for reading it there - with no GPU write pending
+// over it. A copy made as the draw records (a window, a snapshot, a staging copy) or a copy version: not known here
+// (read from guest memory, not from the copy).
+bool served_fixed(const VertexInputPlan& vi, const gcn::VertexElement& e, std::uint32_t first, std::uint32_t n) {
+    if (!n || e.location >= vi.attributes.size()) return false;
+    const VkVertexInputAttributeDescription& a = vi.attributes[e.location];
+    const VkVertexInputBindingDescription* b = nullptr;
+    for (const VkVertexInputBindingDescription& bd : vi.bindings) {
+        if (bd.binding == a.binding) b = &bd;
+    }
+    if (!b || a.binding >= 16 || !vi.va[a.binding]) return false;
+    const std::uint64_t va = vi.va[a.binding] + static_cast<std::uint64_t>(first) * b->stride + a.offset;
+    const std::uint64_t bytes = static_cast<std::uint64_t>(n - 1) * b->stride + 16;
+    switch (vi.served[e.location & 15]) {
+        case kServedHeap: case kServedHandle:
+            return true;
+        case kServedInPlace: case kServedMirror:
+            return !shadow_snapshot_maybe_locked(va, bytes) && !gpu_writes_pending_locked(va, bytes);
+        default:
+            return false;
+    }
+}
+// The vertex ids of draw d's first n vertices: its indices (16- or 32-bit, from the index buffer) or 0..n-1, plus
+// VGT_INDX_OFFSET; null when they cannot be read, with why.
+const char* draw_vertex_ids(const GpuDraw& d, std::uint32_t n, std::uint32_t* ids) {
+    const std::int64_t base = d.gx && d.gx_render ? static_cast<std::int32_t>(d.gx->base_vertex) : d.ctx ? static_cast<std::int32_t>(d.ctx[0x102]) : 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        std::int64_t id = i;
+        if (d.index_va) {
+            const std::uint32_t size = d.index_type ? 4 : 2;
+            const std::uint64_t at = d.index_va + static_cast<std::uint64_t>(i) * size;
+            if (!hle_kernel_va_mapped(at, size)) return "indices not mapped";
+            std::uint32_t x = 0;
+            std::memcpy(&x, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), size);
+            id = x;
+        }
+        id += base;
+        if (id < 0 || id > 0xffffffffll) return "vertex id out of range";
+        ids[i] = static_cast<std::uint32_t>(id);
+    }
+    return nullptr;
+}
+// Phase 2's question for colour target t (host/full_write.h), from the draw's state, the bound pipeline's pixel shader and,
+// for the screen-space quad, its vertices as the vertex input reads them.
+full_write::Input full_write_input(const DrawState& s, int t, const GfxPipeline& bound, const GpuDraw& d, const VertexInputPlan* vi,
+                                   const std::string& name) {
+    full_write::Input in;
+    const RtImage& r = *s.color[t];
+    in.width = r.width;
+    in.height = r.height;
+    in.layers = r.layers;
+    in.mask = s.color_mask[t];
+    in.channels = format_channels(r.format);
+    in.blend = s.gx_blend ? s.gx_blend->rt[t].enable != 0 : ((s.blend[t] >> 30) & 1) != 0;
+    GfxFixedState f = fixed_state(s);
+    in.depth_rejects = s.depth && f.depth_test && f.depth_compare != VK_COMPARE_OP_ALWAYS;
+    in.stencil = s.depth && f.stencil_test;
+    in.bounds = s.depth && f.depth_bounds_test;
+    in.coverage = s.gx_blend && s.gx_blend->alpha_to_coverage;
+    spirv_discard_branches(bound.ps.meta().spirv, in.discard, in.branches);
+    if (bound.clip_discard) in.discard = true;
+    in.raster_kill = ((s.clip_cntl >> 22) & 1) != 0;
+    in.cull = f.cull_mode != 0;
+    in.solid = f.polygon_mode == VK_POLYGON_MODE_FILL;
+    in.depth_clamp = f.depth_clamp;
+    in.vp_x = s.vport[1] - s.vport[0];
+    in.vp_w = 2 * s.vport[0];
+    in.vp_y = s.vport[3] - s.vport[2];
+    in.vp_h = 2 * s.vport[2];
+    in.sc_x = s.scissor.offset.x;
+    in.sc_y = s.scissor.offset.y;
+    in.sc_w = s.scissor.extent.width;
+    in.sc_h = s.scissor.extent.height;
+    // The viewport transform as Vulkan's: x and y scaled and offset, z too, and divided by w (PA_CL_VTE_CNTL 0x43f).
+    in.known_vs = known_quad_vs(name) && vi && s.vte_cntl == 0x43f && !s.gs && !s.tess_hw && !s.domain_level;
+    if (known_quad_vs(name) && !in.known_vs) {
+        note_quad_unknown(name, !vi ? "no vertex input" : s.vte_cntl != 0x43f ? "PA_CL_VTE_CNTL" : "geometry or tessellation stage", s.vte_cntl);
+    }
+    in.prim = s.rect ? full_write::kPrimRectList
+            : s.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ? full_write::kPrimTriangleList
+            : s.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ? full_write::kPrimTriangleStrip
+                                                             : full_write::kPrimOther;
+    in.simple = !d.indirect_va && d.instance_count <= 1 && d.index_count <= 6;
+    in.vertices = d.index_count;
+    if (!in.known_vs || !in.simple) return in;
+    // The element the vertex shader reads into v4..v7, its attribute and binding.
+    const gcn::VertexElement* pos = nullptr;
+    for (const gcn::VertexElement& e : vi->elements) {
+        if (e.vdata == 4 && e.count == 4) pos = &e;
+    }
+    if (!pos) {
+        note_quad_unknown(name, "no element in v4..v7", vi->elements.size());
+        in.known_vs = false;
+        return in;
+    }
+    std::uint32_t ids[6];
+    if (const char* why = draw_vertex_ids(d, in.vertices, ids)) {
+        note_quad_unknown(name, why, d.index_va);
+        in.known_vs = false;
+        return in;
+    }
+    for (std::uint32_t v = 0; v < in.vertices; ++v) {
+        if (const char* why = read_vertex_element(*vi, *pos, ids[v], in.pos[v])) {
+            note_quad_unknown(name, why, pos->location < vi->attributes.size() ? static_cast<std::uint64_t>(vi->attributes[pos->location].format) : 0);
+            in.known_vs = false;
+            return in;
+        }
+    }
+    // Whether those are the bytes the GPU reads (served_fixed), over the vertices' span.
+    {
+        std::uint32_t lo = ~0u, hi = 0;
+        for (std::uint32_t v = 0; v < in.vertices; ++v) {
+            lo = std::min(lo, ids[v]);
+            hi = std::max(hi, ids[v]);
+        }
+        in.bytes_unknown = !in.vertices || !served_fixed(*vi, *pos, lo, hi - lo + 1);
+    }
+    static std::set<std::string> shown;  // under g.mu: each quad pipeline's vertices once (the phase 2 census)
+    if (shown.size() < 24 && shown.insert(name).second) {
+        std::string v;
+        for (std::uint32_t i = 0; i < in.vertices; ++i) {
+            char b[96];
+            std::snprintf(b, sizeof(b), " (%g %g %g %g)", in.pos[i][0], in.pos[i][1], in.pos[i][2], in.pos[i][3]);
+            v += b;
+        }
+        host_log("copy census: %s: prim %d, %u vertices:%s; geometry %s; positions %s (%s)%s", name.c_str(), in.prim, in.vertices, v.c_str(),
+                 full_write::fail_name(full_write::geometry(in)), vertex_served_name(vi->served[pos->location & 15]),
+                 in.bytes_unknown ? "not known to be the GPU's" : "the GPU's", d.index_va ? ", indexed" : "");
+    }
+    return in;
+}
+// A writer of a pending copy's source or destination whose draw the proof could not pass (or did), with the state the
+// proof read, once a pipeline and verdict (the phase 2 census).
+void note_writer_locked(const DrawState& s, int t, const std::string& name, int fail, const full_write::Input& in, const GpuDraw& d) {
+    static std::set<std::pair<std::string, int>> said;  // under g.mu
+    if (said.size() >= 96 || !said.emplace(name, fail).second) return;
+    const RtImage& r = *s.color[t];
+    char blend[112];
+    if (s.gx_blend) {
+        const GxBlendTarget& b = s.gx_blend->rt[t];
+        std::snprintf(blend, sizeof(blend), "blend (GX) %u: colour src %u dst %u op %u, alpha src %u dst %u op %u", b.enable, b.src, b.dst, b.op,
+                      b.src_alpha, b.dst_alpha, b.op_alpha);
+    } else {
+        std::snprintf(blend, sizeof(blend), "CB_BLEND%d_CONTROL %08x", t, s.blend[t]);
+    }
+    host_log("copy census: writer %s, %s: target %d 0x%llx %ux%u f%d x%u, mask %x of %x, %s; depth test %d stencil %d bounds %d a2c %d; "
+             "PS discard %d branches %d; raster kill %d cull %d solid %d; viewport %g,%g %gx%g, scissor %d,%d %ux%u; VTE %x quad VS %d; "
+             "prim %d (rect %d topo %d), %u vertices, index %d indirect %d instances %u (flip %llu)",
+             name.c_str(), full_write::fail_name(fail), t, static_cast<unsigned long long>(r.base), r.width, r.height, static_cast<int>(r.format), r.layers,
+             in.mask, in.channels, blend, in.depth_rejects ? 1 : 0, in.stencil ? 1 : 0, in.bounds ? 1 : 0, in.coverage ? 1 : 0, in.discard ? 1 : 0,
+             in.branches ? 1 : 0, in.raster_kill ? 1 : 0, in.cull ? 1 : 0, in.solid ? 1 : 0, in.vp_x, in.vp_y, in.vp_w, in.vp_h, in.sc_x, in.sc_y, in.sc_w,
+             in.sc_h, s.vte_cntl, in.known_vs ? 1 : 0, in.prim, s.rect ? 1 : 0, static_cast<int>(s.topo), d.index_count, d.index_va ? 1 : 0,
+             d.indirect_va ? 1 : 0, d.instance_count, static_cast<unsigned long long>(hle_video_flip_count()));
+}
+// A point copy's own draw (phase 2's B1): whether it covers its destination, its sampler and view, and its vertices'
+// elements (positions and texture coordinates).
+std::string point_copy_detail_locked(const DrawState& s, const StageImages* stage_images, const std::string& name, const GfxPipeline& bound,
+                                     const GpuDraw& draw, const VertexInputPlan* vi) {
+    std::string out = "covers: ";
+    out += full_write::fail_name(full_write::check(full_write_input(s, 0, bound, draw, vi, name)));
+    char b[200];
+    VkSamplerCreateInfo sci{};
+    if (!stage_images[1].samplers.empty() && stage_images[1].samplers[0] && describe_sampler_locked(stage_images[1].samplers[0], sci)) {
+        std::snprintf(b, sizeof(b), "; sampler mag %d min %d mip %d lod %g..%g bias %g aniso %d addr %d %d unnormalized %d", static_cast<int>(sci.magFilter),
+                      static_cast<int>(sci.minFilter), static_cast<int>(sci.mipmapMode), sci.minLod, sci.maxLod, sci.mipLodBias, sci.anisotropyEnable,
+                      static_cast<int>(sci.addressModeU), static_cast<int>(sci.addressModeV), sci.unnormalizedCoordinates);
+        out += b;
+    } else {
+        out += "; sampler not known";
+    }
+    ViewRecord vr;
+    if (!stage_images[1].images.empty() && stage_images[1].images[0].view && describe_view_locked(stage_images[1].images[0].view, vr)) {
+        const VkImageSubresourceRange& sr = vr.view_info.subresourceRange;
+        std::snprintf(b, sizeof(b), "; view f%d levels %u+%u of %u, layers %u+%u, swizzle %d %d %d %d, image %ux%u", static_cast<int>(vr.view_info.format),
+                      sr.baseMipLevel, sr.levelCount, vr.image_info.mipLevels, sr.baseArrayLayer, sr.layerCount, static_cast<int>(vr.view_info.components.r),
+                      static_cast<int>(vr.view_info.components.g), static_cast<int>(vr.view_info.components.b), static_cast<int>(vr.view_info.components.a),
+                      vr.image_info.extent.width, vr.image_info.extent.height);
+        out += b;
+    } else {
+        out += "; view not known";
+    }
+    {
+        const std::uint32_t nv = std::min<std::uint32_t>(draw.index_count, 6);
+        std::uint32_t ids[6];
+        const char* why = draw_vertex_ids(draw, nv, ids);
+        std::snprintf(b, sizeof(b), "; %u vertices, %s, prim %d (rect %d), ids", draw.index_count,
+                      draw.index_va ? (draw.index_type ? "32-bit indices" : "16-bit indices") : "not indexed", static_cast<int>(s.topo), s.rect ? 1 : 0);
+        out += b;
+        for (std::uint32_t v = 0; !why && v < nv; ++v) out += " " + std::to_string(ids[v]);
+        if (why) out += std::string(" (") + why + ")";
+    }
+    if (vi) {
+        for (const gcn::VertexElement& e : vi->elements) {
+            std::snprintf(b, sizeof(b), "; v%u..%u (%s):", e.vdata, e.vdata + e.count - 1, vertex_served_name(vi->served[e.location & 15]));
+            out += b;
+            const std::uint32_t nv = std::min<std::uint32_t>(draw.index_count, 6);
+            std::uint32_t ids[6];
+            if (const char* why = draw_vertex_ids(draw, nv, ids)) {
+                out += " (";
+                out += why;
+                out += ")";
+                continue;
+            }
+            for (std::uint32_t v = 0; v < nv; ++v) {
+                float c[4];
+                if (const char* why = read_vertex_element(*vi, e, ids[v], c)) {
+                    out += " (";
+                    out += why;
+                    out += ")";
+                    break;
+                }
+                std::snprintf(b, sizeof(b), " (%g %g %g %g)", c[0], c[1], c[2], c[3]);
+                out += b;
+            }
+        }
+    }
+    return out;
+}
+void census_draw_locked(const DrawState& s, const StageImages* stage_images, const std::string& name, const GfxPipeline& bound, const GpuDraw& draw,
+                        const VertexInputPlan* vi) {
+    const bool point = census_point_copy(name);
+    const char* who = name.c_str();
+    // A draw that may write all of a target: every channel, no blending, the viewport and scissor over all of it (its
+    // geometry and a discard can still leave some out - "may").
+    const float vx0 = s.vport[1] - s.vport[0], vy0 = s.vport[3] - std::fabs(s.vport[2]);
+    const float vw = 2 * s.vport[0], vh = 2 * std::fabs(s.vport[2]);
+    const auto may_write_all = [&](int t) {
+        const RtImage& r = *s.color[t];
+        const bool blend = s.gx_blend ? s.gx_blend->rt[t].enable != 0 : ((s.blend[t] >> 30) & 1) != 0;
+        return s.color_mask[t] == 0xf && !blend && vx0 <= 0.5f && vy0 <= 0.5f && vx0 + vw >= r.width - 0.5f && vy0 + vh >= r.height - 0.5f &&
+               s.scissor.offset.x <= 0 && s.scissor.offset.y <= 0 &&
+               s.scissor.offset.x + static_cast<std::int64_t>(s.scissor.extent.width) >= r.width &&
+               s.scissor.offset.y + static_cast<std::int64_t>(s.scissor.extent.height) >= r.height && r.layers == 1;
+    };
+    for (int t = 0; t < 8; ++t) {
+        if (!s.color[t] || (point && t == 0)) continue;
+        if (!s.color_mask[t]) {
+            copy_census::touch(s.color[t]->base, copy_census::kTouchBound, who);
+            continue;
+        }
+        const full_write::Input in = full_write_input(s, t, bound, draw, vi, name);
+        const int fail = full_write::check(in);
+        const int kind = fail == full_write::kNone ? copy_census::kTouchDrawProven : may_write_all(t) ? copy_census::kTouchDrawFull : copy_census::kTouchDraw;
+        if (copy_census::touch(s.color[t]->base, kind, who)) {
+            copy_census::proof(who, fail);
+            note_writer_locked(s, t, name, fail, in, draw);
+        }
+    }
+    if (s.depth) {
+        GfxFixedState f;
+        fixed_raster_depth(s, f);
+        const auto writes = [](const VkStencilOpState& o) {
+            return o.failOp != VK_STENCIL_OP_KEEP || o.passOp != VK_STENCIL_OP_KEEP || o.depthFailOp != VK_STENCIL_OP_KEEP;
+        };
+        const bool w = f.depth_write || (f.stencil_test && (writes(f.front) || writes(f.back)));
+        copy_census::touch(s.depth->base, w ? copy_census::kTouchDraw : copy_census::kTouchBound, who);
+    }
+    const StageImages::Image* src_im = nullptr;
+    if (point && s.color[0] && !stage_images[1].images.empty() && stage_images[1].images[0].resolved) src_im = &stage_images[1].images[0];
+    for (int st = 0; st < 2; ++st) {
+        for (const StageImages::Image& im : stage_images[st].images) {
+            if (im.resolved && &im != src_im) copy_census::read(image_base(im), who);
+        }
+    }
+    if (point && s.color[0] && !src_im) copy_census::touch(s.color[0]->base, copy_census::kTouchDraw, who);
+    if (!src_im) return;
+    const RtImage& d = *s.color[0];
+    const std::uint32_t* w = src_im->w;
+    copy_census::Side a, b;
+    a.base = image_base(*src_im);
+    std::uint32_t flags = 0;
+    if (const RtImage* r = find_render_target(a.base)) {
+        a.bytes = rt_size_bytes(*r);
+        a.w = r->width;
+        a.h = r->height;
+        a.format = static_cast<int>(r->format);
+        flags |= copy_census::kSrcImage;
+    } else {
+        a.w = (w[2] & 0x3fff) + 1;
+        a.h = ((w[2] >> 14) & 0x3fff) + 1;
+        a.bytes = static_cast<std::uint64_t>(a.w) * a.h * 4;
+        a.format = 1000 + static_cast<int>(((w[1] >> 20) & 0x3f) * 16 + ((w[1] >> 26) & 0xf));
+    }
+    b.base = d.base;
+    b.bytes = rt_size_bytes(d);
+    b.w = d.width;
+    b.h = d.height;
+    b.format = static_cast<int>(d.format);
+    if (a.w == b.w && a.h == b.h) flags |= copy_census::kSameSize;
+    if (a.format == b.format) flags |= copy_census::kSameFormat;
+    const bool blend = s.gx_blend ? s.gx_blend->rt[0].enable != 0 : ((s.blend[0] >> 30) & 1) != 0;
+    if (!blend) flags |= copy_census::kBlendOff;
+    if (s.color_mask[0] == 0xf) flags |= copy_census::kMaskFull;
+    const float x0 = vx0, y0 = vy0;
+    const bool vp_covers = x0 <= 0.5f && y0 <= 0.5f && x0 + vw >= b.w - 0.5f && y0 + vh >= b.h - 0.5f;
+    const bool sc_covers = s.scissor.offset.x <= 0 && s.scissor.offset.y <= 0 && s.scissor.offset.x + static_cast<std::int64_t>(s.scissor.extent.width) >= b.w &&
+                           s.scissor.offset.y + static_cast<std::int64_t>(s.scissor.extent.height) >= b.h;
+    if (vp_covers && sc_covers) flags |= copy_census::kCovers;
+    if (a.w == b.w && a.h == b.h) flags |= copy_census::kWhole;
+    copy_census::copy(copy_census::kPointCopy, a, b, who, flags);
+    static std::set<std::tuple<std::uint64_t, std::uint64_t, std::uint32_t>> said;  // under g.mu
+    if (said.size() < 48 && said.emplace(a.base, b.base, flags).second) {
+        host_log("copy census: point copy %s 0x%llx %ux%u f%d -> 0x%llx %ux%u f%d flags %02x: T# %08x %08x %08x %08x %08x %08x %08x %08x; "
+                 "viewport %g,%g %gx%g, scissor %d,%d %ux%u, blend %d (CB_BLEND0 %08x), mask %x, PS images %zu samplers %zu (flip %llu)",
+                 who, static_cast<unsigned long long>(a.base), a.w, a.h, a.format, static_cast<unsigned long long>(b.base), b.w, b.h, b.format,
+                 flags, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], x0, y0, vw, vh, s.scissor.offset.x, s.scissor.offset.y,
+                 s.scissor.extent.width, s.scissor.extent.height, blend ? 1 : 0, s.blend[0], s.color_mask[0], stage_images[1].images.size(),
+                 stage_images[1].samplers.size(), static_cast<unsigned long long>(hle_video_flip_count()));
+        // Its own draw's detail on lines of their own (a log line ends at 1 KiB).
+        const std::string detail = point_copy_detail_locked(s, stage_images, name, bound, draw, vi);
+        for (std::size_t at = 0; at < detail.size(); at += 900) {
+            host_log("copy census: point copy %s 0x%llx -> 0x%llx detail %zu: %s", who, static_cast<unsigned long long>(a.base),
+                     static_cast<unsigned long long>(b.base), at / 900, detail.substr(at, 900).c_str());
+        }
+    }
+}
+
 // Draws the PS4 rasterizes nothing for (PA_CL_CLIP_CNTL.DX_RASTERIZATION_KILL,
 // bit 22), which ours rasterize; and point-list draws whose last vertex stage
 // writes no PointSize - Vulkan leaves their size undefined (the validation
@@ -10676,6 +11216,7 @@ std::uint64_t pass_key(const DrawState& s) {
 }
 
 void clear_depth(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t sval) {
+    if (copy_census::on()) copy_census::touch(r.base, copy_census::kTouchClear, "DB_RENDER_CONTROL clear");
     if (r.view_clear && !g_in_view_flush) view_clear_apply_locked(r, kVcwClear);  // an owed clear is older than this one
     static std::atomic<int> logs{0};
     if (logs.fetch_add(1) < 12) {
@@ -11261,6 +11802,8 @@ std::uint64_t g_rt_returned = 0, g_rt_returned_bytes = 0;  // under g.mu
 // below), never a new block or host memory - or wherever rt_image_memory
 // places a target.
 bool rt_remake_locked(RtImage& r, bool existing_room) {
+    // Its pixels are carried into the new image: a pending copy into it made first (BBHOST_COPY_ELIDE).
+    if (copy_elide_live()) copy_elide_touch_locked(r.base, copy_elide::kReadOther);
     RtImage n = r;
     n.image = VK_NULL_HANDLE;
     n.view = VK_NULL_HANDLE;
@@ -11932,6 +12475,7 @@ bool clear_target_locked(std::uint64_t va, std::size_t bytes, const float rgba[4
     auto it = g_rts.find(va);
     if (it == g_rts.end()) return false;
     if (bytes < rt_size_bytes(it->second)) return false;
+    if (copy_elide_live()) copy_elide_touch_locked(va, copy_elide::kOverwrite);  // cleared whole (BBHOST_COPY_ELIDE)
     rt_written(it->second);
     clear_image_locked(it->second, rgba);
     note_fill_last(it->second, va, bytes, rgba);
@@ -11988,6 +12532,7 @@ bool render_htile_fill_locked(std::uint64_t va, std::size_t bytes, std::uint32_t
         // HTILE: 4 bytes per 8x8 tile.
         if (bytes < static_cast<std::size_t>((r.width / 8) * (r.height / 8)) * 4) continue;
         r.htile_clear_pending = true;
+        if (copy_census::on()) copy_census::touch(r.base, copy_census::kTouchClear, "HTILE fill");
         const float depth = htile_word_depth(word);
         std::memcpy(&r.htile_clear_depth, &depth, 4);
         r.htile_clear_stencil = stencil_clear;
@@ -12050,6 +12595,12 @@ void apply_pending_clear(RtImage& r) {
             ++it;
             continue;
         }
+        // Cleared whole (from its base over all of it) or in part (BBHOST_COPY_ELIDE).
+        if (copy_elide_live()) {
+            copy_elide_touch_locked(r.base, it->first == r.base && it->second.bytes >= rt_size_bytes(r) && first == 0 && count >= r.layers
+                                                ? copy_elide::kOverwrite
+                                                : copy_elide::kWrite);
+        }
         clear_image_locked(r, it->second.rgba, first, count);
         note_fill_last(r, it->first, it->second.bytes, it->second.rgba);
         g_fill_applied.fetch_add(1);
@@ -12092,6 +12643,7 @@ bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float 
             std::uint32_t word = 0;
             std::memcpy(&word, &rgba[0], 4);
             r->htile_clear_pending = true;
+            if (copy_census::on()) copy_census::touch(r->base, copy_census::kTouchClear, "HTILE fill");
             const float depth = htile_word_depth(word);
             std::memcpy(&r->htile_clear_depth, &depth, 4);
             r->htile_clear_stencil = stencil_clear;
@@ -12102,6 +12654,11 @@ bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float 
         fill_layers(*r, va, bytes, first, count);
         if (count) {
             ccheck_note(r, true, first, count, rgba, 0.0f, 0);
+            // Cleared whole (from its base over all of it) or in part (BBHOST_COPY_ELIDE).
+            if (copy_elide_live()) {
+                copy_elide_touch_locked(r->base, va == r->base && bytes >= rt_size_bytes(*r) && first == 0 && count >= r->layers ? copy_elide::kOverwrite
+                                                                                                                              : copy_elide::kWrite);
+            }
             clear_image_locked(*r, rgba, first, count);
             note_fill_last(*r, va, bytes, rgba);
             g_fill_applied.fetch_add(1);
@@ -12236,6 +12793,7 @@ void cross_vendor_report() {
 
 void render_report() {
     cross_vendor_report();
+    if (list_resolve::commit_compare()) ::run_compare_log();
     host_log("%s", gx_state_report().c_str());
     cb_proof::report();
     if (const std::string b = bindless_report(); !b.empty()) host_log("render: %s", b.c_str());
@@ -12717,6 +13275,17 @@ RtImage* make_copy_snapshot_locked(std::uint64_t src_base, std::uint64_t dst_bas
     r.mutable_format = true;
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    // With copies left unmade (BBHOST_COPY_ELIDE), a colour snapshot is made as a colour
+    // target is - its view formats listed (rt_image) - so that a copy's source and
+    // destination are alike and can exchange their images (copy_elide_swap_locked).
+    VkFormat view_formats[5];
+    VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    if (copy_elide_mode() && !from_depth && rt_dcc_listed()) {
+        format_list.viewFormatCount = rt_view_formats(format, view_formats);
+        format_list.pViewFormats = view_formats;
+        ici.pNext = &format_list;
+        r.format_listed = true;
+    }
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = r.format;
     ici.extent = {r.width, r.height, 1};
@@ -12766,8 +13335,38 @@ RtImage* make_copy_snapshot_locked(std::uint64_t src_base, std::uint64_t dst_bas
 // Records the copy of `src`'s top-left width x height into `dst` at (0, 0):
 // colour image to image, a depth plane by the compute pass into a snapshot
 // made for it, else through a buffer. False when that buffer could not be
-// made.
+// made. record_target_copy_raw_locked is the copy alone: a copy left unmade
+// (BBHOST_COPY_ELIDE) is made through it, which the census counted and the
+// ledger let go when it was asked for.
+thread_local const char* t_copy_via = "target copy";  // what asked for the copy (render_copy_target_locked's via), for the census
+bool record_target_copy_raw_locked(RtImage& src, RtImage& dst, std::uint32_t width, std::uint32_t height);
+void census_target_copy_locked(const RtImage& src, const RtImage& dst, std::uint32_t width, std::uint32_t height) {
+    const bool compute = src.depth && dst.storage && depth_copy_available_locked();
+    const copy_census::Side a{src.base, rt_size_bytes(src), src.width, src.height, static_cast<int>(src.format)};
+    const copy_census::Side b{dst.base, rt_size_bytes(dst), dst.width, dst.height, static_cast<int>(dst.format)};
+    std::uint32_t flags = copy_census::kSrcImage;
+    if (width == dst.width && height == dst.height) flags |= copy_census::kWhole;
+    if (src.width == dst.width && src.height == dst.height) flags |= copy_census::kSameSize;
+    if (src.format == dst.format) flags |= copy_census::kSameFormat;
+    copy_census::copy(compute ? copy_census::kTargetDepthCompute : src.depth ? copy_census::kTargetDepthBuffer : copy_census::kTargetColour, a, b,
+                      t_copy_via, flags);
+}
 bool record_target_copy_locked(RtImage& src, RtImage& dst, std::uint32_t width, std::uint32_t height) {
+    if (copy_census::on()) census_target_copy_locked(src, dst, width, height);
+    // Copies left unmade (BBHOST_COPY_ELIDE): the source read as it is (a pending copy
+    // into it made first), the destination about to be written - whole by a colour copy
+    // of all of it (a pending copy into it then never made), else in part.
+    if (copy_elide_live()) {
+        const std::uint64_t sb = src.base, db = dst.base;
+        const bool whole = !src.depth && width == dst.width && height == dst.height && dst.layers == 1;
+        copy_elide_touch_locked(sb, copy_elide::kReadOther);
+        copy_elide_touch_locked(db, whole ? copy_elide::kOverwrite : copy_elide::kWrite);
+        // (a swap may have given either its other image; the references stay valid)
+    }
+    return record_target_copy_raw_locked(src, dst, width, height);
+}
+bool record_target_copy_raw_locked(RtImage& src, RtImage& dst, std::uint32_t width, std::uint32_t height) {
+    const copy_census::Quiet census_quiet;  // the copy's own write stamps: copy_census::copy says what it wrote
     // Clears owed to either image go first (lazy clears).
     if (src.view_clear) view_clear_apply_locked(src, kVcwCopy);
     if (dst.view_clear) view_clear_apply_locked(dst, kVcwCopy);
@@ -12867,6 +13466,675 @@ bool record_target_copy_locked(RtImage& src, RtImage& dst, std::uint32_t width, 
     return true;
 }
 
+// ---- Copies left unmade (BBHOST_COPY_ELIDE; host/copy_elide.h) ----
+// The game copies whole render targets into textures of their shape (GX's
+// CopyResource, a copy token: render_copy_target_locked). Each copy is a
+// transfer between passes, which ends the open pass and drains the GPU on
+// both sides of it; and most destinations are read only while their source
+// is unchanged, or are overwritten before anything reads them, or keep what
+// they were copied after their source is cleared (the census, host/
+// copy_census.h). So a whole copy of a colour target into a target or
+// snapshot of its shape, format and view formats, between passes neither is
+// in, is left unmade:
+//   - a sampled binding of the destination binds the source's image (the
+//     views, alias_rt in textures.cpp), which holds the copy's texels while
+//     nothing writes it;
+//   - just before the source is written, bound as an attachment, cleared in
+//     part or retired, or the destination written in part or read another
+//     way (a copy out of it, a readback, a region copy, the display), the
+//     copy is made (copy_elide_make_locked), as it would have been made,
+//     only later;
+//   - when the destination is overwritten whole (cleared whole, copied into
+//     whole) or retired first, it is never made;
+//   - when the source is the one overwritten whole first, and the two images
+//     are alike, they exchange their images (copy_elide_swap_locked): the
+//     destination keeps the texels the copy would have left it, and the
+//     clear or copy lands on the other image, which nothing reads before it.
+// Every write path of a target image goes through copy_elide_touch_locked
+// first (the ledger's invariant). 0: every copy made where it is asked
+// for. 1: left unmade. compare (2): left unmade as 1, and made at once as
+// well; at each pending copy's end the source is compared with the
+// destination on the GPU (copy_compare.cpp) - a difference is a write that
+// reached the source without the ledger, counted and logged. Unset, the
+// default (copy_elide_decide): 1 on an integrated GPU, 0 elsewhere.
+int g_copy_elide = 0;  // copy_elide_decide, at the device's choice, before anything is drawn
+int copy_elide_mode() { return g_copy_elide; }
+copy_elide::Ledger g_elide(16);  // under g.mu
+// Why a copy was made where it was asked for (the exit report's fallbacks).
+enum ElideRefusal : int {
+    kErDepth,        // a depth target's (or into one)
+    kErLayers,       // a layered image
+    kErShape,        // not a whole copy into an image of the source's size and format
+    kErViews,        // the two take different view formats (mutable, listed)
+    kErUndrawn,      // the source not drawn yet
+    kErDisplay,      // into a display buffer (the presenter reads it as it is)
+    kErBarriers,     // the lazy pass barriers track sampled images by base
+    kErNoIds,        // no stage 2: the id memo keeps no T# bases
+    kErSame,         // the same image
+    kErMade,         // its last copies of this source into this destination made after all (Ledger::worth_deferring)
+    kErRefusals
+};
+const char* const kErNames[kErRefusals] = {"depth", "layered", "shape", "view formats", "undrawn source", "display buffer",
+                                           "lazy barriers", "no stage 2", "same image", "made the last times"};
+// BBHOST_COPY_ELIDE_HISTORY=0: a copy is left unmade whenever it may be, however its last ones ended (phase 1c off).
+const bool g_elide_history = [] {
+    const char* e = std::getenv("BBHOST_COPY_ELIDE_HISTORY");
+    return !(e && e[0] == '0');
+}();
+const char* const kCeEndNames[copy_elide::kEnds] = {"source written", "source retired", "destination written", "destination read",
+                                                    "a copy out of it", "limit", "flush", "dropped", "images exchanged"};
+std::uint64_t g_ce_deferred = 0, g_ce_refused[kErRefusals] = {}, g_ce_swapped = 0, g_ce_redirects = 0, g_ce_lost = 0,
+              g_ce_compared = 0, g_ce_swap_refused = 0;
+std::uint64_t g_ce_made_bytes = 0, g_ce_saved_bytes = 0;
+std::uint64_t g_ce_pass_ended = 0;  // copies left unmade whose source or destination was an attachment of the open pass
+thread_local bool t_elide_lookup = false;  // a draw's target lookups (draw_impl): an attachment bound is a write
+// Phase 2 (BBHOST_COPY_ELIDE_DRAWS, on with elision unless 0): an in-order draw's attachments that are a pending copy's
+// source or destination, noted at its target lookup (copy_elide_bound_locked) and decided once its pipeline, vertex input
+// and images are known (copy_elide_decide_locked): proven to be written whole (host/full_write.h), the source's copy is
+// exchanged for the images (the destination's is never made); else the copy is made there, before the pass begins.
+bool g_elide_draws = false;  // copy_elide_decide
+
+// BBHOST_COPY_ELIDE, or when it is not set the default for the device chosen: on for an integrated GPU, whose video
+// memory is system RAM and whose bandwidth the copies take (+4-5% on a Radeon 680M at 1080p), off elsewhere for now: a
+// discrete GPU at 1080p is mostly limited by the CPU, where elision has not been shown to pay yet. Decided once, before
+// anything is drawn, and said once.
+void copy_elide_decide(bool integrated) {
+    static bool decided = false;
+    if (decided) return;
+    decided = true;
+    const int env = copy_elide_env();
+    g_copy_elide = env >= 0 ? env : integrated ? 1 : 0;
+    const char* const e = std::getenv("BBHOST_COPY_ELIDE_DRAWS");
+    g_elide_draws = g_copy_elide && !(e && e[0] == '0');
+    host_log("render: copy elision %s (%s)", g_copy_elide == 2 ? "in compare mode" : g_copy_elide ? "on" : "off",
+             env >= 0          ? "BBHOST_COPY_ELIDE"
+             : integrated      ? "the default for an integrated GPU; BBHOST_COPY_ELIDE=0 turns it off"
+                               : "the default for a GPU that is not integrated; BBHOST_COPY_ELIDE=1 turns it on");
+}
+thread_local std::uint64_t t_elide_bound[9];  // the draw's noted attachments (bases)
+thread_local int t_elide_bound_n = 0;
+thread_local std::uint64_t t_elide_redirected[8];  // sources the draw's sampled reads of a destination were bound to
+thread_local int t_elide_redirected_n = 0;
+thread_local int t_elide_mutant_draw = 0;  // BBHOST_COPY_ELIDE_MUTANT=2/3 for the draw being recorded (a proven one)
+struct ElideCanary {
+    std::uint64_t base;
+    const char* who;
+};
+thread_local ElideCanary t_elide_canary[8];  // compare: proven draws' targets whose canary is counted after the draw
+thread_local int t_elide_canary_n = 0;
+// What a proven decision did that its draw must follow: if the draw is not recorded after all (a failure or a skip on the
+// way to its draw call), a copy puts back what the copy semantics leave - the destination into the source (exchanged, or
+// the source given the canary), or the source into the destination (a copy never made).
+struct ElideUndo {
+    std::uint64_t from, to;
+};
+thread_local ElideUndo t_elide_undo[9];
+thread_local int t_elide_undo_n = 0;
+// compare: exact point copies drawn (B1), their targets compared with their sources after the draw, then left pending.
+struct ElidePointCopy {
+    std::uint64_t src, dst;
+};
+thread_local ElidePointCopy t_elide_point[2];
+thread_local int t_elide_point_n = 0;
+std::uint64_t g_ce_point_copies = 0, g_ce_point_drawn = 0;  // B1: left undrawn; compare: drawn, compared, then left pending
+// B1's point copies drawn as asked, by the first condition that did not hold (the 5-second report).
+enum PointRefusal : int { kPrInput, kPrTargets, kPrDepth, kPrImages, kPrSource, kPrView, kPrSampler, kPrProof, kPrCoords, kPrQuery, kPrDeferral, kPrRefusals };
+const char* const kPrNames[kPrRefusals] = {"vertex input or indexed", "targets", "depth or stencil written", "images", "source", "view",
+                                           "sampler", "proof", "texture coordinates", "a query or predicate", "the copy refused"};
+std::uint64_t g_ce_point_refused[kPrRefusals] = {}, g_ce_point_proof[full_write::kFails] = {};
+thread_local bool t_elide_drawn = false;  // the draw's call was recorded
+std::uint64_t g_ce_decided = 0, g_ce_proven_swaps = 0, g_ce_proven_drops = 0, g_ce_proven_made = 0, g_ce_again = 0, g_ce_canaries = 0,
+              g_ce_undone = 0;
+std::uint64_t g_ce_unproven[full_write::kFails] = {};
+
+
+RtImage* rt_at_locked(std::uint64_t base) {
+    if (auto it = g_rts.find(base); it != g_rts.end()) return &it->second;
+    if (auto it = g_snapshots.find(base); it != g_snapshots.end()) return &it->second;
+    return nullptr;
+}
+
+bool copy_elide_hides_tsharp(const std::uint32_t* w) {
+    const std::uint64_t vbase = static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32);
+    return copy_elide_hides(tsharp_base(w)) || (vbase != tsharp_base(w) && copy_elide_hides(vbase));
+}
+
+// The pending copy into `dst`'s source: what its sampled bindings bind.
+RtImage* copy_elide_source_locked(const RtImage& dst) {
+    const std::uint64_t src = g_elide.redirect(dst.base);
+    if (!src) return nullptr;
+    RtImage* s = rt_at_locked(src);
+    if (!s || !s->image || s->width != dst.width || s->height != dst.height || s->format != dst.format) {
+        ++g_ce_lost;  // the ledger's invariant says this cannot happen; bind the destination as it is
+        return nullptr;
+    }
+    ++g_ce_redirects;
+    // (phase 2: a draw whose decision makes this copy resolves its images again)
+    if (t_elide_redirected_n < 8) t_elide_redirected[t_elide_redirected_n++] = src;
+    return s;
+}
+
+// A pending copy made now (the ledger said so): recorded as it would have
+// been at its token, the census not counting it again. compare: it was made
+// then, and the source is compared with what it wrote.
+void copy_elide_make_locked(const copy_elide::Pending& p, copy_elide::End why) {
+    RtImage* s = rt_at_locked(p.src);
+    RtImage* d = rt_at_locked(p.dst);
+    if (!s || !d || !s->image || !d->image || s->width != d->width || s->height != d->height || s->format != d->format) {
+        if (g_ce_lost++ < 8) {
+            host_log("render: copy elision: a pending copy 0x%llx -> 0x%llx could not be made (%s): an image went without the ledger",
+                     static_cast<unsigned long long>(p.src), static_cast<unsigned long long>(p.dst), kCeEndNames[why]);
+        }
+        return;
+    }
+    if (g_copy_elide == 2) {
+        copy_compare_record_locked(*s, *d, kCeEndNames[why]);
+        ++g_ce_compared;
+        return;
+    }
+    const copy_census::Quiet census_quiet;
+    record_target_copy_raw_locked(*s, *d, s->width, s->height);
+    g_ce_made_bytes += rt_size_bytes(*d);
+}
+// A pending copy never made: its destination is overwritten whole or retired.
+void copy_elide_drop_locked(const copy_elide::Pending& p) {
+    RtImage* s = rt_at_locked(p.src);
+    RtImage* d = rt_at_locked(p.dst);
+    if (d) g_ce_saved_bytes += rt_size_bytes(*d);
+    if (g_copy_elide == 2 && s && d && s->image && d->image && s->width == d->width && s->height == d->height && s->format == d->format) {
+        copy_compare_record_locked(*s, *d, "dropped");
+        ++g_ce_compared;
+    }
+}
+
+// Two targets' images exchanged (copy_elide_swap_locked): what travels with an
+// image - its memory, its views, whether it was made GENERAL.
+void swap_target_images_locked(RtImage& a, RtImage& b) {
+    std::swap(a.image, b.image);
+    std::swap(a.view, b.view);
+    std::swap(a.memory, b.memory);
+    std::swap(a.layer_views, b.layer_views);
+    std::swap(a.initialised, b.initialised);
+    textures_swap_target_views_locked(a.base, b.base);
+}
+bool rt_swappable(const RtImage& a, const RtImage& b) {
+    return a.image && b.image && a.initialised && b.initialised && !a.depth && !b.depth && !a.managed_layout && !b.managed_layout &&
+           a.format == b.format && a.width == b.width && a.height == b.height && a.layers == 1 && b.layers == 1 &&
+           a.mutable_format == b.mutable_format && a.format_listed == b.format_listed && a.create_flags == b.create_flags &&
+           a.usage == b.usage && a.storage == b.storage && image_memory_in_vram(a.memory) == image_memory_in_vram(b.memory);
+}
+// The source of exactly one pending copy, about to be overwritten whole: it
+// and the destination exchange images instead of the copy being made.
+bool copy_elide_swap_locked(std::uint64_t src) {
+    if (const std::size_t n = g_elide.sources(src); n != 1) {
+        static int logs = 0;  // under g.mu
+        if (logs < 8) {
+            ++logs;
+            host_log("copy elision: 0x%llx overwritten whole is the source of %zu pending copies: no exchange, the copies made (flip %llu)",
+                     static_cast<unsigned long long>(src), n, static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+        return false;
+    }
+    const copy_elide::Pending* p = g_elide.find_src(src);
+    RtImage* s = rt_at_locked(src);
+    RtImage* d = p ? rt_at_locked(p->dst) : nullptr;
+    if (!s || !d || !rt_swappable(*s, *d)) {
+        ++g_ce_swap_refused;
+        return false;
+    }
+    // Neither may be an attachment of the open pass, whose views name the images.
+    for (int t = 0; g_pass.active && t < g_pass.ntargets; ++t) {
+        if (g_pass.targets[t] == s->base || g_pass.targets[t] == d->base) render_end_pass_locked();
+    }
+    if (g_copy_elide == 2) {
+        copy_compare_record_locked(*s, *d, "swapped");
+        ++g_ce_compared;
+    }
+    g_elide.take(src);
+    swap_target_images_locked(*s, *d);
+    g_ce_saved_bytes += rt_size_bytes(*d);
+    ++g_ce_swapped;
+    return true;
+}
+
+void copy_elide_touch_locked(std::uint64_t base, int touch) {
+    if (!copy_elide_live()) return;
+    if (touch == copy_elide::kOverwrite && g_elide.is_src(base) && copy_elide_swap_locked(base)) return;
+    g_elide.touch(base, static_cast<copy_elide::Touch>(touch), copy_elide_make_locked, copy_elide_drop_locked);
+}
+void copy_elide_flush_locked() {
+    if (!copy_elide_live()) return;
+    g_elide.flush(copy_elide_make_locked);
+}
+
+void copy_elide_bound_locked(std::uint64_t base) {
+    if (!copy_elide_live()) return;
+    if (g_elide_draws && (g_elide.is_src(base) || copy_elide_hides(base))) {
+        for (int i = 0; i < t_elide_bound_n; ++i) {
+            if (t_elide_bound[i] == base) return;
+        }
+        if (t_elide_bound_n < 9) {
+            t_elide_bound[t_elide_bound_n++] = base;
+            return;
+        }
+    }
+    copy_elide_touch_locked(base, copy_elide::kWrite);
+}
+
+// Whether a pipeline's pixel shader cannot discard and stores its colour outputs on every path (spirv_discard_branches).
+void pipeline_ps_rules(const GfxPipeline& p, bool& discard, bool& branches) {
+    bool d = false, b = false;
+    spirv_discard_branches(p.ps.meta().spirv, d, b);
+    discard = discard || d || p.clip_discard;
+    branches = branches || b;
+}
+
+// Phase 2: the attachments the draw's target lookup noted, decided now that its pipeline, vertex input and images are
+// known (draw_impl, after the images' prefetch, before the pass begins: the command processor's draws only - a run part
+// notes nothing). Proven to be written whole with what it held lost (host/full_write.h, from the state the draw is
+// recorded with), a pending copy's source is overwritten whole - the two images exchanged - and a destination's copy is
+// never made; else the copy is made here. True when a copy was made whose source a sampled read of this draw was bound
+// to: the draw's images are resolved again (they would read the image the draw writes).
+bool copy_elide_decide_locked(const DrawState& s, const GpuDraw& d, const GfxPipeline& pl, const VertexInputPlan* vi, const StageImages* stages) {
+    bool again = false;
+    const int n = t_elide_bound_n;
+    t_elide_bound_n = 0;
+    // The render area: the smallest of the draw's attachments (begin_pass).
+    std::uint32_t area_w = ~0u, area_h = ~0u;
+    for (int k = 0; k < 8; ++k) {
+        if (!s.color[k]) continue;
+        area_w = std::min(area_w, s.color[k]->width);
+        area_h = std::min(area_h, s.color[k]->height);
+    }
+    if (s.depth) {
+        area_w = std::min(area_w, s.depth->width);
+        area_h = std::min(area_h, s.depth->height);
+    }
+    // The variant without the page-table fallback is bound once built when every constant buffer binds (draw_impl's
+    // bind_pl): its pixel shader must pass too, and before it is built the draw is not decided whole.
+    const bool lean_possible = g.cb_lean && !pl.tess_native && !pl.gs_native && (!pl.vs.meta().buffers.empty() || !pl.ps.meta().buffers.empty());
+    const GfxPipeline* const lean = pl.lean_variant && !pl.lean_variant->failed ? pl.lean_variant : nullptr;
+    for (int i = 0; i < n; ++i) {
+        const std::uint64_t base = t_elide_bound[i];
+        const bool src = g_elide.is_src(base), dst = copy_elide_hides(base);
+        if (!src && !dst) continue;  // ended since the lookup
+        int t = -1;
+        for (int k = 0; k < 8 && t < 0; ++k) {
+            if (s.color[k] && s.color[k]->base == base && s.color_mask[k]) t = k;
+        }
+        int fail = full_write::kMask;  // not a colour target the draw writes
+        if (t >= 0) {
+            full_write::Input in = full_write_input(s, t, pl, d, vi, pl.name);
+            in.area_w = area_w;
+            in.area_h = area_h;
+            for (int st = 0; st < 2 && !in.feedback; ++st) {
+                for (const StageImages::Image& im : stages[st].images) {
+                    if (im.resolved && image_base(im) == base) in.feedback = true;
+                }
+            }
+            if (lean) {
+                pipeline_ps_rules(*lean, in.discard, in.branches);
+            } else if (lean_possible) {
+                in.variant_unknown = true;
+            }
+            if (d.index_va) in.bytes_unknown = true;  // its indices are bytes too, not read as the GPU reads them
+            fail = full_write::check(in);
+        }
+        ++g_ce_decided;
+        static std::set<std::pair<std::string, int>> said;  // under g.mu
+        if (said.size() < 48 && said.emplace(pl.name, fail).second) {
+            host_log("copy elision: draw %s into 0x%llx (target %d, a pending copy's %s): %s (flip %llu)", pl.name.c_str(),
+                     static_cast<unsigned long long>(base), t, src ? "source" : "destination", full_write::fail_name(fail),
+                     static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+        if (fail == full_write::kNone) {
+            const std::uint64_t swaps = g_ce_swapped;
+            const std::uint64_t partner = src ? g_elide.find_src(base)->dst : g_elide.redirect(base);
+            copy_elide_touch_locked(base, copy_elide::kOverwrite);
+            bool undo_into_source = false;
+            if (!src) {
+                ++g_ce_proven_drops;
+                t_elide_undo[t_elide_undo_n++] = {partner, base};  // not drawn: the copy made after all
+            } else if (g_ce_swapped > swaps) {
+                ++g_ce_proven_swaps;
+                undo_into_source = true;  // not drawn: the source's texels back from the destination, which now holds them
+            } else {
+                ++g_ce_proven_made;  // more than one copy of the source pending, or images unlike: made
+            }
+            // compare: the image the draw writes holds the canary until the draw, which must leave none of it.
+            if (g_copy_elide == 2 && t_elide_canary_n < 8) {
+                copy_canary_fill_locked(*s.color[t]);
+                t_elide_canary[t_elide_canary_n++] = {base, pl.name.c_str()};
+                if (src) undo_into_source = true;
+            }
+            if (undo_into_source) t_elide_undo[t_elide_undo_n++] = {partner, base};
+            if (g_elide_mutant >= 2) t_elide_mutant_draw = g_elide_mutant;
+        } else {
+            ++g_ce_unproven[fail];
+            copy_elide_touch_locked(base, copy_elide::kWrite);
+            for (int r = 0; r < t_elide_redirected_n; ++r) {
+                if (t_elide_redirected[r] == base) again = true;
+            }
+        }
+    }
+    t_elide_redirected_n = 0;
+    if (again) ++g_ce_again;
+    return again;
+}
+
+// At the end of a draw that decided (draw_impl's guard): if its draw call was not recorded, what the proven decisions did
+// put back by copies (t_elide_undo), and their canaries dropped.
+void copy_elide_undo_locked() {
+    const int n = t_elide_undo_n;
+    t_elide_undo_n = 0;
+    if (t_elide_drawn || !n) return;
+    for (int i = 0; i < n; ++i) {
+        RtImage* a = rt_at_locked(t_elide_undo[i].from);
+        RtImage* b = rt_at_locked(t_elide_undo[i].to);
+        if (a && b && a->format == b->format && a->width == b->width && a->height == b->height) {
+            const copy_census::Quiet census_quiet;
+            record_target_copy_raw_locked(*a, *b, a->width, a->height);
+            ++g_ce_undone;
+            static int logs = 0;  // under g.mu
+            if (logs++ < 8) {
+                host_log("copy elision: a draw proven to write 0x%llx was not drawn: 0x%llx copied into it (flip %llu)",
+                         static_cast<unsigned long long>(b->base), static_cast<unsigned long long>(a->base),
+                         static_cast<unsigned long long>(hle_video_flip_count()));
+            }
+        }
+    }
+    t_elide_canary_n = 0;
+}
+
+// Phase 2 B1: a PointSampleColor1 draw (0b0acf50+f7229091: mrt0 = the f16 round trip of a nearest sample of its image
+// at LOD 0 at the interpolated param0, which ScreenSpaceQuadShader exports from v8..v9 as read) that is an exact texel
+// copy of a render target into one of its size and format, left undrawn: a pending copy of the source into the
+// destination instead (copy_elide_defer_locked, as a copy token's). Exact when: one colour target, no depth or stencil
+// written; one image, a render target other than the target, of its size and a UNORM8 format (k/255 survives the f16
+// round trip); viewed at level 0 of one level, layer 0, the target's format, identity swizzle; a nearest sampler; the
+// draw proven to write all of the target (host/full_write.h, as phase 2 A); w = 1 at every vertex and the texture
+// coordinates the pixel position over the size there (so at every pixel centre: its own texel's centre); the positions
+// and coordinates the bytes the GPU reads; no query or predicate on the draw. compare: drawn as well, its target compared
+// with its source after the draw, then left pending (copy_elide_canary_after_draw).
+bool copy_elide_defer_locked(RtImage& src, RtImage& dst, std::uint32_t width, std::uint32_t height);  // below
+bool copy_elide_point_copy_locked(const DrawState& s, const GpuDraw& d, const GfxPipeline& pl, const VertexInputPlan* vi, const StageImages* stages) {
+    if (pl.name.size() < 17 || pl.name.compare(0, 17, "0b0acf50+f7229091") != 0) return false;
+    // A condition that does not hold: counted, and said once with what the draw had.
+    const auto refuse = [&](int why, const char* detail) {
+        ++g_ce_point_refused[why];
+        static bool said[kPrRefusals] = {};  // under g.mu
+        if (!said[why]) {
+            said[why] = true;
+            host_log("copy elision: point copy %s into 0x%llx (%ux%u f%d) drawn as asked: %s (%s; flip %llu)", pl.name.c_str(),
+                     static_cast<unsigned long long>(s.color[0] ? s.color[0]->base : 0), s.color[0] ? s.color[0]->width : 0,
+                     s.color[0] ? s.color[0]->height : 0, s.color[0] ? static_cast<int>(s.color[0]->format) : 0, kPrNames[why], detail,
+                     static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+        return false;
+    };
+    if (!vi || d.index_va) return refuse(kPrInput, !vi ? "no vertex input" : "indexed");
+    if (!s.color[0]) return refuse(kPrTargets, "no colour target 0");
+    for (int k = 1; k < 8; ++k) {
+        if (s.color[k]) return refuse(kPrTargets, "another colour target");
+    }
+    if (s.depth) {
+        GfxFixedState f;
+        fixed_raster_depth(s, f);
+        // Vulkan writes depth only where the depth test is on, stencil only with the stencil test on.
+        if ((f.depth_test && f.depth_write) || f.stencil_test) return refuse(kPrDepth, f.stencil_test ? "stencil test" : "depth written");
+    }
+    RtImage& dst = *s.color[0];
+    if (!stages[0].images.empty() || stages[1].images.size() != 1 || stages[1].samplers.size() != 1) return refuse(kPrImages, "not one image and one sampler");
+    const StageImages::Image& im = stages[1].images[0];
+    if (!im.resolved || !im.view || !stages[1].samplers[0]) return refuse(kPrImages, "image or sampler not resolved");
+    RtImage* const src = rt_at_locked(image_base(im));
+    const bool unorm8 = dst.format == VK_FORMAT_B8G8R8A8_UNORM || dst.format == VK_FORMAT_R8G8B8A8_UNORM;
+    if (!src || src == &dst || src->depth || src->format != dst.format || !unorm8 || src->width != dst.width || src->height != dst.height ||
+        src->layers != 1 || dst.layers != 1) {
+        char b[96];
+        std::snprintf(b, sizeof(b), "source 0x%llx %ux%u f%d", static_cast<unsigned long long>(image_base(im)), src ? src->width : 0,
+                      src ? src->height : 0, src ? static_cast<int>(src->format) : 0);
+        return refuse(kPrSource, b);
+    }
+    ViewRecord vr;
+    if (!describe_view_locked(im.view, vr)) return refuse(kPrView, "view not known");
+    const VkImageSubresourceRange& sr = vr.view_info.subresourceRange;
+    const auto identity = [](VkComponentSwizzle c, VkComponentSwizzle self) { return c == VK_COMPONENT_SWIZZLE_IDENTITY || c == self; };
+    if (vr.view_info.format != dst.format || sr.baseMipLevel != 0 || sr.levelCount != 1 || sr.baseArrayLayer != 0 || sr.layerCount != 1 ||
+        !identity(vr.view_info.components.r, VK_COMPONENT_SWIZZLE_R) || !identity(vr.view_info.components.g, VK_COMPONENT_SWIZZLE_G) ||
+        !identity(vr.view_info.components.b, VK_COMPONENT_SWIZZLE_B) || !identity(vr.view_info.components.a, VK_COMPONENT_SWIZZLE_A) ||
+        vr.image_info.extent.width != src->width || vr.image_info.extent.height != src->height) {
+        return refuse(kPrView, "not level 0 of one, layer 0, the target's format, identity swizzle");
+    }
+    VkSamplerCreateInfo sci{};
+    if (!describe_sampler_locked(stages[1].samplers[0], sci) || sci.magFilter != VK_FILTER_NEAREST || sci.minFilter != VK_FILTER_NEAREST ||
+        sci.anisotropyEnable || sci.compareEnable || sci.unnormalizedCoordinates) {
+        return refuse(kPrSampler, "not a nearest sampler");
+    }
+    // The draw writes all of its target (phase 2's proof, as copy_elide_decide_locked takes it).
+    full_write::Input in = full_write_input(s, 0, pl, d, vi, pl.name);
+    std::uint32_t area_w = dst.width, area_h = dst.height;
+    if (s.depth) {
+        area_w = std::min(area_w, s.depth->width);
+        area_h = std::min(area_h, s.depth->height);
+    }
+    in.area_w = area_w;
+    in.area_h = area_h;
+    in.feedback = image_base(im) == dst.base;
+    const bool lean_possible = g.cb_lean && !pl.tess_native && !pl.gs_native && (!pl.vs.meta().buffers.empty() || !pl.ps.meta().buffers.empty());
+    if (pl.lean_variant && !pl.lean_variant->failed) {
+        pipeline_ps_rules(*pl.lean_variant, in.discard, in.branches);
+    } else if (lean_possible) {
+        in.variant_unknown = true;
+    }
+    if (const int fail = full_write::check(in); fail != full_write::kNone) {
+        ++g_ce_point_proof[fail];
+        return refuse(kPrProof, full_write::fail_name(fail));
+    }
+    // The texture coordinates (v8..v9): at each vertex the window position over the size, w = 1 everywhere.
+    const gcn::VertexElement* uv = nullptr;
+    for (const gcn::VertexElement& e : vi->elements) {
+        if (e.vdata == 8 && e.count >= 2) uv = &e;
+    }
+    std::uint32_t ids[6];
+    if (!uv) return refuse(kPrCoords, "no element in v8..v9");
+    if (draw_vertex_ids(d, in.vertices, ids) || !served_fixed(*vi, *uv, ids[0], in.vertices)) return refuse(kPrCoords, "their bytes not the GPU's");
+    float coords[6][2];
+    for (std::uint32_t v = 0; v < in.vertices; ++v) {
+        float c[4];
+        if (const char* why = read_vertex_element(*vi, *uv, ids[v], c)) return refuse(kPrCoords, why);
+        coords[v][0] = c[0];
+        coords[v][1] = c[1];
+    }
+    if (!full_write::texel_exact(in, coords)) {
+        char b[160];
+        std::snprintf(b, sizeof(b), "not each pixel's own texel: uv (%g %g) (%g %g) (%g %g) (%g %g), viewport %g,%g %gx%g", coords[0][0], coords[0][1],
+                      coords[1][0], coords[1][1], coords[2][0], coords[2][1], coords[3][0], coords[3][1], in.vp_x, in.vp_y, in.vp_w, in.vp_h);
+        return refuse(kPrCoords, b);
+    }
+    if (!occlusion_draw_plain()) return refuse(kPrQuery, "an occlusion query or a predicate");
+    if (g_copy_elide == 2) {
+        if (t_elide_point_n < 2) t_elide_point[t_elide_point_n++] = {src->base, dst.base};
+        if (g_elide_mutant == 4) t_elide_mutant_draw = 2;
+        return false;  // drawn; compared and left pending after it
+    }
+    if (!copy_elide_defer_locked(*src, dst, dst.width, dst.height)) return refuse(kPrDeferral, "copy_elide_refusal");  // drawn as asked
+    ++g_ce_point_copies;
+    t_elide_drawn = true;  // its target overwritten whole all the same: what the decisions took stands
+    static int logs = 0;  // under g.mu
+    if (logs++ < 4) {
+        host_log("copy elision: point copy 0x%llx -> 0x%llx (%ux%u format %d) left undrawn: a pending copy (flip %llu)",
+                 static_cast<unsigned long long>(src->base), static_cast<unsigned long long>(dst.base), dst.width, dst.height,
+                 static_cast<int>(dst.format), static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+    return true;
+}
+
+// compare: after an in-order draw (host_gpu_draw, its packet handed over), the canaries of the targets it was proven to
+// write whole counted, and an exact point copy's target compared with its source, then left pending.
+void copy_elide_canary_after_draw() {
+    if (!t_elide_canary_n && !t_elide_point_n) return;
+    std::lock_guard<GpuMutex> lock(g.mu);
+    for (int i = 0; i < t_elide_canary_n; ++i) {
+        if (RtImage* r = rt_at_locked(t_elide_canary[i].base)) {
+            copy_canary_check_locked(*r, t_elide_canary[i].who);
+            ++g_ce_canaries;
+        }
+    }
+    t_elide_canary_n = 0;
+    for (int i = 0; i < t_elide_point_n; ++i) {
+        RtImage* a = rt_at_locked(t_elide_point[i].src);
+        RtImage* b = rt_at_locked(t_elide_point[i].dst);
+        if (!a || !b) continue;
+        copy_compare_record_locked(*a, *b, "point copy drawn");
+        if (copy_elide_defer_locked(*a, *b, b->width, b->height)) ++g_ce_point_drawn;
+    }
+    t_elide_point_n = 0;
+}
+
+// Why a whole copy of `src` into `dst` must be made where it is asked for (a
+// refusal), or -1.
+int copy_elide_refusal(const RtImage& src, const RtImage& dst, std::uint32_t width, std::uint32_t height) {
+    if (src.depth || dst.depth) return kErDepth;
+    if (src.layers != 1 || dst.layers != 1) return kErLayers;
+    if (src.format != dst.format || width != src.width || height != src.height || dst.width != width || dst.height != height) return kErShape;
+    // A binding of the destination takes the source's view formats (render_target_view: a format outside a listed
+    // source's list reads a copy of it), so only mutability must agree; a swap wants them alike (rt_swappable).
+    if (src.mutable_format != dst.mutable_format) return kErViews;
+    if (!src.initialised || !src.image) return kErUndrawn;
+    if (src.image == dst.image) return kErSame;
+    if (hle_video_is_display_buffer(dst.base)) return kErDisplay;
+    if (g_lazy_barriers) return kErBarriers;
+    if (!textures_images_mode()) return kErNoIds;
+    return -1;
+}
+
+// render_copy_target_locked's whole copy of `src` into `dst`: left unmade when
+// it may be (true), with what the copy does beyond its texels done now.
+bool copy_elide_defer_locked(RtImage& src, RtImage& dst, std::uint32_t width, std::uint32_t height) {
+    if (!g_copy_elide) return false;
+    if (const int why = copy_elide_refusal(src, dst, width, height); why >= 0) {
+        ++g_ce_refused[why];
+        // Which copies are refused, once a reason, source and destination (up to 32): what a later phase could take.
+        static std::set<std::tuple<int, std::uint64_t, std::uint64_t>> said;  // under g.mu
+        if (said.size() < 32 && said.emplace(why, src.base, dst.base).second) {
+            host_log("copy elision: a copy of 0x%llx %ux%u f%d into 0x%llx %ux%u f%d made where asked (%s) (flip %llu)",
+                     static_cast<unsigned long long>(src.base), src.width, src.height, static_cast<int>(src.format),
+                     static_cast<unsigned long long>(dst.base), dst.width, dst.height, static_cast<int>(dst.format), kErNames[why],
+                     static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+        return false;
+    }
+    // Phase 1c: a copy of this source into this destination whose last ones, two or more in a row, were made after all
+    // is made where it is asked, today's path (copy_elide::Ledger::worth_deferring: one in a window of 2 to 64 is left
+    // unmade again).
+    if (g_elide_history && !g_elide.worth_deferring(src.base, dst.base)) {
+        ++g_ce_refused[kErMade];
+        static std::set<std::pair<std::uint64_t, std::uint64_t>> said;  // under g.mu
+        if (said.size() < 16 && said.emplace(src.base, dst.base).second) {
+            host_log("copy elision: copies of 0x%llx into 0x%llx (%ux%u f%d) made where asked: the last ones made after all (flip %llu)",
+                     static_cast<unsigned long long>(src.base), static_cast<unsigned long long>(dst.base), dst.width, dst.height,
+                     static_cast<int>(dst.format), static_cast<unsigned long long>(hle_video_flip_count()));
+        }
+        return false;
+    }
+    // Either an attachment of the open pass (mostly the source, drawn up to the token): the pass ends here, where the
+    // copy made now would end it (record_target_copy_raw_locked ends any open pass). A later draw into either begins a
+    // new pass whose target lookup - in order: a copy token ends a run (list_split_of) - ends the pending copy first,
+    // and a sampled read of the destination, bound to the source's image, is no feedback loop once the pass that drew
+    // the source has ended.
+    for (int t = 0; g_pass.active && t < g_pass.ntargets; ++t) {
+        if (g_pass.targets[t] == src.base || g_pass.targets[t] == dst.base) {
+            begin_recording_locked();
+            render_end_pass_locked();
+            ++g_ce_pass_ended;
+            break;
+        }
+    }
+    if (copy_census::on()) census_target_copy_locked(src, dst, width, height);
+    // What the copy does before it writes: the clears owed to either image made.
+    if (src.view_clear) view_clear_apply_locked(src, kVcwCopy);
+    if (dst.view_clear) view_clear_apply_locked(dst, kVcwCopy);
+    const std::uint64_t sb = src.base, db = dst.base;
+    // What this ends first: the destination overwritten whole (its own pending
+    // copy forgotten; a copy out of it made, or the two images exchanged), and
+    // in the ledger the source's own pending copy (made now).
+    copy_elide_touch_locked(db, copy_elide::kOverwrite);
+    g_elide.defer(sb, db, 0, copy_elide_make_locked, copy_elide_drop_locked);
+    // A destination nothing has made GENERAL yet is made so now (a barrier, no
+    // texels), so everything that asks whether it was drawn finds it was.
+    if (!dst.initialised) {
+        begin_recording_locked();
+        render_end_pass_locked();
+        image_barrier(g_cmd(), dst.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                      VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        dst.initialised = true;
+    }
+    // The destination is written now, as far as anything that asks is concerned.
+    {
+        const copy_census::Quiet census_quiet;
+        rt_written(dst);
+    }
+    if (g_pending_clears.erase(db)) ++g_pending_gen;
+    dst.fill_last = false;
+    ++g_ce_deferred;
+    // compare: made at once as well, so that each end can check the source against it -
+    // and checked at once (the compare's own check: the two must be equal here).
+    if (g_copy_elide == 2) {
+        const copy_census::Quiet census_quiet;
+        record_target_copy_raw_locked(src, dst, width, height);
+        copy_compare_record_locked(src, dst, "at the copy");
+        ++g_ce_compared;
+    }
+    return true;
+}
+
+std::string copy_elide_report_locked() {
+    if (!g_copy_elide) return {};
+    std::string ends, refused;
+    for (int e = 0; e < copy_elide::kEnds; ++e) {
+        if (const std::uint64_t n = g_elide.ends(e)) ends += (ends.empty() ? "" : ", ") + std::string(kCeEndNames[e]) + " " + std::to_string(n);
+    }
+    for (int r = 0; r < kErRefusals; ++r) {
+        if (g_ce_refused[r]) refused += (refused.empty() ? "" : ", ") + std::string(kErNames[r]) + " " + std::to_string(g_ce_refused[r]);
+    }
+    std::string unproven;  // phase 2's draws not proven, by the first rule that failed
+    for (int f = 0; f < full_write::kFails; ++f) {
+        if (g_ce_unproven[f]) unproven += (unproven.empty() ? "" : ", ") + std::string(full_write::fail_name(f)) + " " + std::to_string(g_ce_unproven[f]);
+    }
+    char draws[900] = "";
+    if (g_elide_draws) {
+        std::snprintf(draws, sizeof(draws), "; draws decided %llu: proven %llu exchanged, %llu dropped, %llu made; not proven [%s]; images resolved again %llu; "
+                      "point copies left undrawn %llu (compare: drawn and compared %llu); undone %llu",
+                      static_cast<unsigned long long>(g_ce_decided), static_cast<unsigned long long>(g_ce_proven_swaps),
+                      static_cast<unsigned long long>(g_ce_proven_drops), static_cast<unsigned long long>(g_ce_proven_made),
+                      unproven.empty() ? "none" : unproven.c_str(), static_cast<unsigned long long>(g_ce_again),
+                      static_cast<unsigned long long>(g_ce_point_copies), static_cast<unsigned long long>(g_ce_point_drawn),
+                      static_cast<unsigned long long>(g_ce_undone));
+        std::string pr;
+        for (int r = 0; r < kPrRefusals; ++r) {
+            if (g_ce_point_refused[r]) pr += (pr.empty() ? "" : ", ") + std::string(kPrNames[r]) + " " + std::to_string(g_ce_point_refused[r]);
+        }
+        for (int f = 0; f < full_write::kFails; ++f) {
+            if (g_ce_point_proof[f]) pr += std::string(" (proof: ") + full_write::fail_name(f) + " " + std::to_string(g_ce_point_proof[f]) + ")";
+        }
+        const std::size_t used = std::strlen(draws);
+        std::snprintf(draws + used, sizeof(draws) - used, "; point copies drawn as asked [%s]", pr.empty() ? "none" : pr.c_str());
+    }
+    char buf[1400];
+    std::snprintf(buf, sizeof(buf),
+                  "copy elision%s: %llu copies left unmade (%zu pending), %llu exchanged images, ends [%s]; %llu bindings of a destination bound "
+                  "its source; made later %.1f MiB, never made %.1f MiB; made where asked [%s]; swaps refused %llu, lost %llu; open passes "
+                  "ended at a copy left unmade %llu%s",
+                  g_copy_elide == 2 ? " (compare)" : "", static_cast<unsigned long long>(g_ce_deferred), g_elide.size(),
+                  static_cast<unsigned long long>(g_ce_swapped), ends.empty() ? "none" : ends.c_str(),
+                  static_cast<unsigned long long>(g_ce_redirects), static_cast<double>(g_ce_made_bytes) / (1 << 20),
+                  static_cast<double>(g_ce_saved_bytes) / (1 << 20), refused.empty() ? "none" : refused.c_str(),
+                  static_cast<unsigned long long>(g_ce_swap_refused), static_cast<unsigned long long>(g_ce_lost),
+                  static_cast<unsigned long long>(g_ce_pass_ended), draws);
+    return g_copy_elide == 2 ? std::string(buf) + "; " + copy_compare_report_locked() : std::string(buf);
+}
+
 // The bytes of one texel of a T#'s data format (IMG_DATA_FORMAT), 0 for the
 // block-compressed and the formats a target is never made in.
 std::size_t tsharp_texel_bytes(std::uint32_t dfmt) {
@@ -12945,6 +14213,7 @@ bool copy_overlap_locked(RtImage& src, std::uint64_t src_base, std::uint64_t dst
 }
 
 bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes, const char* via) {
+    t_copy_via = via;
     // BBHOST_WATCH_COPY_DST=0x<base>: every whole-target copy into that
     // address, with the flip. A frame can go wrong without any draw being
     // different - the engine also moves whole surfaces around, and a copy from
@@ -13029,6 +14298,8 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
             bump_view_epoch();
         }
     }
+    // BBHOST_COPY_ELIDE: left unmade while nothing needs it made (copy_elide_defer_locked).
+    if (copy_elide_defer_locked(src, into ? *into : *snap, src.width, src.height)) return true;
     if (!record_target_copy_locked(src, into ? *into : *snap, src.width, src.height)) {
         note_copy_refused_locked(kCopyRefusedNoImage, via, src_base, dst_base, bytes);
         return false;
@@ -13713,7 +14984,21 @@ using namespace gpu;
 std::string host_gpu_fill_stats() { return render_fill_stats(); }
 std::string host_gpu_target_copy_report() {
     std::lock_guard<GpuMutex> lock(g.mu);
-    return g.ok ? render_target_copy_report() : std::string();
+    if (g.ok && copy_census::on()) copy_census::report_locked();
+    if (!g.ok) return std::string();
+    if (const std::string e = copy_elide_report_locked(); !e.empty()) {
+        // A log line ends at 1 KiB: the report on as many as it takes, cut after a "; ".
+        for (std::size_t at = 0; at < e.size();) {
+            std::size_t n = std::min<std::size_t>(e.size() - at, 960);
+            if (at + n < e.size()) {
+                const std::size_t cut = e.rfind("; ", at + n);
+                if (cut != std::string::npos && cut > at) n = cut + 2 - at;
+            }
+            host_log("  %s%s", at ? "copy elision (more): " : "", e.substr(at, n).c_str());
+            at += n;
+        }
+    }
+    return render_target_copy_report();
 }
 void host_gpu_pipeline_time_us(std::uint64_t out[5]) { render_pipeline_time_us(out); }
 void host_gpu_pipeline_work(std::uint64_t out[14]) {
@@ -13917,6 +15202,42 @@ const bool g_cb_prefetch = [] {
 // `records`, when given: the most records a V# read by index holds (a
 // geometry-shader draw's emitter's room for particles). `bases`, when given:
 // each buffer's V# base (0 for one not resolved), meta.buffers.size() of them.
+namespace {
+// BBHOST_RUN_COMMIT=compare: the constant buffers each stage of this thread's
+// draw bound through the whole snapshot ring (resolve_stage_buffers). Such a
+// binding's cb_bias_dw is its copy's offset in the ring, which a run part and
+// the commit in order place apart, so the params' digest (run_digest_params)
+// takes the guest range the copy was made from in its place - while the bias
+// points at that copy - rather than the offset.
+struct RingCbNote {
+    std::uint32_t slots = 0;                      // bit n: buffers[n] bound through the whole ring
+    std::uint32_t at_dw[16] = {};                 // its copy's offset in the ring, in dwords
+    std::uint64_t base[16] = {}, bytes[16] = {};  // the guest range the copy was made from
+};
+thread_local constinit RingCbNote t_ring_cb[2] = {};  // per stage, reset with t_run_digest at the draw's start
+thread_local constinit int t_ring_cb_stage = -1;      // the stage draw_impl resolves, -1 outside
+// BBHOST_RUN_COMMIT=compare: the join commits a run's draws again in order
+// (run_compare_join_locked) - they leave what the pipeline workers finished
+// since the fork (table masks, lean variants, relinks) to the draw after the
+// run, as a part's draw does, so each meets the masks and variants its part
+// met. Right after a load a mask could arrive between the fork and the join:
+// the commit in order then left out user data and tables the part had built
+// for words the variant never reads, or bound the lean variant where the part
+// bound its fallback - the same draw, but not the same digest.
+thread_local constinit bool t_compare_recommit = false;
+void run_digest_ring_cb(std::size_t slot, std::uint64_t at, std::uint64_t base, std::uint64_t bytes) {
+    if (t_ring_cb_stage < 0 || slot >= 16) return;
+    RingCbNote& n = t_ring_cb[t_ring_cb_stage];
+    n.slots |= 1u << slot;
+    n.at_dw[slot] = static_cast<std::uint32_t>(at / 4);
+    // A table GX built in its ring (placed apart by a part and in order): by its bytes, as the constant buffers' digest
+    // takes it (resolve_stage_buffers).
+    const bool in_ring = g_gx_ring.base && base >= g_gx_ring.base && base + bytes <= g_gx_ring.base + g_gx_ring.size;
+    n.base[slot] = in_ring ? fnv1a(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(base)), bytes) : base;
+    n.bytes[slot] = bytes;
+}
+}  // namespace
+
 void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t* user, gcn::StageParams& params,
                            std::vector<VkDescriptorBufferInfo>& infos, const GxStageRecords* gx = nullptr, bool exact = false,
                            std::uint32_t* records = nullptr, std::uint64_t* bases = nullptr) {
@@ -14284,6 +15605,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         info = whole_ring ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, memo->at, bytes};
                         params.cb_valid |= 1u << i;
                         params.cb_bias_dw[i] = whole_ring ? static_cast<std::uint32_t>(memo->at / 4) : 0;
+                        if (whole_ring && list_resolve::commit_compare()) run_digest_ring_cb(i, memo->at, base, bytes);
                         outcome = kBound;
                         if (!whole_ring) note_copy_binding_locked(info, base);
                         if (host_tooling()) bump(g_cb_snapshots_shared);
@@ -14377,6 +15699,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     info = whole ? VkDescriptorBufferInfo{scratch.buffer, 0, kScratch} : VkDescriptorBufferInfo{scratch.buffer, at, bytes};
                     params.cb_valid |= 1u << i;
                     params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(at / 4) : 0;
+                    if (whole && list_resolve::commit_compare()) run_digest_ring_cb(i, at, base, bytes);
                     outcome = kBound;
                     // The guest bytes, unless a copy-back's copy laid over them
                     // (never a snapshot's: its range has no copy version, as
@@ -15120,6 +16443,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         const std::uint32_t* w;
         Located whole;
         bool snapped = false;  // whole is the record's snapshot (shadow_snapshot_locked)
+        std::uint8_t served = kServedUnknown;  // how its bytes reach the GPU (VertexServed)
     } shadows[16];
     std::size_t n_shadows = 0;
     // The mirrors' answer for each record this draw asked them about
@@ -15193,6 +16517,8 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 ve.count = fe.count;
                 ve.w3 = w[3];
                 p.elements.push_back(ve);
+                // (bound after its buffer's end, the copy holds what the draw recorded and guest memory may be another's)
+                p.served[e] = ended_el[e] ? kServedUnknown : kServedHandle;
                 placed[e] = {gxvk_plan_buffer(va), va, stride, fmt, va};
                 continue;
             }
@@ -15363,15 +16689,19 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 // The heap's import, from the record's start, as far as it holds.
                 ns.whole = {loc.buffer, loc.offset - fe.offset, std::min<std::uint64_t>(record_bytes, loc.avail + fe.offset)};
                 in_place = true;
+                ns.served = kServedHeap;
             } else if (mirrored) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};  // the mirror already (window imports)
                 shadow_served = vb_race_wide_on();  // =3: counted as the mirrors' too
+                ns.served = kServedMirror;
             } else if (snapped) {
                 ns.whole = snap;  // the snapshot already (window imports)
                 ns.snapped = true;
                 bump(g_vertex_snapshot_records);
+                ns.served = kServedSnapshot;
             } else if (windowed) {
                 bump(g_vertex_window_records);
+                ns.served = kServedWindow;
             } else if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
                 // Placed in place when this draw asked the mirrors about the
@@ -15417,6 +16747,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                     }
                 }
                 shadow_served = ns.whole.buffer != loc.buffer;
+                ns.served = shadow_served ? kServedMirror : kServedInPlace;
                 if (ns.whole.buffer == loc.buffer) {  // stays in host memory
                     // A ring the game rewrites: the bytes as the draw records
                     // (shadow_snapshot_locked); otherwise staged as the GPU
@@ -15424,6 +16755,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                     if (version == kCopyVersionNone && shadow_snapshot_maybe_locked(record_va, record_bytes) &&
                         shadow_snapshot_locked(record_va, read_bytes(), ns.whole)) {
                         bump(g_vertex_snapshot_records);
+                        ns.served = kServedSnapshot;
                     } else if (vb_race_on() && read_bytes() > (1u << 20)) {
                         static int logs = 0;
                         if (logs++ < 12) {
@@ -15438,6 +16770,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                         in_place = true;
                     } else if (vertex_stage_on() && shadow_stage_locked(record_va, record_bytes, ns.whole)) {
                         bump(g_vertex_staged_records);
+                        ns.served = kServedStaged;
                     } else {
                         ns.whole = {};
                         in_place = true;
@@ -15445,6 +16778,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 }
             } else {
                 in_place = true;
+                ns.served = kServedInPlace;
             }
             // BBHOST_VB_RACE: the bytes the draw reads where the GPU reads
             // them in place - not a window's, a copy version's or a snapshot's
@@ -15482,6 +16816,8 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         ve.count = fe.count;
         ve.w3 = w[3];
         p.elements.push_back(ve);
+        // A copy version's bytes stand where the record shadow kept the version's location.
+        p.served[e] = version == kCopyVersionInside && rs->served == kServedInPlace ? kServedVersion : rs->served;
         placed[e] = {loc.buffer, loc.offset, stride, fmt, va};
     }
     // Every element reads address + v0 * stride, so elements in one buffer
@@ -16067,6 +17403,7 @@ void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t 
         RtImage& r = kv.second;
         if (!r.depth || r.base != base) continue;
         r.htile_clear_pending = true;
+        if (copy_census::on()) copy_census::touch(r.base, copy_census::kTouchClear, "depth clear");
         const float depth = htile_word_depth(word);
         std::memcpy(&r.htile_clear_depth, &depth, 4);
         r.htile_clear_stencil = stencil;
@@ -16217,6 +17554,8 @@ void view_clear_apply_locked(RtImage& r, int why) { view_clear_apply_barrier_loc
 // with one barrier after them all.
 void view_clears_flush_locked(int why) {
     if (g_in_view_flush) return;
+    // A dump or capture reads targets' images as they are: every copy left unmade is made first (BBHOST_COPY_ELIDE).
+    if (why == kVcwDump) copy_elide_flush_locked();
     std::vector<std::uint64_t> list;
     list.swap(g_view_clear_list);
     ++g_view_clear_list_gen;
@@ -16400,6 +17739,7 @@ bool host_gpu_clear_view_resolvable(const GpuClearView& c, const char** why) {
 bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* out) {
     std::lock_guard<GpuMutex> lk(g.mu);
     if (!g.ok) return false;
+    const copy_census::As census_as(copy_census::kTouchClear);
     const int kind = clear_view_kind(c);
     std::uint32_t first = 0, count = 0;
     const std::size_t before = g_rts.size();
@@ -16509,6 +17849,9 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
                 view_clear_apply_locked(*r, kVcwOlder);
             }
         }
+        // Copies left unmade (BBHOST_COPY_ELIDE): the clear owed from here overwrites the
+        // image whole (every layer) or in part.
+        if (copy_elide_live()) copy_elide_touch_locked(r->base, first == 0 && count >= r->layers ? copy_elide::kOverwrite : copy_elide::kWrite);
         if (!r->view_clear) g_view_clear_list.push_back(r->base);
         r->view_clear = true;
         r->view_clear_load = false;
@@ -16522,13 +17865,18 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
             note_fill_last(*r, r->base, rt_size_bytes(*r), c.rgba);
         }
         ++g_vc_set;
-        rt_written(*r);
+        {
+            const copy_census::As census_part(first == 0 && count >= r->layers ? copy_census::kTouchClear : copy_census::kTouchClearPart);
+            rt_written(*r);
+        }
         g_cv_by_image[r->base].last_write = r->last_write;
         return true;
     }
     if (!c.depth) {
+        if (copy_elide_live()) copy_elide_touch_locked(r->base, first == 0 && count >= r->layers ? copy_elide::kOverwrite : copy_elide::kWrite);
         clear_image_locked(*r, c.rgba, first, count);
         note_fill_last(*r, r->base, rt_size_bytes(*r), c.rgba);
+        const copy_census::As census_part(first == 0 && count >= r->layers ? copy_census::kTouchClear : copy_census::kTouchClearPart);
         rt_written(*r);
         g_cv_by_image[r->base].last_write = r->last_write;
         return true;
@@ -16547,7 +17895,9 @@ bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* 
     if (planes.stencil && has_stencil && !(c.flags & 2)) ++g_cv_stencil_by_htile;
     if (c.htile && has_stencil && !planes.stencil) ++g_cv_stencil_kept;
     if (!planes.depth || (has_stencil && !planes.stencil)) ++g_cv_aspects[kind];
+    if (copy_elide_live()) copy_elide_touch_locked(r->base, copy_elide::kWrite);  // (no copy of a depth target is left unmade)
     clear_depth_layers_locked(*r, planes.depth, planes.stencil, planes.depth_value, planes.stencil_value, first, count);
+    const copy_census::As census_part(first == 0 && count >= r->layers ? copy_census::kTouchClear : copy_census::kTouchClearPart);
     rt_written(*r);
     g_cv_by_image[r->base].last_write = r->last_write;
     return true;
@@ -18800,6 +20150,11 @@ static bool tess_draw_one(const GpuDraw& d, TessDraw& t) {
 }
 
 bool host_gpu_draw(const GpuDraw& d) {
+    // Copy elision's compare: the canaries of the targets the draw was proven to write whole, counted once it is
+    // recorded (its packet handed over) - before a run's parts follow it.
+    struct CanaryAfter {
+        ~CanaryAfter() { copy_elide_canary_after_draw(); }
+    } canary_after;
     const ResolveKind resolve_kind(d.gx_token ? (d.gx_token_kind ? d.gx_token_kind : "token draw") : "packet draw");
     // The windows given since the last draw are this one's (host_gpu_draw_window).
     t_draw_windows.swap(t_given_windows);
@@ -19303,7 +20658,7 @@ void run_digest_call(const DrawCall& call) {
     d.instances = call.instances;
     d.vertex_offset = call.vertex_offset;
 }
-std::uint64_t run_digest_params(const gcn::StageParams& p) {
+std::uint64_t run_digest_params(const gcn::StageParams& p, int stage) {
     gcn::StageParams q = p;
     const std::uint64_t lo = g_gx_ring.base, hi = g_gx_ring.base + g_gx_ring.size;
     for (int k = 0; k + 1 < 16; k += 2) {
@@ -19313,7 +20668,93 @@ std::uint64_t run_digest_params(const gcn::StageParams& p) {
         const std::uint64_t a8 = q.user_sgpr[k] | (static_cast<std::uint64_t>(q.user_sgpr[k + 1] & 0xff) << 32);
         if (lo && ((a16 >= lo && a16 < hi) || (a8 >= lo && a8 < hi))) q.user_sgpr[k] = q.user_sgpr[k + 1] = 0;
     }
-    return fnv1a(&q, sizeof(q));
+    // A constant buffer bound through the whole snapshot ring: the guest range
+    // its copy was made from in place of its bias (the copy's place in the
+    // ring) - or, should the bias point anywhere but at that copy, a value no
+    // copy has.
+    std::uint64_t h = 1469598103934665603ull;
+    const RingCbNote& n = t_ring_cb[stage & 1];
+    std::uint64_t* const ring_base = t_run_digest.ring_base[stage & 1];
+    std::uint64_t* const ring_bytes = t_run_digest.ring_bytes[stage & 1];
+    std::fill(ring_base, ring_base + 16, 0);
+    std::fill(ring_bytes, ring_bytes + 16, 0);
+    for (std::uint32_t left = n.slots; left; left &= left - 1) {
+        const int k = __builtin_ctz(left);
+        const std::uint64_t what[2] = {q.cb_bias_dw[k] == n.at_dw[k] ? n.base[k] : ~0ull, n.bytes[k]};
+        h = fnv1a(what, sizeof(what), h);
+        ring_base[k] = what[0];
+        ring_bytes[k] = n.bytes[k];
+        q.cb_bias_dw[k] = 0;
+    }
+    t_run_digest.pm[stage & 1] = q;  // for the log of a draw whose params differ
+    return fnv1a(&q, sizeof(q), h);
+}
+
+// BBHOST_RUN_COMMIT=compare: which fields of two params blocks, as their
+// digests hashed them (run_digest_params), differ - each with both values (the
+// part's/the commit in order's), up to `most` fields.
+std::string run_params_fields_differing(const RunDigest& a, const RunDigest& b, int st, int most) {
+    const gcn::StageParams& x = a.pm[st];
+    const gcn::StageParams& y = b.pm[st];
+    std::string out;
+    int n = 0;
+    const auto add = [&](const char* field, int k, std::uint64_t u, std::uint64_t v) {
+        if (u == v || n >= most) {
+            n += u != v;
+            return;
+        }
+        ++n;
+        char t[128];
+        if (k >= 0) std::snprintf(t, sizeof(t), " %s[%d] %llx/%llx", field, k, static_cast<unsigned long long>(u), static_cast<unsigned long long>(v));
+        else std::snprintf(t, sizeof(t), " %s %llx/%llx", field, static_cast<unsigned long long>(u), static_cast<unsigned long long>(v));
+        out += t;
+    };
+    add("l1_table", -1, x.l1_table, y.l1_table);
+    add("lds_address", -1, x.lds_address, y.lds_address);
+    for (int k = 0; k < 16; ++k) add("user_sgpr", k, x.user_sgpr[k], y.user_sgpr[k]);
+    add("cb_valid", -1, x.cb_valid, y.cb_valid);
+    add("lds_bytes", -1, x.lds_bytes, y.lds_bytes);
+    add("gds_base", -1, x.gds_base, y.gds_base);
+    add("pad", -1, x.pad, y.pad);
+    for (int k = 0; k < 16; ++k) add("cb_bias_dw", k, x.cb_bias_dw[k], y.cb_bias_dw[k]);
+    for (int k = 0; k < 16; ++k) {
+        add("ring_cb_base", k, a.ring_base[st][k], b.ring_base[st][k]);
+        // Two sources in the GX ring (each commit's own place): their bytes.
+        const std::uint64_t lo = g_gx_ring.base, hi = g_gx_ring.base + g_gx_ring.size, u = a.ring_base[st][k], v = b.ring_base[st][k];
+        const std::uint64_t len = std::min(a.ring_bytes[st][k], b.ring_bytes[st][k]);
+        if (u != v && n <= most && lo && u >= lo && u < hi && v >= lo && v < hi && len && u + len <= hi && v + len <= hi) {
+            const auto* pu = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(u));
+            const auto* pv = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(v));
+            std::uint64_t at = 0;
+            while (at < len && pu[at] == pv[at]) ++at;
+            char t[96];
+            if (at == len) std::snprintf(t, sizeof(t), " (both in the GX ring, %llu bytes the same)", static_cast<unsigned long long>(len));
+            else std::snprintf(t, sizeof(t), " (both in the GX ring, bytes differ from +%llu of %llu)", static_cast<unsigned long long>(at), static_cast<unsigned long long>(len));
+            out += t;
+        }
+    }
+    for (int k = 0; k < 16; ++k) add("cb_stride", k, x.cb_stride[k], y.cb_stride[k]);
+    for (int k = 0; k < 16; ++k) add("cb_w3", k, x.cb_w3[k], y.cb_w3[k]);
+    for (int k = 0; k < 16; ++k) add("vertex_formats", k, x.vertex_formats[k], y.vertex_formats[k]);
+    for (int k = 0; k < 4; ++k) {
+        std::uint32_t u, v;
+        std::memcpy(&u, &x.patch_cull_w[k], 4);
+        std::memcpy(&v, &y.patch_cull_w[k], 4);
+        add("patch_cull_w", k, u, v);
+    }
+    add("patch_stride", -1, x.patch_stride, y.patch_stride);
+    add("patch_base", -1, x.patch_base, y.patch_base);
+    {
+        std::uint32_t u, v;
+        std::memcpy(&u, &x.patch_cull_near, 4);
+        std::memcpy(&v, &y.patch_cull_near, 4);
+        add("patch_cull_near", -1, u, v);
+    }
+    add("patch_pad", -1, x.patch_pad, y.patch_pad);
+    for (int k = 0; k < 16; ++k) add("image_index", k, x.image_index[k], y.image_index[k]);
+    for (int k = 0; k < 16; ++k) add("sampler_index", k, x.sampler_index[k], y.sampler_index[k]);
+    if (n > most) out += " (" + std::to_string(n - most) + " more)";
+    return out;
 }
 
 // BBHOST_RUN_COMMIT: a run part's draw against the owed view clears, read
@@ -19502,6 +20943,7 @@ void run_targets_part(const GpuDrawInputs& in, DrawState& s) {
 // At the join: the run's targets written by its last draw, as each of its
 // draws' lookups would have noted them (rt_written).
 void run_targets_written_locked() {
+    const copy_census::Quiet census_quiet;  // the draws said what they wrote (census_draw_locked)
     const RunTargets& m = t_run_targets;
     for (RtImage* rt : m.color) {
         if (rt) rt_written(*rt);
@@ -19669,7 +21111,12 @@ static bool draw_impl(const GpuDraw& d) {
     timer.next(kPhaseDraw);
     RecordedState& rs = part ? t_part_recorded : g_recorded;  // what the recording has bound
     const bool digest = list_resolve::commit_compare();  // BBHOST_RUN_COMMIT=compare: what it resolved (RunDigest)
-    if (digest) t_run_digest = RunDigest{};
+    if (digest) {
+        t_run_digest = RunDigest{};
+        t_ring_cb[0] = t_ring_cb[1] = RingCbNote{};
+        t_run_digest.part_first = part && rs.pipeline == VK_NULL_HANDLE;  // for the log: its part bound nothing yet
+        t_run_digest.flip = hle_video_flip_count();
+    }
     // BBHOST_RUN_BATCH: how many times the GPU mutex has been taken, this take
     // included - the draw before in the run took it last when this is one more
     // (run_targets) - and, switched on (not compare), this draw's number for the
@@ -19711,8 +21158,9 @@ static bool draw_impl(const GpuDraw& d) {
     } call_seq(d.gx_objects ? d.gx_objects->call_seq : 0);
     // What the pipeline workers finished, before the draw; a run part's draw
     // leaves it to the command processor's next (BBHOST_RUN_COMMIT), and its
-    // fork had no particle arguments to make.
-    if (!part) {
+    // fork had no particle arguments to make. So does compare mode's commit in
+    // order of a run's draw at the join (t_compare_recommit).
+    if (!part && !t_compare_recommit) {
         apply_table_masks_locked();
         apply_lean_builds_locked();
         apply_relinks_locked();
@@ -19847,14 +21295,22 @@ static bool draw_impl(const GpuDraw& d) {
     if (!rebuild_page_tables()) return false;
     // Render targets (draw_targets; BBHOST_RUN_BATCH: run_targets; a run part's
     // draw: the run's first draw's, run_targets_part).
-    if (part) {
-        run_targets_part(in, s);
-        if (run->stop >= 0) return false;
-    } else if (list_resolve::batching()) {
-        run_targets(d, in, s, mu_taken);
-    } else {
-        DrawTargetsOut targets;
-        draw_targets(d, in, s, targets);
+    {
+        const copy_census::Quiet census_quiet;  // the lookups' write stamps: census_draw_locked says what the draw writes
+        t_elide_lookup = !part;  // an attachment bound ends the pending copies it is part of (BBHOST_COPY_ELIDE)
+        t_elide_bound_n = t_elide_redirected_n = t_elide_mutant_draw = 0;  // phase 2: this draw's notes (copy_elide_decide_locked)
+        struct LookupEnd {
+            ~LookupEnd() { t_elide_lookup = false; }
+        } lookup_end;
+        if (part) {
+            run_targets_part(in, s);
+            if (run->stop >= 0) return false;
+        } else if (list_resolve::batching()) {
+            run_targets(d, in, s, mu_taken);
+        } else {
+            DrawTargetsOut targets;
+            draw_targets(d, in, s, targets);
+        }
     }
     s.su_sc_mode = in.su_sc_mode;
     s.clip_cntl = in.clip_cntl;
@@ -20350,6 +21806,23 @@ static bool draw_impl(const GpuDraw& d) {
         t_resolve_site = kSiteBuffers;
     }
     if (part && run->stop >= 0) return false;  // its images stopped it (BBHOST_RUN_COMMIT)
+    // Copy elision's phase 2: the attachments its lookup noted decided now, in order (a run part notes none). A copy
+    // made whose source one of its images was bound to: the images resolved again.
+    t_elide_drawn = false;
+    struct ElideUndoGuard {
+        ~ElideUndoGuard() {
+            if (t_elide_undo_n) copy_elide_undo_locked();
+        }
+    } elide_undo_guard;
+    if (t_elide_bound_n && !part &&
+        copy_elide_decide_locked(s, d, pl, use_vertex_input ? &vertex_input : nullptr, stage_images)) {
+        t_resolve_site = kSitePrefetch;
+        prefetch_stage_images(pl.vs.meta(), s.vs_user, stage_images[0], gx_stage[0], pl.paths_match[0] ? &key_stages[0] : nullptr);
+        prefetch_stage_images(pl.ps.meta(), s.ps_user, stage_images[1], gx_stage[1], pl.paths_match[1] ? &key_stages[1] : nullptr);
+        t_resolve_site = kSiteBuffers;
+    }
+    // Phase 2 B1: an exact point copy left undrawn, a pending copy in its place (in order only).
+    if (!part && g_elide_draws && copy_elide_point_copy_locked(s, d, pl, use_vertex_input ? &vertex_input : nullptr, stage_images)) return true;
     draw_stamp.to(kRenderCostPrefetch);
     // BBHOST_CAPTURE_DRAW (draw_capture.h): run everything recorded so far
     // before this draw's sets exist, so memory and images hold its inputs.
@@ -20358,10 +21831,21 @@ static bool draw_impl(const GpuDraw& d) {
     // Lavapipe only (host/lvp_split.h): after a depth-only pipeline, a draw
     // whose colour slots differ where lavapipe would draw them all with slot
     // 0's blend state starts a command buffer of its own, what was recorded
-    // before it submitted (not waited for).
-    if (lvp_blend_split(s)) {
-        submit_locked();
-        g_lvp_splits.fetch_add(1, std::memory_order_relaxed);
+    // before it submitted (not waited for). A run part's draw that would mark
+    // the command buffer or split it stops first (BBHOST_RUN_COMMIT), and the
+    // command processor commits it and the run's later draws in order: the
+    // submit is the GPU mutex holder's to make. Made in a part, on a run worker
+    // beside the command processor's own part, it appended to the command
+    // stream and moved the slots from two threads at once - a replayed kBegin
+    // whose command buffer was garbage, blocks changed after their publish.
+    if (const LvpBlend lvp = lvp_blend_split(s); lvp != kLvpNone) {
+        if (run_part_stop(kRunStopOrder)) return false;
+        if (lvp == kLvpMark) {
+            g_lvp_depth_only_serial = g.record_serial;
+        } else {
+            submit_locked();
+            g_lvp_splits.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     // BBHOST_WATCH_PS_IMAGE=<pipeline prefix>:<image index>: for every draw of
     // that pipeline, resolve the image's T# and hash the memory behind it, and
@@ -21195,8 +22679,10 @@ static bool draw_impl(const GpuDraw& d) {
         }
         std::uint64_t gate_bases[16] = {};
         const bool gate = st == 0 && pl.gs_as_vs && pl.gs_gate.vertices && meta.buffers.size() <= 16;
+        if (digest) t_ring_cb_stage = st;  // (BBHOST_RUN_COMMIT=compare: the whole-ring bindings' stage)
         resolve_stage_buffers(meta, params.user_sgpr, params, buffer_infos, gx_stage[st], cb_exact_bindings(), nullptr,
                               gate ? gate_bases : nullptr);
+        if (digest) t_ring_cb_stage = -1;
         if (gate) particle_vertices = particle_gate_vertices_locked(pl, meta, gate_bases);
         if (!meta.buffers.empty()) {
             any_buffers = true;
@@ -22049,7 +23535,7 @@ static bool draw_impl(const GpuDraw& d) {
     if (part) {
         // The run's pass is open - its first draw began it - and a draw into
         // its targets with no hazard begins none (BBHOST_RUN_COMMIT).
-        if (!g_pass.active || g_pass.key != pass_key(s) || feedback_census_on()) {
+        if (!g_pass.active || g_pass.key != pass_key(s) || feedback_census_on() || copy_census::on()) {
             run_part_stop(kRunStopOrder);
             return false;
         }
@@ -22057,6 +23543,7 @@ static bool draw_impl(const GpuDraw& d) {
         g_pass_profile_name = &bind_pl->profile_name;
         begin_pass(s, pass_key(s), sample_hazard);
         if (feedback_census_on()) note_feedback_loops(s, stage_images, 2, bind_pl->name);
+        if (copy_census::on()) census_draw_locked(s, stage_images, pl.name, *bind_pl, d, use_vertex_input ? &vertex_input : nullptr);
     }
     draw_stamp.to(kRenderCostPass);
     // Drivers finalise a pipeline's ISA on first use, so a pathological
@@ -22288,6 +23775,7 @@ static bool draw_impl(const GpuDraw& d) {
         rs.viewport_set = true;
     }
     VkRect2D sc = s.scissor;
+    if (t_elide_mutant_draw == 2 && sc.extent.height > 1) --sc.extent.height;  // BBHOST_COPY_ELIDE_MUTANT=2: a proven draw a row short
     sc.extent.width = std::min<std::uint32_t>(sc.extent.width, g_pass.extent.width > static_cast<std::uint32_t>(sc.offset.x) ? g_pass.extent.width - sc.offset.x : 0);
     sc.extent.height = std::min<std::uint32_t>(sc.extent.height, g_pass.extent.height > static_cast<std::uint32_t>(sc.offset.y) ? g_pass.extent.height - sc.offset.y : 0);
     if (!sc.extent.width || !sc.extent.height) {
@@ -22486,6 +23974,7 @@ static bool draw_impl(const GpuDraw& d) {
         glitch_draw_locked(call);
         occlusion_draw_locked(call);
         if (digest) run_digest_call(call);
+        t_elide_drawn = true;
         cmds.draw(call);
         g_gs_vs_draws.fetch_add(1, std::memory_order_relaxed);
         g_gs_vs_vertices.fetch_add(static_cast<std::uint64_t>(particle_capacity) * particle_vertices, std::memory_order_relaxed);
@@ -22518,6 +24007,7 @@ static bool draw_impl(const GpuDraw& d) {
         glitch_draw_locked(call);
         occlusion_draw_locked(call);
         if (digest) run_digest_call(call);
+        t_elide_drawn = true;
         cmds.draw(call);
     } else if (d.index_va) {
         DrawCall call;
@@ -22525,9 +24015,11 @@ static bool draw_impl(const GpuDraw& d) {
         call.count = d.index_count;
         call.instances = d.instance_count;
         call.vertex_offset = vtx_off;
+        if (t_elide_mutant_draw == 3 && call.count == 6) call.count = 3;  // BBHOST_COPY_ELIDE_MUTANT=3: a proven draw's first triangle
         glitch_draw_locked(call);
         occlusion_draw_locked(call);
         if (digest) run_digest_call(call);
+        t_elide_drawn = true;
         cmds.draw(call);
     } else {
         DrawCall call;
@@ -22535,9 +24027,11 @@ static bool draw_impl(const GpuDraw& d) {
         call.count = d.index_count;
         call.instances = d.instance_count;
         call.vertex_offset = vtx_off;
+        if (t_elide_mutant_draw == 3 && (call.count == 4 || call.count == 6)) call.count = 3;  // BBHOST_COPY_ELIDE_MUTANT=3: a proven draw's first triangle
         glitch_draw_locked(call);
         occlusion_draw_locked(call);
         if (digest) run_digest_call(call);
+        t_elide_drawn = true;
         cmds.draw(call);
     }
     if (!g.profile_passes) profile_end_locked();
@@ -22545,7 +24039,8 @@ static bool draw_impl(const GpuDraw& d) {
         // BBHOST_RUN_COMMIT=compare: the rest of what it resolved.
         RunDigest& dg = t_run_digest;
         dg.done = true;
-        dg.pipeline = bind_vk;
+        dg.pipeline = key;  // the pipeline's identity: its fallback, lean variant or relink alike
+        std::snprintf(dg.name, sizeof(dg.name), "%s", bind_pl->name.c_str());
         dg.sets[0] = sets[0];
         dg.sets[1] = sets[1];
         dg.vp = vp;
@@ -22568,7 +24063,7 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
         for (int st = 0; st < 2; ++st) {
-            dg.params[st] = run_digest_params(stage_params[st]);
+            dg.params[st] = run_digest_params(stage_params[st], st);
             std::memcpy(dg.user[st], stage_params[st].user_sgpr, sizeof(dg.user[st]));
         }
     }
@@ -23052,6 +24547,10 @@ void run_compare_join_locked(RunJob& j, std::uint32_t& failed) {
     // them is that it changes nothing they are answered.
     bool redone = false;
     run_forget_recorded_locked();
+    struct Recommit {  // (t_compare_recommit)
+        Recommit() { t_compare_recommit = true; }
+        ~Recommit() { t_compare_recommit = false; }
+    } recommit;
     for (int k = 0; k < j.parts; ++k) {
         for (std::uint32_t i = j.lo[k]; i < j.lo[k + 1]; ++i) {
             if (i == j.stopped[k] && !((kRunLocalStops >> j.rd[i].stop) & 1)) redone = true;
@@ -23094,7 +24593,7 @@ void run_compare_join_locked(RunJob& j, std::uint32_t& failed) {
                 g_run_field_diff[f].fetch_add(1, std::memory_order_relaxed);
                 which += std::string(which.empty() ? "" : ", ") + kRunFieldName[f];
             }
-            if (any && g_run_differed.fetch_add(1, std::memory_order_relaxed) < 16) {
+            if (any && g_run_differed.fetch_add(1, std::memory_order_relaxed) < 64) {  // the first 64 logged
                 host_log("render: run commit compare: draw %u of a run of %u (part %d) differs from its commit in order: %s", i, j.n, k,
                          which.c_str());
                 if (diff[kCmpBuffers]) {
@@ -23124,6 +24623,18 @@ void run_compare_join_locked(RunJob& j, std::uint32_t& failed) {
                     host_log("render:   its user data differing (part/in order):%s%s; the GX ring at 0x%llx, %llu bytes",
                              u.empty() ? " none (another field of its params)" : "", u.c_str(), static_cast<unsigned long long>(g_gx_ring.base),
                              static_cast<unsigned long long>(g_gx_ring.size));
+                    // The fields that differ as the digest hashed them (GX-ring
+                    // pointer pairs and ring-bound biases cleared), and what
+                    // names the draw.
+                    const std::uint64_t w = world_first_flip();
+                    for (int st = 0; st < 2; ++st) {
+                        if (a.params[st] == b.params[st]) continue;
+                        host_log("render:   its %s params differing as hashed (part/in order):%s", st ? "PS" : "VS",
+                                 run_params_fields_differing(a, b, st, 12).c_str());
+                    }
+                    host_log("render:   part %d of %d, %s; flip %llu, %lld from the world's first frame; pipeline %s (in order: %s)", k, j.parts,
+                             a.part_first ? "its part's first draw" : "not its part's first draw", static_cast<unsigned long long>(a.flip),
+                             w ? static_cast<long long>(a.flip) - static_cast<long long>(w) : -1LL, a.name, b.name);
                 }
             }
         }
@@ -23147,14 +24658,7 @@ void run_report() {
         if (const std::uint64_t v = g_run_refused[k].load(std::memory_order_relaxed))
             refused += std::string(refused.empty() ? "" : ", ") + kRunRefusalName[k] + " " + std::to_string(v);
     }
-    if (list_resolve::commit_compare()) {
-        std::string fields;
-        for (int f = 0; f < kCmpFields; ++f) {
-            fields += std::string(f ? ", " : "") + kRunFieldName[f] + " " + std::to_string(g_run_field_diff[f].load());
-        }
-        host_log("render: run commit compare: %llu draws committed in parts compared with their commits in order, %llu differed (%s)",
-                 static_cast<unsigned long long>(g_run_compared.load()), static_cast<unsigned long long>(g_run_differed.load()), fields.c_str());
-    }
+    if (list_resolve::commit_compare()) ::run_compare_log();
     host_log("render: run commit: fallback variants bound in parts: no buffers %llu, not all bound %llu, no variant yet %llu, failed or "
              "not fitting %llu",
              static_cast<unsigned long long>(g_run_fallback[0].load()), static_cast<unsigned long long>(g_run_fallback[1].load()),
@@ -23173,6 +24677,17 @@ void run_report() {
 }
 
 }  // namespace
+
+// BBHOST_RUN_COMMIT=compare's totals: every 1,000 flips with tooling (run_report), and at the exit (render_report) - a
+// slow device's run (lavapipe) never reaches the 1,000th flip.
+static void run_compare_log() {
+    std::string fields;
+    for (int f = 0; f < kCmpFields; ++f) {
+        fields += std::string(f ? ", " : "") + kRunFieldName[f] + " " + std::to_string(g_run_field_diff[f].load());
+    }
+    host_log("render: run commit compare: %llu draws committed in parts compared with their commits in order, %llu differed (%s)",
+             static_cast<unsigned long long>(g_run_compared.load()), static_cast<unsigned long long>(g_run_differed.load()), fields.c_str());
+}
 
 int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uint32_t n, std::uint32_t& failed) {
     failed = 0;
@@ -24474,6 +25989,7 @@ namespace {
 // Records the copy of r into a new host-visible staging buffer; the caller
 // flushes once for all of them and takes the bytes (take_target_pixels).
 bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
+    if (copy_elide_live()) copy_elide_touch_locked(r.base, copy_elide::kReadOther);  // read as it is (BBHOST_COPY_ELIDE)
     if (r.view_clear) view_clear_apply_locked(r, kVcwReadback);
     const bool depth = r.depth;
     if (depth && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D32_SFLOAT_S8_UINT) return false;
@@ -24497,6 +26013,7 @@ bool record_target_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
 // The stencil plane of a depth target with one, layer 0 (F12 with BBHOST_F12_DEPTH).
 bool record_stencil_readback(RtImage& r, DevBuffer& staging, TargetPixels& out) {
     if (!r.depth || r.format == VK_FORMAT_D32_SFLOAT || r.format == VK_FORMAT_D16_UNORM) return false;
+    if (copy_elide_live()) copy_elide_touch_locked(r.base, copy_elide::kReadOther);
     if (r.view_clear) view_clear_apply_locked(r, kVcwReadback);
     out.width = r.width;
     out.height = r.height;
@@ -24679,11 +26196,17 @@ void precompile_set_loading(bool loading) {
     g_loading_now.store(loading);
     precompile_boost_update(loading ? "a loading screen" : "the loading screen gone");
 }
+namespace {
+std::atomic<std::uint64_t> g_world_first_flip{0};  // world_first_flip()
+}  // namespace
 void precompile_set_world_reached() {
+    std::uint64_t none = 0;
+    g_world_first_flip.compare_exchange_strong(none, hle_video_flip_count());
     g_world_seen.store(true);
     precompile_boost_update("the first in-game frame");
 }
 bool world_reached() { return g_world_seen.load(std::memory_order_relaxed); }
+std::uint64_t world_first_flip() { return g_world_first_flip.load(std::memory_order_relaxed); }
 
 std::size_t precompile_backlog() {
     Precompiler* w = g_precompiler.load();

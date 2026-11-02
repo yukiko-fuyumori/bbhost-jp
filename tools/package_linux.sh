@@ -27,7 +27,7 @@ if [ -n "$(git -c core.excludesFile=/dev/null status --porcelain --untracked-fil
     rev="$rev+"
 fi
 profile=$(cat "$(dirname "$bin")/bbhost-edition.txt")
-case "$profile" in jp-only|eu-personal) ;; *) echo "invalid edition profile" >&2; exit 1;; esac
+case "$profile" in jp-only) ;; *) echo "invalid edition profile" >&2; exit 1;; esac
 name=bbhost-linux-$profile-$rev
 dir=$out/$name
 rm -rf "$dir"
@@ -39,11 +39,7 @@ tools/package_plugins.sh "$(dirname "$bin")/plugins" "$dir/plugins"
 objcopy --strip-debug "$bin" "$dir/bbhost" 2>/dev/null || llvm-objcopy --strip-debug "$bin" "$dir/bbhost"
 chmod +x "$dir/bbhost"
 cp "$bin" "$out/$name.debug"
-if [ "$profile" = eu-personal ]; then
-    sed -e 's/CUSA03014/CUSA03173/g' -e 's/日本版 Old Hunters/欧州 GOTY（個人用）/g' bbhost.example.toml > "$dir/bbhost.example.toml"
-else
-    cp bbhost.example.toml "$dir/bbhost.example.toml"
-fi
+cp bbhost.example.toml "$dir/bbhost.example.toml"
 # The HLSL path's compiler beside the binary, where bbhost looks first.
 tools/fetch_dxc.sh linux "$dir"
 dxc_tag=$(cat third_party/dxc/VERSION)

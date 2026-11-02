@@ -1,3 +1,2 @@
 #pragma once
-#cmakedefine01 BBHOST_PERSONAL_EU
 #define BBHOST_EDITION_PROFILE "@BBHOST_EDITION_PROFILE@"

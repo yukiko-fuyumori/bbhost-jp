@@ -1,14 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
-project(bbhost LANGUAGES C CXX)
+project(bbhost VERSION 0.2.23 LANGUAGES C CXX)
 
-option(BBHOST_PERSONAL_EU "Build the separate personal EU GOTY Linux edition" OFF)
-if(BBHOST_PERSONAL_EU AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  message(FATAL_ERROR "The personal EU edition is only available for Linux.")
-endif()
 set(BBHOST_EDITION_PROFILE "jp-only")
-if(BBHOST_PERSONAL_EU)
-  set(BBHOST_EDITION_PROFILE "eu-personal")
-endif()
 configure_file(cmake/bbhost_edition.h.in gen/bbhost_edition.h)
 file(WRITE ${CMAKE_BINARY_DIR}/bbhost-edition.txt "${BBHOST_EDITION_PROFILE}\n")
 message(STATUS "bbhost: game edition profile ${BBHOST_EDITION_PROFILE}")
@@ -20,6 +13,35 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(WIN32 AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   message(FATAL_ERROR
     "bbhost must be built with Clang on Windows so guest SysV functions can be implemented with __attribute__((sysv_abi)).")
+endif()
+
+# BBHOST_LTO=ON: ThinLTO across every target. The command processor's draw
+# path crosses files at every step (render.cpp into buffer_shadow.cpp and
+# gpu.cpp - the shadow's lookups, locate, the twins' and copy versions'
+# checks), and calls it cannot inline otherwise: Kyo's Central Yharnam save on
+# the Radeon 8060S, CP-bound, went from ~137 to ~143-144 fps; on an RTX 4070
+# with two Xeon Gold 6230, 1080p, Old Yharnam +3.7% and the Cainhurst
+# courtyard +3.1%. Off by default; the release packages are built with it
+# (.github/workflows/release.yml).
+option(BBHOST_LTO "build with ThinLTO (-flto=thin)" OFF)
+if(BBHOST_LTO)
+  add_compile_options(-flto=thin)
+  add_link_options(-flto=thin)
+endif()
+
+# BBHOST_PGO=generate: an instrumented build, whose run writes a profile at its
+# exit (LLVM_PROFILE_FILE names it; main.cpp writes it before the process ends,
+# which skips the runtime's own exit handler). BBHOST_PGO=<file.profdata>: a
+# build optimized by such a profile (llvm-profdata merge -o file.profdata
+# *.profraw). Clang's IR profiles; MSYS2 needs mingw-w64-ucrt-x86_64-compiler-rt.
+set(BBHOST_PGO "" CACHE STRING "profile-guided optimization: generate, or the .profdata file to use")
+if(BBHOST_PGO STREQUAL "generate")
+  add_compile_options(-fprofile-generate)
+  add_link_options(-fprofile-generate)
+  add_compile_definitions(BBHOST_PGO_GENERATE=1)
+elseif(BBHOST_PGO)
+  add_compile_options(-fprofile-use=${BBHOST_PGO} -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+  add_link_options(-fprofile-use=${BBHOST_PGO})
 endif()
 
 # LibAtrac9 (MIT, https://github.com/Thealexbarney/LibAtrac9): ATRAC9 decoding for sceAjm.
@@ -109,6 +131,8 @@ add_executable(bbhost
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
+  src/engine/menu_close.cpp
+  src/engine/matching_region.cpp
   src/engine/key_prompts.cpp
   src/engine/yebis.cpp
   src/engine/yebis_bind.cpp
@@ -169,6 +193,7 @@ add_executable(bbhost
   src/hle/gnm.cpp
   src/hle/gnm_exec.cpp
   src/host/host_lists.cpp
+  src/host/list_resolve.cpp
   src/host/cb_proof.cpp
   src/host/gxvk_census.cpp
   src/host/gxvk_buffers.cpp
@@ -202,7 +227,7 @@ target_link_libraries(bbhost PRIVATE ZLIB::ZLIB)
 # rewritten by every build only when it changes): a crash report from a
 # machine names the build to symbolize it against.
 add_custom_target(bbhost_version
-  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/gen/bbhost_version.h
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DRELEASE_VERSION=${PROJECT_VERSION} -DOUT=${CMAKE_BINARY_DIR}/gen/bbhost_version.h
           -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
   BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/bbhost_version.h)
 add_dependencies(bbhost bbhost_version)
@@ -244,13 +269,14 @@ function(bb_plugin name)
   endif()
 endfunction()
 add_library(bb_plugin_region_switch MODULE plugins/region_switch/region_switch.c)
-target_compile_definitions(bb_plugin_region_switch PRIVATE BBHOST_PERSONAL_EU=$<BOOL:${BBHOST_PERSONAL_EU}>)
 set_target_properties(bb_plugin_region_switch PROPERTIES OUTPUT_NAME region_switch PREFIX ""
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins)
 
 bb_plugin(randomizer plugins/randomizer/randomizer.cpp)
 bb_plugin(boss_rush plugins/boss_rush/boss_rush.cpp)
 bb_plugin(mutators plugins/mutators/mutators.cpp)
+bb_plugin(quake plugins/quake/quake.cpp)
+bb_plugin(lohit plugins/lohit/lohit.cpp)
 # The Debug Menu plugin carries its glyphs (plugins/debug_menu/font14.bin,
 # tools/make_debug_font.py) as bytes: build/gen/debug_font14.inc, rewritten
 # only when the file changes.
@@ -283,6 +309,10 @@ elseif(WIN32)
   # The image must stay out of the guest's fixed windows (4-10 GiB CPU dmem,
   # 0xff00000000 GPU alias): a fixed base above them, no ASLR.
   target_link_options(bbhost PRIVATE -Wl,--image-base=0x600000000 -Wl,--disable-dynamicbase)
+  # A GUI program: Windows opens no console for it. The log takes a file, a
+  # pipe or the terminal it was started with, or a console it makes when
+  # Tooling and logging is on (main.cpp, log_console); off, there is no window.
+  target_link_options(bbhost PRIVATE -Wl,--subsystem,windows)
 endif()
 
 find_package(CURL QUIET)
@@ -313,6 +343,7 @@ if(Vulkan_FOUND)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
   target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+                                src/host/copy_census.cpp src/host/copy_compare.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # The SPIR-V validator: the HLSL path validates the modules DXC compiled
@@ -369,13 +400,37 @@ if(SDL3_FOUND AND Vulkan_FOUND)
   target_include_directories(imgui PUBLIC third_party/imgui)
   target_link_libraries(imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan)
   target_compile_options(imgui PRIVATE -w)
-  target_sources(bbhost PRIVATE src/host/launcher.cpp src/host/plugin_ui.cpp src/host/shader_compile.cpp)
+  target_sources(bbhost PRIVATE src/host/launcher.cpp src/host/launcher_ui.cpp src/host/plugin_ui.cpp src/host/shader_compile.cpp)
+  # The setup window's backgrounds (res/launcher-art/*.png: Kyo's screenshots,
+  # their light only, coloured by the palette at load; one picked each start),
+  # taken in whole by the assembler's .incbin: build/gen/launcher_art.inc,
+  # rewritten only when the folder's list changes. Too many bytes for the
+  # hex text the debug menu's font is carried as. The labels are global: under
+  # LTO the code reading them can land in another module than the asm.
+  file(GLOB BB_LAUNCHER_ART CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/res/launcher-art/*.png)
+  list(SORT BB_LAUNCHER_ART)
+  set(BB_LAUNCHER_ART_ASM "")
+  set(BB_LAUNCHER_ART_DECL "")
+  set(BB_LAUNCHER_ART_LIST "")
+  set(i 0)
+  foreach(png IN LISTS BB_LAUNCHER_ART)
+    string(APPEND BB_LAUNCHER_ART_ASM ".globl bb_launcher_art_${i}, bb_launcher_art_${i}_end\nbb_launcher_art_${i}:\n.incbin \"${png}\"\nbb_launcher_art_${i}_end:\n")
+    string(APPEND BB_LAUNCHER_ART_DECL "extern \"C\" const unsigned char bb_launcher_art_${i}[], bb_launcher_art_${i}_end[];\n")
+    string(APPEND BB_LAUNCHER_ART_LIST "    {bb_launcher_art_${i}, bb_launcher_art_${i}_end},\n")
+    math(EXPR i "${i} + 1")
+  endforeach()
+  file(WRITE ${CMAKE_BINARY_DIR}/gen/launcher_art.inc.new
+    "#ifdef _WIN32\n#define BB_ART_SECTION \".section .rdata,\\\"dr\\\"\\n\"\n#else\n#define BB_ART_SECTION \".section .rodata\\n\"\n#endif\n"
+    "asm(BB_ART_SECTION R\"asm(\n.balign 16\n${BB_LAUNCHER_ART_ASM}.text\n)asm\");\n#undef BB_ART_SECTION\n"
+    "${BB_LAUNCHER_ART_DECL}const ArtPng kArtPngs[] = {\n${BB_LAUNCHER_ART_LIST}};\n")
+  configure_file(${CMAKE_BINARY_DIR}/gen/launcher_art.inc.new ${CMAKE_BINARY_DIR}/gen/launcher_art.inc COPYONLY)
+  set_source_files_properties(src/host/launcher_ui.cpp PROPERTIES OBJECT_DEPENDS "${BB_LAUNCHER_ART}")
   target_link_libraries(bbhost PRIVATE imgui)
   set_source_files_properties(src/host/window.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/overlay.cpp src/host/present_pass.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/ingame_menu.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/buffer_shadow.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
-  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
+  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/copy_compare.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
 else()
   message(STATUS "bbhost: SDL3/Vulkan not found; headless only")
 endif()
@@ -426,6 +481,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/sfx/node_emit.cpp
   src/decomp/sync/adaptive_mutex.cpp
   src/decomp/sync/ez_work.cpp
+  src/decomp/physics/ragdoll_drive.cpp
 )
 target_sources(bbhost PRIVATE ${BBHOST_DECOMP_SOURCES})
 set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
@@ -553,6 +609,9 @@ if(UNIX)
   add_executable(uncapped_limit_test tests/uncapped_limit_test.cpp)
   target_include_directories(uncapped_limit_test PRIVATE src)
   add_test(NAME uncapped_limit_test COMMAND uncapped_limit_test)
+  add_executable(frame_clock_test tests/frame_clock_test.cpp)
+  target_include_directories(frame_clock_test PRIVATE src)
+  add_test(NAME frame_clock_test COMMAND frame_clock_test)
   add_executable(sfx_schedule_test tests/sfx_schedule_test.cpp)
   target_include_directories(sfx_schedule_test PRIVATE src)
   add_test(NAME sfx_schedule_test COMMAND sfx_schedule_test)
@@ -631,6 +690,13 @@ if(UNIX)
   add_executable(gxvk_buffers_mode_test tests/gxvk_buffers_mode_test.cpp)
   target_include_directories(gxvk_buffers_mode_test PRIVATE src)
   add_test(NAME gxvk_buffers_mode_test COMMAND gxvk_buffers_mode_test)
+  add_executable(gxvk_budget_test tests/gxvk_budget_test.cpp)
+  target_include_directories(gxvk_budget_test PRIVATE src)
+  add_test(NAME gxvk_budget_test COMMAND gxvk_budget_test)
+  # The memory policy: GX's buffers, their budget, the imports and the staging, decided once for the device.
+  add_executable(memory_policy_test tests/memory_policy_test.cpp)
+  target_include_directories(memory_policy_test PRIVATE src)
+  add_test(NAME memory_policy_test COMMAND memory_policy_test)
   # The buffer shadow's page copies grow a run only where both ends meet.
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)
@@ -655,6 +721,10 @@ if(UNIX)
   add_executable(import_fallback_test tests/import_fallback_test.cpp)
   target_include_directories(import_fallback_test PRIVATE src)
   add_test(NAME import_fallback_test COMMAND import_fallback_test)
+  # The page table's view of the window imports: a merge's windows keep the older import until the queue sees the new one.
+  add_executable(import_table_test tests/import_table_test.cpp)
+  target_include_directories(import_table_test PRIVATE src)
+  add_test(NAME import_table_test COMMAND import_table_test)
   # The image heap's placement in its blocks and its compaction's policy: the block chosen, the room kept, the pace, the stop.
   add_executable(heap_compact_test tests/heap_compact_test.cpp)
   target_include_directories(heap_compact_test PRIVATE src)
@@ -742,6 +812,7 @@ if(UNIX)
   bbhost_decomp_test(gnmx_cue)
   bbhost_decomp_test(gnmx_cue_ccb SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_clear SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(physics_ragdoll_drive SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   # The host command lists without the game (tests/host_lists_test.cpp), in shadow mode.
   add_executable(host_lists_test tests/host_lists_test.cpp src/core/portable.cpp)
   target_include_directories(host_lists_test PRIVATE src include)
@@ -757,6 +828,14 @@ if(UNIX)
   add_executable(masked_blend_test tests/masked_blend_test.cpp)
   target_include_directories(masked_blend_test PRIVATE src)
   add_test(NAME masked_blend_test COMMAND masked_blend_test)
+  # Copies left unmade (tests/copy_elide_test.cpp): the ledger against a model in which every copy is made.
+  add_executable(copy_elide_test tests/copy_elide_test.cpp)
+  target_include_directories(copy_elide_test PRIVATE src)
+  add_test(NAME copy_elide_test COMMAND copy_elide_test)
+  # Whether a draw writes every pixel of a target (tests/full_write_test.cpp): the state rules and the geometry.
+  add_executable(full_write_test tests/full_write_test.cpp)
+  target_include_directories(full_write_test PRIVATE src)
+  add_test(NAME full_write_test COMMAND full_write_test)
   # Which draws start a command buffer of their own on lavapipe (tests/lvp_split_test.cpp).
   add_executable(lvp_split_test tests/lvp_split_test.cpp)
   target_include_directories(lvp_split_test PRIVATE src)
@@ -874,10 +953,12 @@ if(UNIX)
   add_test(NAME hlsl_default_test COMMAND hlsl_default_test)
   set_tests_properties(hlsl_default_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # The PC options' generated menu assets (engine/menu_assets.cpp, which it
-  # includes) against the game's option movie and message bundles.
+  # includes) against the game's option movie and message bundles. The test
+  # supplies its own config() stub for menu_assets_ensure's empty roots.
   add_executable(menu_assets_test tests/menu_assets_test.cpp)
   target_include_directories(menu_assets_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(menu_assets_test PRIVATE ZLIB::ZLIB)
+  add_dependencies(menu_assets_test bbhost_version)
   add_test(NAME menu_assets_test COMMAND menu_assets_test)
   set_tests_properties(menu_assets_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   # The setup window's "Compile shaders now" recommendation (host/shader_compile.h).
@@ -950,7 +1031,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     # The official plugins too: the package carries them, and a CI build makes
     # nothing it is not asked for (v0.2.0's Windows zip shipped without them).
-    DEPENDS bbhost bb_plugin_region_switch bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_debug_menu
+    DEPENDS bbhost bb_plugin_region_switch bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_debug_menu bb_plugin_quake bb_plugin_lohit
     USES_TERMINAL)
 else()
   add_custom_target(smoke
@@ -973,6 +1054,12 @@ add_test(NAME game_edition_test COMMAND game_edition_test)
 add_executable(japanese_font_test tests/japanese_font_test.cpp src/host/overlay_font.cpp src/host/japanese_font.cpp)
 target_include_directories(japanese_font_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
 add_test(NAME japanese_font_test COMMAND japanese_font_test)
+if(TARGET imgui)
+  add_executable(japanese_menu_test tests/japanese_menu_test.cpp src/host/launcher_ui.cpp src/host/japanese_font.cpp)
+  target_include_directories(japanese_menu_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_link_libraries(japanese_menu_test PRIVATE imgui)
+  add_test(NAME japanese_menu_test COMMAND japanese_menu_test)
+endif()
 add_executable(jp_eu_http_test tests/jp_eu_http_test.cpp src/core/futex.cpp src/core/portable.cpp)
 target_include_directories(jp_eu_http_test PRIVATE src include ${CMAKE_BINARY_DIR}/gen)
 add_dependencies(jp_eu_http_test bbhost_version)
@@ -986,7 +1073,6 @@ add_test(NAME jp_eu_http_test COMMAND jp_eu_http_test)
 if(WIN32 OR UNIX)
   add_executable(jp_region_test tests/jp_region_test.cpp)
   target_include_directories(jp_region_test PRIVATE src include)
-  target_compile_definitions(jp_region_test PRIVATE BBHOST_PERSONAL_EU=$<BOOL:${BBHOST_PERSONAL_EU}>)
   target_link_libraries(jp_region_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(jp_region_test bb_plugin_region_switch)
   foreach(case success off wrong-title wrong-region wrong-eboot)
