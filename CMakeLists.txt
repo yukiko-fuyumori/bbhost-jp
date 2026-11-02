@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(bbhost VERSION 0.2.23 LANGUAGES C CXX)
+project(bbhost VERSION 0.2.24 LANGUAGES C CXX)
 
 set(BBHOST_EDITION_PROFILE "jp-only")
 configure_file(cmake/bbhost_edition.h.in gen/bbhost_edition.h)
@@ -148,6 +148,7 @@ add_executable(bbhost
   src/engine/menu_memory.cpp
   src/engine/frame_rate.cpp
   src/engine/frame_tick.cpp
+  src/engine/sound_wake.cpp
   src/engine/frame_pool.cpp
   src/engine/sf_heap_probe.cpp
   src/engine/debug_menu.cpp
@@ -467,6 +468,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/gx/blink.cpp
   src/decomp/gx/upload_heap.cpp
   src/decomp/gx/render_queue.cpp
+  src/decomp/gx/job_barrier.cpp
   src/decomp/gnmx/cue.cpp
   src/decomp/yebis/gnm.cpp
   src/decomp/yebis/context.cpp
@@ -482,6 +484,8 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/sync/adaptive_mutex.cpp
   src/decomp/sync/ez_work.cpp
   src/decomp/physics/ragdoll_drive.cpp
+  src/decomp/chr/replay_manipulator.cpp
+  src/decomp/chr/chr_sync.cpp
 )
 target_sources(bbhost PRIVATE ${BBHOST_DECOMP_SOURCES})
 set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
@@ -736,6 +740,18 @@ if(UNIX)
   add_executable(text_entry_test tests/text_entry_test.cpp src/host/text_entry.cpp)
   target_include_directories(text_entry_test PRIVATE src)
   add_test(NAME text_entry_test COMMAND text_entry_test)
+  # The keyboard's movement keys on the stick, frame by frame at 30, 60 and 120 fps.
+  add_executable(key_move_test tests/key_move_test.cpp src/host/bindings.cpp)
+  target_include_directories(key_move_test PRIVATE src)
+  add_test(NAME key_move_test COMMAND key_move_test)
+  # The menus' own keys: their tabs, shortcuts and switches, apart from play's.
+  add_executable(menu_keys_test tests/menu_keys_test.cpp src/host/bindings.cpp)
+  target_include_directories(menu_keys_test PRIVATE src)
+  if(SDL3_FOUND)
+    target_compile_definitions(menu_keys_test PRIVATE BBHOST_HAVE_SDL3=1)
+    target_link_libraries(menu_keys_test PRIVATE SDL3::SDL3)
+  endif()
+  add_test(NAME menu_keys_test COMMAND menu_keys_test)
   # The settings' publication and two of its listeners: applied on a change,
   # never asked for per frame (host/settings_store.h).
   add_executable(settings_store_test tests/settings_store_test.cpp src/host/shader_patch.cpp)
@@ -805,6 +821,7 @@ if(UNIX)
   bbhost_decomp_test(gx_water_gate)
   bbhost_decomp_test(gx_blink)
   bbhost_decomp_test(gx_render_queue SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(gx_job_barrier)
   bbhost_decomp_test(yebis_gnm SOURCES src/decomp/gx/draw.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_context SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_ppfx)
@@ -813,6 +830,8 @@ if(UNIX)
   bbhost_decomp_test(gnmx_cue_ccb SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_clear SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(physics_ragdoll_drive SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(chr_replay_manipulator)
+  bbhost_decomp_test(chr_sync)
   # The host command lists without the game (tests/host_lists_test.cpp), in shadow mode.
   add_executable(host_lists_test tests/host_lists_test.cpp src/core/portable.cpp)
   target_include_directories(host_lists_test PRIVATE src include)

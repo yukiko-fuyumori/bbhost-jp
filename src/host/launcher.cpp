@@ -300,6 +300,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool performance_mode = host_opt_get("performance_mode");
     bool debug_camera = host_opt_get("debug_camera");
     int frame_cap = host_opt_frame_cap();
+    // The Native frame clock (experimental, off): F10's DISPLAY row, read as the
+    // game starts (engine/frame_rate.cpp; BBHOST_FRAME_CLOCK=0|1 wins).
+    bool frame_clock = host_opt_get("frame_clock");
     int resolution = host_opt_resolution_index();
     // In the setting's order (host/options.cpp): by size within each shape.
     static const char* const kResolutions[] = {"640x360",           "960x540",           "1280x720",          "1440x810",
@@ -493,6 +496,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("performance_mode", performance_mode);
         host_opt_set("debug_camera", debug_camera);
         host_opt_set_frame_cap(kCaps[cap_choice]);
+        host_opt_set("frame_clock", frame_clock);
         host_opt_set_index("camera_tuning", camera_tuning);
         host_opt_set_index("shaders", shaders);
         host_opt_set_resolution_index(resolution);
@@ -837,7 +841,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 
             // The display, and online at a glance, side by side.
             const float row_lw = std::min(104 * scale, (w - gap) * 0.19f);  // a third of the card at most
-            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), card_h(5)), "画面");
+            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), card_h(6)), "画面");
             {
                 ui::row_label("画面モード", row_lw);
                 static const char* const kModes[] = {"Windowed", "Fullscreen"};
@@ -848,6 +852,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ui::combo("##cap", &cap_choice, kCapLabels, kCapCount, kCapTips);
                 ui::tooltip_for_item("フレームレート",
                                      "ゲームの動作速度です。「画面に合わせる」は起動時の画面更新頻度が上限です（180 Hz なら 180 fps）。");
+                ui::toggle_row("実フレーム時間で動作（試験的）", nullptr, &frame_clock,
+                               "再起動が必要です。設定したフレームレートを維持できない場合も、実際のフレーム時間に合わせてゲームを動かします。");
                 ui::row_label("解像度", row_lw);
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 ui::combo("##res", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
@@ -859,7 +865,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             }
             ui::card_end();
             ImGui::SameLine(0, gap);
-            ui::card_begin("##online", ImVec2(0, card_h(5)), "オンライン");
+            ui::card_begin("##online", ImVec2(0, card_h(6)), "オンライン");
             {
                 ui::row_label("サーバー", 72 * scale);
                 static const char* const kShort[] = {"本番", "テスト", "カスタム"};

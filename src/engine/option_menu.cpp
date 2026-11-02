@@ -953,7 +953,7 @@ void to_utf16(char16_t (&out)[N], const char* s) {
 // The page names, as the tabs read. Plain ASCII: the line help and values
 // are drawn as HTML text, where an ampersand is not a character.
 const char* const kKeyPageNames[kBindPages] = {"移動", "戦闘", "アイテムとジェスチャー", "カメラとメニュー",
-                                               "その他"};
+                                               "メニューのページと操作", "その他"};
 
 // The actions listed: the Debug Menu key only when the menu is there (the
 // Debug Menu plugin, engine/debug_menu.h); it is the last.

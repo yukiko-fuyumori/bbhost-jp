@@ -5,6 +5,7 @@
 #include "engine/uncapped_limit.h"
 #include "engine/frame_tick.h"
 #include "engine/sfx_schedule.h"
+#include "engine/sound_wake.h"
 #include "engine/wind_pace.h"
 #include "decomp/decomp.h"
 #include "decomp/sfx/step_gate.h"
@@ -322,12 +323,14 @@ enum class Handover : std::uint8_t {
     Game,    // the game's value is right at every rate
     Decomp,  // its reader is a decomp of ours that converts it every frame
     Load,    // its one load reads a slot of ours instead (kClockLoads)
+    Wake,    // its thread is woken by the frame instead (engine/sound_wake.h)
 };
 struct HandedOver {
     std::uint32_t at;
     Handover how;
     const char* env;               // =0: the start-time value, as with the clock off
     const char* decomp = nullptr;  // Decomp: the decomp, by its name on the list
+    bool by_default = false;       // handed back with the clock off too (its decomp is on by default)
 };
 constexpr HandedOver kHandedOver[] = {
     // A physics world's expected shortest step (sub_a3fad0's cinfo, +0x70,
@@ -356,6 +359,17 @@ constexpr HandedOver kHandedOver[] = {
     // slot instead (kClockLoads, Rate). What reads s is not known yet: a camera
     // turn at 144 blurs the same with 144 or 60 there (2026-10-31).
     {0x4c9f358, Handover::Load, "BBHOST_LENS_BLUR_RATE"},
+    // The replay ghosts' move and turn a frame, a tenth of a sample's change
+    // (0x192c57d's vmovaps, ReplayManipulator's update): its decomp moves a
+    // ghost by that tenth times the frame in 30 fps frames, every frame, and
+    // counts the samples in 30 fps frames of game time (kCountsHandedOver),
+    // so it plays at the 3 samples a game second it was recorded at
+    // (decomp/chr/replay_manipulator.cpp). On by default, the clock on or
+    // off.
+    {0x4cf6420, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390", true},
+    {0x4cf6424, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390", true},
+    {0x4cf6428, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390", true},
+    {0x4cf642c, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390", true},
 };
 constexpr bool handed_over_in_constants() {
     for (const HandedOver& h : kHandedOver) {
@@ -400,6 +414,51 @@ constexpr Counted kCounts[] = {
     {0x25629f1, 4, 33000, Count::Micros},
     {0x4b33c51, 5, 33333, Count::Digits},
 };
+
+// With the frame clock on, as kHandedOver for the values: the counts above
+// that keep the game's, because what counts them counts game time instead,
+// or because they never followed the frame. Each has a switch of its own
+// (=0) that writes the rate's count at start, as with the clock off, and so
+// does a decomp or a hook that is not in place.
+struct CountHandedOver {
+    std::uint32_t at;
+    Handover how;
+    const char* env;
+    const char* decomp = nullptr;  // Decomp: the decomp, by its name on the list
+    bool by_default = false;       // handed back with the clock off too (its decomp is on by default)
+};
+constexpr CountHandedOver kCountsHandedOver[] = {
+    // The replay ghosts' 10 frames a sample: its decomp counts them in the
+    // 30 fps frames of game time its frames begin (frame_clock's ticks30), 3
+    // samples a game second, as the recorder took them (sub_1d09b40 takes one
+    // each 1/3 s of the steps it is handed).
+    {0x192c405, Handover::Decomp, "BBHOST_REPLAY_STEP", "sub_192c390", true},
+    // ChrSync's 5 frames between the local player's sync packets (the default
+    // ChrSync.FrameSkipCount is read with): its decomp counts them in 30 fps
+    // frames of game time the same way, 6 packets a game second as at 30. These
+    // two on by default, the clock on or off.
+    {0x1929676, Handover::Decomp, "BBHOST_CHR_SYNC_STEP", "sub_1929470", true},
+    // The user-service event thread's usleep(33000) while no event waits: the
+    // game's own poll, a sign-in or a sign-out seen within 33 ms at any rate.
+    {0x25629f1, Handover::Game, "BBHOST_USER_POLL"},
+    // The sound thread's update time: its sleep waits for the next frame
+    // instead, at most this long (engine/sound_wake.h).
+    {0x4b33c51, Handover::Wake, "BBHOST_SOUND_WAKE"},
+};
+constexpr bool counts_handed_over_in_counts() {
+    for (const CountHandedOver& h : kCountsHandedOver) {
+        bool found = false;
+        for (const Counted& c : kCounts) found = found || c.at == h.at;
+        if (!found || h.how == Handover::Load) return false;
+    }
+    return true;
+}
+static_assert(counts_handed_over_in_counts(), "every count handed back is one of kCounts (its old value is checked there)");
+constexpr const CountHandedOver* count_handed_over(std::uint32_t at) {
+    for (const CountHandedOver& h : kCountsHandedOver)
+        if (h.at == at) return &h;
+    return nullptr;
+}
 
 // And the same at every rate: the frame-time manager's catch-up allowance
 // zeroed (its movabs rcx, 0x1e0000000n into +0x268/+0x26c) - inside the
@@ -906,9 +965,17 @@ struct DtSlot {
 };
 std::vector<DtSlot> g_dt_slots;
 std::size_t g_dt_loads_applied = 0;
-// The values handed back to a decomp (kHandedOver), with the start-time value
-// each takes if that decomp is not placed (frame_rate_install_late).
-std::vector<std::pair<const HandedOver*, std::uint32_t>> g_late;
+// The values and counts handed back to a decomp (kHandedOver,
+// kCountsHandedOver), with the start-time bytes each takes if that decomp is
+// not placed (frame_rate_install_late).
+struct Late {
+    std::uint32_t at;
+    std::uint8_t n;
+    std::uint8_t now[8];
+    const char* decomp;
+    double shown;  // the start-time value, for the log
+};
+std::vector<Late> g_late;
 
 template <typename T>
 void put(std::uint64_t a, T v) {
@@ -1464,7 +1531,9 @@ void each_frame(const SprjFlipper* f) {
     const float measured = g_test_step > 0.0f ? g_test_step : f->measured_frame_seconds;
     const float step = scaled(std::min(std::max(measured, g_test_step > 0.0f ? g_test_step : f->target_frame_seconds), kThirtieth));
     if (step > 0.0f) {  // also NaN: the cave keeps the last step
-        if (frame_clock::on()) frame_clock::publish(step);  // the frame clock (engine/frame_clock.h, BBHOST_FRAME_CLOCK=1)
+        // The frame clock (engine/frame_clock.h): with BBHOST_FRAME_CLOCK=1, or
+        // for what counts game time by default (frame_clock::publishing).
+        if (frame_clock::on() || frame_clock::publishing()) frame_clock::publish(step);
         frame_tick_frame(step);  // the fixed ticks' count for this frame (engine/frame_tick.h)
         if (g_step_va) put<float>(g_step_va, step);
         if (g_wind_va) put<float>(g_wind_va, wind_pace::step_for(step));
@@ -1542,6 +1611,7 @@ void each_frame(const SprjFlipper* f) {
 
 // rdi: the frame-time manager.
 GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* saved) {
+    sound_wake_frame();  // the frame's work is done: its sound requests go to a pass now (engine/sound_wake.h)
     np_test_tick();  // the online test hook wants the main thread, once a frame
     params_tick();   // the param repository walk (engine/params.h)
     lua_events_tick();  // named Lua events queued from any thread (engine/lua_events.h)
@@ -1770,7 +1840,7 @@ int apply_rate(ElfImage* image, int want) {
     // would have had beside it, for the log and for a mechanism not in place.
     // A decomp's needs our SprjFlipper::Update, which publishes the clock.
     const auto handed_back = [&](const HandedOver& h) {
-        if (!frame_clock::on()) return false;
+        if (!frame_clock::on() && !h.by_default) return false;
         const char* e = std::getenv(h.env);
         if (e && e[0] == '0') return false;
         return h.how != Handover::Decomp || g_source == Source::Ours;
@@ -1794,8 +1864,20 @@ int apply_rate(ElfImage* image, int want) {
         if (r && mode != 60 && !r->each_frame) ++rated_fixed;
         write(c.at, &now, 4);
     }
+    // The counts handed back (kCountsHandedOver) keep the game's the same way.
+    const auto count_handed_back = [&](const CountHandedOver& h) {
+        if (!frame_clock::on() && !h.by_default) return false;
+        const char* e = std::getenv(h.env);
+        if (e && e[0] == '0') return false;
+        return h.how != Handover::Decomp || g_source == Source::Ours;
+    };
+    std::vector<std::pair<const CountHandedOver*, const Counted*>> kept_counts;
     for (const Counted& c : kCounts) {
         if (skipped(c.at)) continue;
+        if (const CountHandedOver* h = count_handed_over(c.at); h && count_handed_back(*h)) {
+            kept_counts.push_back({h, &c});
+            continue;
+        }
         std::uint8_t now[8];
         count_bytes(c, fps, now);
         write(c.at, now, c.n);
@@ -2059,7 +2141,9 @@ int apply_rate(ElfImage* image, int want) {
     for (const auto& [h, now] : kept) {
         const char* how = "right at every rate";
         if (h->how == Handover::Decomp) {
-            g_late.push_back({h, now});
+            Late late{h->at, 4, {}, h->decomp, static_cast<double>(bits_float(now))};
+            std::memcpy(late.now, &now, 4);
+            g_late.push_back(late);
             how = "converted every frame by its decomp";
         } else if (h->how == Handover::Load) {
             how = "read every frame through a slot of the frame clock's";
@@ -2073,6 +2157,33 @@ int apply_rate(ElfImage* image, int want) {
         }
         host_log("frame rate: 0x%x keeps the game's value (%g), %s (%s=0: the rate's, %g)", h->at,
                  static_cast<double>(bits_float(get<std::uint32_t>(va(h->at)))), how, h->env, static_cast<double>(bits_float(now)));
+    }
+    // The counts handed back (kCountsHandedOver), the same way. The sound
+    // thread's wake is placed here; where it cannot be, the rate's count is
+    // written after all.
+    for (const auto& [h, c] : kept_counts) {
+        std::uint8_t now[8] = {};
+        count_bytes(*c, fps, now);
+        const double was = c->was, then = c->kind == Count::Frames ? static_cast<double>(c->was) * fps / 30
+                                                                   : static_cast<double>(c->was) * 30 / fps;
+        const char* how = "right at every rate";
+        if (h->how == Handover::Decomp) {
+            Late late{h->at, c->n, {}, h->decomp, std::floor(then)};
+            std::memcpy(late.now, now, c->n);
+            g_late.push_back(late);
+            how = "counted in game time by its decomp";
+        } else if (h->how == Handover::Wake) {
+            how = "its thread woken once a frame, at most this long apart";
+            if (!sound_wake_install(image)) {
+                write(h->at, now, c->n);
+                host_log("frame rate: the sound thread's wake could not be placed; 0x%x takes the rate's count at start (%.0f), as "
+                         "with the frame clock off",
+                         h->at, std::floor(then));
+                continue;
+            }
+        }
+        host_log("frame rate: 0x%x keeps the game's count (%.0f), %s (%s=0: the rate's, %.0f)", h->at, was, how, h->env,
+                 std::floor(then));
     }
     // The camera's weights hold Kyo's 60 fps values (kConstants' defaults,
     // and his stores with the sites) or, with Original, the game's 30 fps
@@ -2168,13 +2279,27 @@ void frame_rate_install(ElfImage* image) {
     if (const char* e = std::getenv("BBHOST_FRAME_SOURCE"); e && e[0]) {
         g_source = e[0] == '0' ? Source::Guest : e[0] == '2' ? Source::Compare : Source::Ours;
     }
-    // BBHOST_FRAME_CLOCK=1: the frame clock (engine/frame_clock.h), read here,
-    // before the decomps are added (they ask it). Off, nothing here changes.
-    if (const char* e = std::getenv("BBHOST_FRAME_CLOCK"); e && e[0] == '1') {
-        frame_clock::set_on(true);
-        host_log("frame rate: the frame clock is on (BBHOST_FRAME_CLOCK=1): every frame's step, published before the frame "
-                 "runs, converts what follows the frame at any frame length (engine/frame_clock.h)");
+    // The frame clock (engine/frame_clock.h), read here, before the decomps are
+    // added (they ask it): BBHOST_FRAME_CLOCK=1 or 0, else the Native frame
+    // clock setting (F10, the setup window; bbhost.toml's [video] frame_clock
+    // its default), off by default (config_frame_clock). Off, nothing here
+    // changes; the line says what turned it on, or the switch that kept it off.
+    {
+        const char* from = "";
+        const bool setting = host_settings().frame_clock;
+        if (config_frame_clock(setting, host_opt_saved("frame_clock"), &from)) {
+            frame_clock::set_on(true);
+            host_log("frame rate: the frame clock is on (%s): every frame's step, published before the frame runs, converts "
+                     "what follows the frame at any frame length (engine/frame_clock.h)",
+                     from);
+        } else if (setting) {
+            host_log("frame rate: the frame clock is off (%s, over the Native frame clock setting's On)", from);
+        }
     }
+    // BBHOST_SOUND_CENSUS=1 (a test switch): the sound thread's passes counted
+    // against the frames at any rate, its sleep left as it is unless the frame
+    // clock's wake takes it over below (engine/sound_wake.h).
+    if (const char* e = std::getenv("BBHOST_SOUND_CENSUS"); e && e[0] == '1') sound_wake_census_install(image);
     int want = wanted_fps();
     // Uncapped: the display's refresh rate, read now (the window opens later, on
     // the primary display: core/portable.h) and run as that fixed rate - its
@@ -2250,6 +2375,23 @@ void frame_rate_install(ElfImage* image) {
     }
     g_game_fps = got;
     hle_video_set_game_pace(got);  // above 60: flips complete at once (hle/video.cpp)
+    // The replay ghosts and the local player's character sync count game time by
+    // default, the frame clock on or off (kHandedOver and kCountsHandedOver's
+    // by_default rows, decomp/chr/): they read the clock's 30 fps frames, which
+    // our frame-time manager then publishes every frame although nothing else
+    // of the clock is on. Each has its own switch.
+    {
+        const auto off = [](const char* k) {
+            const char* e = std::getenv(k);
+            return e && e[0] == '0';
+        };
+        const bool replay = !off("BBHOST_REPLAY_STEP"), sync = !off("BBHOST_CHR_SYNC_STEP");
+        frame_clock::set_publishing(g_source == Source::Ours && (replay || sync));
+        if (frame_clock::publishing() && !frame_clock::on())
+            host_log("frame rate: %s%s%s count game time, not the rate's frames (BBHOST_REPLAY_STEP=0, BBHOST_CHR_SYNC_STEP=0): the "
+                     "frame clock's 30 fps frames are published for them, nothing else of the clock is on (engine/frame_clock.h)",
+                     replay ? "the replay ghosts" : "", replay && sync ? " and " : "", sync ? "the character sync" : "");
+    }
     // Above 30 the effects' whole steps set the clock's sub-steps: two in a whole 1/30 s step (30 and smooth), one in a
     // whole 1/60 s step (one event an update is 60 a second already); effect steps frame stays the game's.
     if (sfx_node::emission_clock() > 0) {
@@ -2275,16 +2417,16 @@ void frame_rate_install(ElfImage* image) {
 
 void frame_rate_install_late(ElfImage* image) {
     constexpr std::uint32_t kCodeEnd = 0x54d96dc;  // the 1.09 image's executable segment's end (apply_rate)
-    for (const auto& [h, now] : g_late) {
-        if (decomp_placed(h->decomp) != 0) continue;  // ours (or its compare stand-in) converts it every frame
-        const std::uint64_t at = image->mem.slide + (h->at - kPreferredGuestSlide), lo = at & ~0xfffull,
-                            hi = (at + 4 + 0xfff) & ~0xfffull;
+    for (const Late& l : g_late) {
+        if (decomp_placed(l.decomp) != 0) continue;  // ours (or its compare stand-in) converts it every frame
+        const std::uint64_t at = image->mem.slide + (l.at - kPreferredGuestSlide), lo = at & ~0xfffull,
+                            hi = (at + l.n + 0xfff) & ~0xfffull;
         guest_protect_rwx(&image->mem, lo, hi - lo);
-        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), &now, 4);
-        if (h->at < kCodeEnd) guest_protect_rx(&image->mem, lo, hi - lo);
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), l.now, l.n);
+        if (l.at < kCodeEnd) guest_protect_rx(&image->mem, lo, hi - lo);
         else guest_protect_rw(&image->mem, lo, hi - lo);
         host_log("frame rate: %s is not in place; 0x%x takes the rate's value at start (%g), as with the frame clock off",
-                 h->decomp, h->at, static_cast<double>(bits_float(now)));
+                 l.decomp, l.at, l.shown);
     }
     g_late.clear();
 }

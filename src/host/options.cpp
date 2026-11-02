@@ -64,6 +64,7 @@ enum SettingId {
     kWindowMode,
     kVsync,
     kFrameCap,
+    kFrameClock,
     kFpsCounter,
     kMemoryCounter,
     kPerfOverlay,
@@ -135,6 +136,14 @@ Setting g_set[kSettingCount] = {
     {"frame_cap", "フレームレート", {"30", "60", "90", "120", "150", "180", "240", "360", "480", "960", "Display-Limited"}, 0,
      "30 は原作の速度です。選んだ FPS に合わせてゲームを動かします。「画面に合わせる」は起動時の画面更新頻度が上限です。次回起動時に反映します。",
      false},
+    // The frame clock (engine/frame_clock.h), experimental and off by default:
+    // what the frame rate otherwise sets once for the rate chosen at start
+    // follows each frame's own length. Read once as the game starts
+    // (engine/frame_rate.cpp, config_frame_clock): bbhost.toml's [video]
+    // frame_clock is its default, BBHOST_FRAME_CLOCK=0|1 wins over both.
+    {"frame_clock", "実フレーム時間で動作（試験的）", {"Off", "On"}, 0,
+     "再起動が必要です。設定したフレームレートを維持できない場合も、実際のフレーム時間に合わせてゲームを動かします。",
+     true},
     // The game's frames a second, counted as they start (host/window.cpp,
     // host_fps_frame_start), with how busy the GPU is beside it.
     {"fps_counter", "FPS 表示", {"Off", "On"}, 0,
@@ -313,6 +322,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kWindowMode},
     {Row::Option, nullptr, kVsync},
     {Row::Option, nullptr, kFrameCap},
+    {Row::Option, nullptr, kFrameClock},
     {Row::Option, nullptr, kFpsCounter},
     {Row::Option, nullptr, kMemoryCounter},
     {Row::Option, nullptr, kPerfOverlay},
@@ -390,6 +400,9 @@ std::array<int, kSettingCount> g_pending = [] {
     return a;
 }();
 bool g_dirty = false;  // something changed since the last save
+// Which settings the options file held a value for when it was read (the rest
+// keep their defaults: the table's, or bbhost.toml's), for host_opt_saved.
+std::array<bool, kSettingCount> g_saved{};
 
 // What every setting starts with: the table's own indices, taken before
 // anything is loaded over them, then whatever bbhost.toml sets for it - the
@@ -714,7 +727,7 @@ void apply(int id) {
 // version stays. 4: the camera zoom actions (zoom_in, zoom_out, zoom_reset on
 // the wheel and the middle button); an older file's Transform on the middle
 // button, its default until then, gives it to Camera Zoom Reset.
-constexpr int kOptionsVersion = 4;
+constexpr int kOptionsVersion = 5;
 
 void save() {
     if (!g_dirty) {
@@ -765,6 +778,7 @@ void rebuild_settings() {
     h.fullscreen = index_of(kWindowMode) == 1;
     h.vsync = index_of(kVsync) == 0;
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
+    h.frame_clock = on_of(kFrameClock);
     h.fps_counter = on_of(kFpsCounter);
     h.memory_counter = on_of(kMemoryCounter);
     h.perf_overlay = on_of(kPerfOverlay);
@@ -910,6 +924,8 @@ void host_options_load() {
         if (mode != cap) host_log("options: video.fps_cap = %d is not a frame rate; %d", cap, mode);
         g_set[kFrameCap].index = std::max(0, fps_index(mode));
     }
+    // video.frame_clock is the Native frame clock's default (off).
+    g_set[kFrameClock].index = config().frame_clock ? 1 : 0;
     // A package's own (video.resolution, video.window_mode: the Steam Deck
     // kit's 1280x800, fullscreen; video.model_detail), by the entry's name.
     const auto seed = [](int id, const std::string& value) {
@@ -921,7 +937,8 @@ void host_options_load() {
     seed(kModelDetail, config().model_detail);
     seed(kShaders, config().shaders);
     if (config().setup_text_size > 0) seed(kMenuTextSize, std::to_string(config().setup_text_size) + "%");
-    for (const int id : {static_cast<int>(kSkipLogos), static_cast<int>(kFrameCap), static_cast<int>(kResolution), static_cast<int>(kWindowMode),
+    for (const int id : {static_cast<int>(kSkipLogos), static_cast<int>(kFrameCap), static_cast<int>(kFrameClock),
+                         static_cast<int>(kResolution), static_cast<int>(kWindowMode),
                          static_cast<int>(kModelDetail), static_cast<int>(kShaders), static_cast<int>(kChangeAppearance),
                          static_cast<int>(kRebirth), static_cast<int>(kFivePlayers), static_cast<int>(kSkillIssue)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
@@ -996,6 +1013,7 @@ void host_options_load() {
                 for (std::size_t v = 0; v < g_set[id].values.size(); ++v) {
                     if (val == g_set[id].values[v]) {
                         g_set[id].index = static_cast<int>(v);
+                        g_saved[static_cast<std::size_t>(id)] = true;
                     }
                 }
             }
@@ -1008,6 +1026,11 @@ void host_options_load() {
         // button they take was Transform's (host/bindings.h).
         if (file_version < 4) {
             host_bindings_migrate_zoom();
+            g_dirty = true;
+        }
+        // Before version 5 there were no menu pages and options (host/bindings.h).
+        if (file_version < 5) {
+            host_bindings_migrate_menu_keys();
             g_dirty = true;
         }
         if (file_version < 3 &&
@@ -1468,6 +1491,11 @@ int host_opt_default_resolution_index() { return g_default_index[kResolution]; }
 bool host_opt_get(const char* key) {
     const int id = setting_id(key);
     return id >= 0 && reads_on(g_set[id], g_set[id].index);
+}
+
+bool host_opt_saved(const char* key) {
+    const int id = setting_id(key);
+    return id >= 0 && g_saved[static_cast<std::size_t>(id)];
 }
 
 bool host_opt_resolution(int* w, int* h) {

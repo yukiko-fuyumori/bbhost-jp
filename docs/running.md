@@ -129,7 +129,17 @@ step of Camera distance (up closer, down further out), and the middle button
 puts it back at the game's own distance: Camera Zoom In, Out and Reset on the
 Key Bindings menu's Other page, which a player can rebind (Transform, on the
 middle button too until then, keeps C). Hold Left Alt with the movement keys to walk, and two
-opposite keys held together cancel, both as in Dark Souls III. F9 opens the
+opposite keys held together cancel, both as in Dark Souls III. The game's
+menus take keys of their own, as Dark Souls III keeps a menu's apart from
+play's: the arrows or the movement keys move, Return or Interact confirms,
+Backspace or Dodge goes back, Page Up and Page Down turn the page or the tab
+(L1 and R1), Home and End are a menu's two shortcuts (L2 and R2: the storage
+box's Show Storage and Show Inventory) and F and R its display and status
+switches (Square and Triangle) - the Key Bindings menu's Menu Pages and
+Options page. The attacks,
+the firearm, Transform, the Blood Vial and the quick item work in play only,
+so their keys do nothing in a menu, and a menu's key may also be one of
+theirs. F9 opens the
 patch and plugin menu and F10 bbhost's own settings: menus over the game in
 the setup window's look, moved through with the mouse, the arrow keys or a
 controller (the d-pad and A, L1 and R1 for the pages, B or Escape to close).
@@ -525,10 +535,20 @@ The follow camera runs the game's own values at every frame rate, converted
 to each frame's length, so above 30 it moves as it does at 30.
 `BBHOST_CAMERA_TUNING=fps++` runs Kyo's 60 FPS++ camera retune instead.
 
-`BBHOST_FRAME_CLOCK=1` (a test switch, off by default while it is proven)
-converts each frame, from that frame's own length, the few values the frame
-rate otherwise sets once for the rate chosen at start, so a rate the machine
-cannot hold, a variable refresh rate or a dip keeps them right too:
+Two things the game counts in its own frames count game time at every
+converted rate, so a rate the machine cannot hold keeps them at the game's
+pace: the replay ghosts (bloodstains and other players' ghosts) take their
+samples and move by game time, 3 samples a game second as recorded
+(`BBHOST_REPLAY_STEP=0` for the rate's frames), and the local player's
+character sync sends 6 packets a second as at 30, which other players see
+(`BBHOST_CHR_SYNC_STEP=0`).
+
+The native frame clock (experimental, off by default: Native frame clock
+(experimental) under F10's Frame rate, or the same switch on the setup
+window's Game page; it applies when the game starts) converts each frame,
+from that frame's own length, the few values the frame rate otherwise sets
+once for the rate chosen at start, so a rate the machine cannot hold, a
+variable refresh rate or a dip keeps them right too:
 - a ragdoll's bodies follow its animation by each frame's step
   (`BBHOST_RAGDOLL_STEP=0` for the rate's step);
 - YEBIS's eye adaptation and afterimage follow each frame's length
@@ -536,10 +556,20 @@ cannot hold, a variable refresh rate or a dip keeps them right too:
 - its lens simulation takes each frame's rate, above 60 too
   (`BBHOST_LENS_BLUR_RATE=0` keeps 60's);
 - the physics worlds' two step hints keep the game's 1/30
-  (`BBHOST_PHYSICS_HINTS=0` for the rate's).
+  (`BBHOST_PHYSICS_HINTS=0` for the rate's);
+- the sound thread runs a pass for each frame's sound requests, woken as the
+  frame's work ends, and the game's own 33 ms at the longest
+  (`BBHOST_SOUND_WAKE=0` for the rate's period);
+- the user-service event poll keeps the game's 33 ms (`BBHOST_USER_POLL=0`).
 
 With it on, the values that follow the frame's seconds also take the game's
-step itself, a loading screen's included.
+step itself, a loading screen's included. `[video] frame_clock = true` in
+bbhost.toml is the switch's default (what F10 or the setup window saves wins
+over it, as with `fps_cap`), and `BBHOST_FRAME_CLOCK=1` or `=0` overrides both
+for a run; the log's `frame rate: the frame clock is on (...)` line names what
+turned it on. `BBHOST_SOUND_CENSUS=1` (a test
+switch, at any rate) counts the sound thread's passes against the frames in
+the 300-flip report: how many frames began between one pass and the next.
 
 `BBHOST_GAME_FPS=30|60|...|960|0` overrides the setting for a run (0 is
 Display-Limited), `BBHOST_UNCAPPED_FPS=N` sets Display-Limited's rate (30-960) whatever

@@ -29,6 +29,8 @@ ime = "type"
 width = 1920
 height = 1080
 fps_cap = 30
+# 実際のフレーム時間に合わせて動作する試験的な設定。変更後は再起動が必要です。
+frame_clock = false
 headless = false
 
 [startup]
