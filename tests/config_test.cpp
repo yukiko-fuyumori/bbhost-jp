@@ -197,6 +197,41 @@ int main() {
     // No bbhost.toml in the working directory to layer over the user's.
     if (chdir((g_dir / "work").c_str()) != 0) return 1;
 
+    // Explicit command-line switches win over files; flag names are exact.
+    {
+        load("[video]\nheadless = false\n");
+        char arg0[] = "config_test", headless[] = "--headless";
+        char* argv[] = {arg0, headless, nullptr};
+        HostConfig c;
+        std::string err;
+        CHECK(config_load(2, argv, &c, &err) && c.headless);
+        for (const char* flag : {"--config-extra", "--app0-extra", "--data-extra", "--eboot-extra", "--write-config-extra"}) {
+            std::string arg = std::string(flag) + "=" + (g_dir / "invalid.toml").string();
+            argv[1] = arg.data();
+            CHECK(!config_load(2, argv, &c, &err));
+            CHECK(err == "unknown flag " + arg);
+        }
+    }
+    // Legacy relative paths with inline notes survive importing and removing
+    // the old local config, including a quoted path containing '#'.
+    {
+        fs::remove(g_dir / "config" / "bbhost.toml");
+        const auto local = g_dir / "work" / "bbhost.toml";
+        std::ofstream(local) << "[paths]\napp0 = \"game#1\" # game folder\n"
+                                "eboot = 'eboot.bin' # decrypted executable\n"
+                                "data = saves # keep existing saves\n";
+        char arg0[] = "config_test";
+        char* argv[] = {arg0, nullptr};
+        HostConfig c;
+        std::string err;
+        CHECK(config_load(1, argv, &c, &err));
+        fs::remove(local);
+        CHECK(config_load(1, argv, &c, &err));
+        CHECK(c.app0 == (g_dir / "work" / "game#1").string());
+        CHECK(c.eboot == (g_dir / "work" / "eboot.bin").string());
+        CHECK(c.data == (g_dir / "work" / "saves").string());
+    }
+
     // A note after a quoted value is not part of it.
     {
         HostConfig c = load("[online]\nhost = \"192.168.1.50\"  # added by bbhost v0.2.0: the server\n"
@@ -388,6 +423,26 @@ int main() {
         CHECK(c.eboot == update + "/eboot.bin");
         c = load("[paths]\napp0 = \"" + base + "\"\neboot = \"" + base + "/eboot.bin\"\n");
         CHECK(c.eboot == base + "/eboot.bin");  // a path given is kept
+    }
+
+    // Settings saves accept filenames in the working directory and report I/O errors.
+    {
+        const std::string original = "# keep this comment\n[video]\nwidth = 1920\n\n[player]\nname = \"Hunter\"\n";
+        std::ofstream("settings.toml") << original;
+        CHECK(config_set_values("settings.toml", {{"video", "width", "1280"}, {"video", "height", "720"}}));
+        const std::string text = read("settings.toml");
+        CHECK(text.find("width = 1280") != std::string::npos && text.find("height = 720") != std::string::npos);
+        CHECK(text.find("# keep this comment") != std::string::npos && text.find("name = \"Hunter\"") != std::string::npos);
+        CHECK(config_set_values("new-settings.toml", {{"video", "headless", "true"}}));
+        CHECK(read("new-settings.toml").find("headless = true") != std::string::npos);
+        CHECK(!config_set_values((g_dir / "work").string(), {{"video", "width", "640"}}));
+        std::map<std::string, std::string> kv;
+        std::string err;
+        CHECK(!config_parse_toml((g_dir / "work").string(), &kv, &err));
+        // Small buffered writes must report errors at flush/close too.
+        CHECK(!config_write_template("/dev/full"));
+        fs::remove("settings.toml");
+        fs::remove("new-settings.toml");
     }
 
     // The play log's 5 s from the old example moved to 30 (config_version

@@ -108,6 +108,10 @@ bool parse_file(const std::string& path, std::map<std::string, std::string>* kv,
         }
         (*kv)[section.empty() ? key : section + "." + key] = val;
     }
+    if (in.bad()) {
+        *err = "cannot read " + path;
+        return false;
+    }
     return true;
 }
 
@@ -339,7 +343,17 @@ bool is_relative_path(const std::string& v) {
 
 std::string dir_of(const std::string& file) {
     const std::size_t slash = file.find_last_of("/\\");
+    if (slash == 0 || (slash == 2 && file[1] == ':')) return file.substr(0, slash + 1);
     return slash == std::string::npos ? std::string() : file.substr(0, slash);
+}
+
+bool write_lines(const std::string& path, const std::vector<std::string>& lines) {
+    const std::string dir = dir_of(path);
+    if (!dir.empty() && !make_dirs(dir)) return false;
+    std::ofstream out(path, std::ios::trunc);
+    for (const std::string& line : lines) out << line << '\n';
+    out.close();
+    return static_cast<bool>(out);
 }
 
 // The [paths] keys whose relative values are relative to their file.
@@ -393,6 +407,7 @@ void upgrade_user_config(const std::string& path) {
         if (!l.empty() && l.back() == '\r') l.pop_back();
         lines.push_back(l);
     }
+    if (in.bad()) return;
     in.close();
     std::map<std::string, std::string> kv;
     std::string err;
@@ -429,8 +444,7 @@ void upgrade_user_config(const std::string& path) {
         changed = true;
     }
     if (!changed) return;
-    std::ofstream out(path, std::ios::trunc);
-    for (const std::string& l : lines) out << l << "\n";
+    if (!write_lines(path, lines)) host_log("config: cannot update %s", path.c_str());
 }
 
 // The live server takes only https and signed-in players, as the playtest
@@ -554,7 +568,8 @@ bool import_legacy(const std::string& from, const std::string& to, bool paths_on
         const std::size_t eq = t.find('=');
         if (section == "paths" && !t.empty() && t[0] != '#' && eq != std::string::npos) {
             const std::string key = trim(t.substr(0, eq));
-            std::string v = unquote(trim(t.substr(eq + 1)));
+            // Reuse the parser's value, which already excludes inline comments.
+            std::string v = unquote(kv.at("paths." + key));
             if (!dir.empty() && dir != "." && is_relative_path(v) && !is_placeholder(v)) {
                 v = dir + "/" + (v.rfind("./", 0) == 0 ? v.substr(2) : v);
                 out << key << " = \"" << v << "\"\n";
@@ -563,9 +578,11 @@ bool import_legacy(const std::string& from, const std::string& to, bool paths_on
         }
         out << l << "\n";
     }
+    if (in.bad()) return false;
     if (!make_dirs(dir_of(to))) return false;
     std::ofstream o(to);
     o << out.str();
+    o.close();
     if (!o) return false;
     host_log("config: imported %s into %s (the per-user config every copy of bbhost reads)", from.c_str(), to.c_str());
     return true;
@@ -577,9 +594,11 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
     HostConfig c;
     std::string explicit_cfg;
     std::string cli_app0, cli_data, cli_eboot;
+    bool cli_headless = false;
     std::string write_template;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
+        const std::string flag = a.substr(0, a.find('='));
         auto val = [&](std::string* dst) -> bool {
             std::size_t eq = a.find('=');
             if (eq != std::string::npos) {
@@ -593,18 +612,18 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
             *error = "missing value for " + a;
             return false;
         };
-        if (a.rfind("--config", 0) == 0) {
+        if (flag == "--config") {
             if (!val(&explicit_cfg)) return false;
-        } else if (a.rfind("--app0", 0) == 0) {
+        } else if (flag == "--app0") {
             if (!val(&cli_app0)) return false;
-        } else if (a.rfind("--data", 0) == 0) {
+        } else if (flag == "--data") {
             if (!val(&cli_data)) return false;
-        } else if (a.rfind("--eboot", 0) == 0) {
+        } else if (flag == "--eboot") {
             if (!val(&cli_eboot)) return false;
-        } else if (a.rfind("--write-config", 0) == 0) {
+        } else if (flag == "--write-config") {
             if (!val(&write_template)) return false;
         } else if (a == "--headless") {
-            c.headless = true;
+            cli_headless = true;
         } else if (a == "--setup") {
             c.setup_requested = true;
         } else if (a.rfind("--", 0) == 0) {
@@ -729,6 +748,7 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
     if (!cli_app0.empty()) c.app0 = cli_app0;
     if (!cli_data.empty()) c.data = cli_data;
     if (!cli_eboot.empty()) c.eboot = cli_eboot;
+    if (cli_headless) c.headless = true;
     // A config that still holds the template's stand-in path is not configured.
     if (is_placeholder(c.app0)) c.app0.clear();
     if (is_placeholder(c.eboot)) c.eboot.clear();
@@ -989,7 +1009,8 @@ check = false
 # attack = "Mouse1"
 # firearm = "X, Mouse2"
 )toml";
-    return true;
+    out.close();
+    return static_cast<bool>(out);
 }
 
 std::string config_exe_dir() { return exe_dir(); }
@@ -1001,11 +1022,17 @@ std::string config_default_data_dir() { return user_data_dir(); }
 bool config_set_values(const std::string& path, const std::vector<ConfigEdit>& edits) {
     std::vector<std::string> lines;
     {
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(path, ec);
+        if (ec) return false;
+        if (exists && (!std::filesystem::is_regular_file(path, ec) || ec)) return false;
         std::ifstream in(path);
+        if (exists && !in) return false;
         for (std::string l; std::getline(in, l);) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
             lines.push_back(l);
         }
+        if (in.bad()) return false;
     }
     for (const ConfigEdit& e : edits) {
         // Where the key is now, and where its section's block ends.
@@ -1039,10 +1066,7 @@ bool config_set_values(const std::string& path, const std::vector<ConfigEdit>& e
             lines.push_back(entry);
         }
     }
-    if (!make_dirs(dir_of(path))) return false;
-    std::ofstream out(path, std::ios::trunc);
-    for (const std::string& l : lines) out << l << "\n";
-    return static_cast<bool>(out);
+    return write_lines(path, lines);
 }
 
 bool config_parse_toml(const std::string& path, std::map<std::string, std::string>* kv, std::string* err) {

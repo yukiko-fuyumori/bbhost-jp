@@ -54,9 +54,19 @@ int main() {
     const std::string broken = "https://.s3.amazonaws.com/20261026/play-log_01.bin";
     test_config.online_host = "example.invalid";
     test_config.online_scheme = "https";
+    assert(rewrite_url("http://scej-network.jp/status") == "https://example.invalid/status");
+    assert(rewrite_url("http://bb.scej-network.jp:20443/status?area=1") ==
+           "https://example.invalid:20443/status?area=1");
+    assert(rewrite_url("http://bb.scej-network.jp?area=1") == "https://example.invalid?area=1");
+    assert(rewrite_url("http://bb.scej-network.jp#status") == "https://example.invalid#status");
+    assert(rewrite_url("http://BB.SCEJ-NETWORK.JP/status") == "https://example.invalid/status");
+    for (const char* host : {"notscej-network.jp", "scej-network.jp.example.invalid", "example.invalid"}) {
+        const std::string url = std::string("http://") + host + "/status";
+        assert(rewrite_url(url) == url);
+    }
     assert(rewrite_jp_eu_missing_s3_playlog(broken, 4) == "https://example.invalid:18671/20261026/play-log_01.bin");
     assert(rewrite_jp_eu_missing_s3_playlog(broken, 0) == broken);
-    for (const char* key : {"", "20261026/", "20261026/../x", "20261026/x?q=1", "abcdefgh/log"}) {
+    for (const char* key : {"", "20261026/", "20261026/.", "20261026/..", "20261026/../x", "20261026/x?q=1", "abcdefgh/log"}) {
         const std::string url = std::string("https://.s3.amazonaws.com/") + key;
         assert(rewrite_jp_eu_missing_s3_playlog(url, 4) == url);
     }

@@ -253,24 +253,27 @@ std::string rewrite_url(const std::string& url) {
     }
     std::string scheme = url.substr(0, p);
     std::size_t host_start = p + 3;
-    std::size_t host_end = url.find_first_of(":/", host_start);
+    std::size_t host_end = url.find_first_of(":/?#", host_start);
     if (host_end == std::string::npos) {
         host_end = url.size();
     }
     std::string host = url.substr(host_start, host_end - host_start);
+    std::string hostname = host;
+    std::transform(hostname.begin(), hostname.end(), hostname.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     std::string rest = url.substr(host_end);
     // The game uploads its play logs to FromSoftware's S3 buckets
     // (https://bb-playlog-{test,prod}.s3.amazonaws.com/<date>/<file>, PUT).
     // They go to the private server's game port instead, which stores them
     // (its PUT /{date}/{file}); left alone they went to Amazon under bucket
     // names we do not own.
-    if (host == "bb-playlog-test.s3.amazonaws.com" || host == "bb-playlog-prod.s3.amazonaws.com") {
+    if (hostname == "bb-playlog-test.s3.amazonaws.com" || hostname == "bb-playlog-prod.s3.amazonaws.com") {
         const std::string to = cfg.online_host.empty() ? "thehuntersdream.com" : cfg.online_host;
         const std::string sch = cfg.online_scheme.empty() ? "http" : cfg.online_scheme;
         std::size_t path = rest.find('/');
         return sch + "://" + to + ":18671" + (path == std::string::npos ? "/" : rest.substr(path));
     }
-    bool official = host.size() >= 15 && host.compare(host.size() - 15, 15, "scej-network.jp") == 0;
+    const bool official = hostname == "scej-network.jp" || hostname.ends_with(".scej-network.jp");
     if (official && !cfg.online_host.empty()) {
         host = cfg.online_host;
     }
@@ -298,7 +301,7 @@ std::string rewrite_jp_eu_missing_s3_playlog(const std::string& url, int method)
         [](unsigned char c) {
             return std::isalnum(c) != 0 || c == '_' || c == '-' || c == '.';
         });
-    if (!name_ok)
+    if (!name_ok || key.substr(9) == "." || key.substr(9) == "..")
         return url;
 
     const HostConfig& cfg = config();
