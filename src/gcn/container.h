@@ -42,6 +42,15 @@ bool bnd4_read(const std::vector<std::uint8_t>& b, Bnd4Archive& out, std::string
 // out: the dump's talk-script archives pack back byte for byte.
 std::vector<std::uint8_t> bnd4_pack(const Bnd4Archive& a);
 
+// The OrbShdr binary subtype distinguishes domain programs from ordinary
+// vertex programs even though both have Shdr type 1. Values and bit layout:
+// https://ps4-opengnm.github.io/opengnm/reference/shaderbinary/
+enum class ShaderHardwareStage : std::uint8_t {
+    Pixel = 0, Vertex = 1, Export = 2, Local = 3, Compute = 4,
+    Geometry = 5, GeometryVertex = 6, Hull = 7, DomainVertex = 8, DomainExport = 9,
+    Unknown = 0xff,
+};
+
 // Sony shader container: 0x24-byte file header, 0x50-byte "Shdr" header, GCN
 // code, "OrbShdr" footer. Returns the code slice (dword aligned) or false.
 struct ShaderCode {
@@ -49,8 +58,12 @@ struct ShaderCode {
     std::size_t offset = 0;  // byte offset of the code in the container
     std::size_t footer = 0;  // byte offset of the 'OrbShdr' ShaderBinaryInfo
     std::uint8_t type = 0;   // ShaderFileHeader type byte
+    ShaderHardwareStage hardware_stage = ShaderHardwareStage::Unknown;
 };
 bool shader_code(const std::vector<std::uint8_t>& container, ShaderCode& out);
+// Domain programs need the draw's tessellation topology and LDS layout, so
+// they cannot be precompiled as independent ordinary vertex stages.
+bool shader_needs_tessellation_context(const ShaderCode& code);
 
 // Load a file into memory.
 bool read_file(const std::string& path, std::vector<std::uint8_t>& out);

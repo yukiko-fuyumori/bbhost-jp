@@ -1,6 +1,7 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "host/launcher.h"
 #include "host/trophy_ui.h"
+#include "host/play_history_ui.h"
 #include "core/game_edition.h"
 
 #include "bbhost_version.h"
@@ -64,7 +65,7 @@ constexpr int kTextSizes[] = {100, 125, 150, 175, 200, 250, 300, 350, 400};
 const char* const kTextSizeLabels[] = {"100%", "125%", "150%", "175%", "200%", "250%", "300%", "350%", "400%"};
 
 // The window's pages, as the sidebar lists them.
-enum Page { kPageGame, kPageOnline, kPageEnhancements, kPagePatches, kPageShaders, kPagePlugins, kPageTrophies, kPageSettings, kPageCount };
+enum Page { kPageGame, kPageOnline, kPageEnhancements, kPagePatches, kPageShaders, kPagePlugins, kPageTrophies, kPageHistory, kPageSettings, kPageCount };
 struct PageInfo {
     const char* name;
     const char* slug;  // its picture's name (BBHOST_SETUP_TEST=shot)
@@ -78,6 +79,7 @@ constexpr PageInfo kPages[kPageCount] = {
     {"シェーダー", "shaders", launcher_ui::Icon::Shaders},
     {"プラグイン", "plugins", launcher_ui::Icon::Plugins},
     {"トロフィー", "trophies", launcher_ui::Icon::Enhance},
+    {"プレイ記録", "play-history", launcher_ui::Icon::Game},
     {"設定", "settings", launcher_ui::Icon::Settings},
 };
 
@@ -258,6 +260,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     }
     SDL_SetWindowMinimumSize(win, std::min(win_w, static_cast<int>(860 * scale)), std::min(win_h, static_cast<int>(580 * scale)));
     dark_title_bar(win);
+    // V-Sync paces the window where the driver keeps it; the loop below caps
+    // it at 60 a second besides, for where it does not.
     SDL_SetRenderVSync(ren, 1);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -303,6 +307,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // The Native frame clock (experimental, off): F10's DISPLAY row, read as the
     // game starts (engine/frame_rate.cpp; BBHOST_FRAME_CLOCK=0|1 wins).
     bool frame_clock = host_opt_get("frame_clock");
+    // Effect timing (Smooth by default): F10's DISPLAY row, read as the game
+    // starts (engine/frame_rate.cpp; BBHOST_SFX_STEP wins). The row shows what
+    // will run (host_effect_timing_row); a pick, one of the four, is the
+    // player's own from Save or Play on.
+    int effect_timing = -1;  // the pick, -1 none
     int resolution = host_opt_resolution_index();
     // In the setting's order (host/options.cpp): by size within each shape.
     static const char* const kResolutions[] = {"640x360",           "960x540",           "1280x720",          "1440x810",
@@ -426,7 +435,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     const char* test = std::getenv("BBHOST_SETUP_TEST");
     int frames = 0;
     TrophyUi trophy_ui;
+    PlayHistoryUi history_ui;
     if (test && !std::strcmp(test, "trophies")) page = kPageTrophies;
+    if (test && !std::strcmp(test, "play-history")) page = kPageHistory;
+    if (test && !std::strcmp(test, "chalice-history")) { page = kPageHistory; history_ui.chalice = true; }
     // link: starts a Discord link as its button does and, once the code is
     // up, cancels it and closes.
     const std::string test_create = test && !std::strncmp(test, "create:", 7) ? test + 7 : "";
@@ -497,6 +509,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("debug_camera", debug_camera);
         host_opt_set_frame_cap(kCaps[cap_choice]);
         host_opt_set("frame_clock", frame_clock);
+        if (effect_timing >= 0) host_opt_choose_effect_timing(effect_timing);
         host_opt_set_index("camera_tuning", camera_tuning);
         host_opt_set_index("shaders", shaders);
         host_opt_set_resolution_index(resolution);
@@ -508,6 +521,16 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         return true;
     };
 
+    // The window's pace: 60 frames a second at most. V-Sync alone left the loop
+    // drawing as fast as it could wherever the driver ignores it - a driver
+    // setting that turns it off, a backend without it, a window the compositor
+    // stopped showing - a whole core spent on a settings page. Each frame's
+    // deadline moves on by a sixtieth of a second on SDL's nanosecond clock,
+    // and what is left of it is slept after the present; a frame that ran a
+    // whole frame past it starts the count again rather than hurrying to
+    // catch up.
+    constexpr Uint64 kFrameNs = SDL_NS_PER_SECOND / 60;
+    Uint64 frame_due = SDL_GetTicksNS();
     while (!done) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -527,6 +550,15 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 if (g_pick_for == kEboot) eboot = check_eboot(f[kEboot].str());
                 g_pick_for = -1;
             }
+        }
+        // Minimized, hidden or covered: nothing is drawn, and the loop waits
+        // for the next event, a tenth of a second at most (a sign-in finished
+        // in the browser is still saved above). A test's window draws on, so
+        // its frames still count.
+        if (!test && (SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | SDL_WINDOW_OCCLUDED))) {
+            SDL_WaitEventTimeout(nullptr, 100);
+            frame_due = SDL_GetTicksNS();
+            continue;
         }
         // A new text size: the style and fonts take it, and the window
         // grows or shrinks to what it opens at with that size.
@@ -841,7 +873,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 
             // The display, and online at a glance, side by side.
             const float row_lw = std::min(104 * scale, (w - gap) * 0.19f);  // a third of the card at most
-            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), card_h(6)), "画面");
+            ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), card_h(7)), "画面");
             {
                 ui::row_label("画面モード", row_lw);
                 static const char* const kModes[] = {"Windowed", "Fullscreen"};
@@ -854,6 +886,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                      "ゲームの動作速度です。「画面に合わせる」は起動時の画面更新頻度が上限です（180 Hz なら 180 fps）。");
                 ui::toggle_row("実フレーム時間で動作（試験的）", nullptr, &frame_clock,
                                "再起動が必要です。設定したフレームレートを維持できない場合も、実際のフレーム時間に合わせてゲームを動かします。");
+                ui::row_label("エフェクト", row_lw);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                {
+                    const HostEffectTimingRow et = host_effect_timing_row();
+                    const char* labels[5] = {kHostEffectTimingLabels[0], kHostEffectTimingLabels[1], kHostEffectTimingLabels[2],
+                                             kHostEffectTimingLabels[3], et.custom.c_str()};
+                    const char* tips[5] = {kHostEffectTimingTips[0], kHostEffectTimingTips[1], kHostEffectTimingTips[2],
+                                           kHostEffectTimingTips[3], et.tip.c_str()};
+                    int shown = effect_timing >= 0 ? effect_timing : et.index;
+                    if (ui::combo("##effects", &shown, labels, et.index == 4 ? 5 : 4, tips) && shown < 4) effect_timing = shown;
+                }
+                ui::tooltip_for_item("エフェクトの時間処理", kHostEffectTimingNote);
                 ui::row_label("解像度", row_lw);
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 ui::combo("##res", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
@@ -865,7 +909,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             }
             ui::card_end();
             ImGui::SameLine(0, gap);
-            ui::card_begin("##online", ImVec2(0, card_h(6)), "オンライン");
+            ui::card_begin("##online", ImVec2(0, card_h(7)), "オンライン");
             {
                 ui::row_label("サーバー", 72 * scale);
                 static const char* const kShort[] = {"本番", "テスト", "カスタム"};
@@ -1190,6 +1234,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     std::string head, sub;
                 };
                 State state{ui::Icon::Check, ui::kGood, "準備完了", "この bbhost と現在のドライバーで作成済みです。"};
+                const ShaderCompileResultCounts counts = shader_compile_result_counts(cache_state.last);
+                const std::uint64_t last_failed = cv.finished ? cv.failed : counts.failed;
                 if (cv.running) state = {ui::Icon::Refresh, ui::kBlue, "コンパイル中", cv.phase};
                 else if (!cache_state.have_caches) state = {ui::Icon::Warning, ui::kWarn, "シェーダーキャッシュがありません", "初回起動時にすべてコンパイルします。"};
                 else if (!cache_state.translator_current)
@@ -1197,6 +1243,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 else if (cache_state.device_current == 0)
                     state = {ui::Icon::Warning, ui::kWarn, "別の GPU またはドライバー用です", "ドライバー側の処理を再コンパイルします。"};
                 else if (cache_state.device_current != 1) state = {ui::Icon::Info, ui::kIce, "ドライバーを確認中", "この bbhost で作成済みです。"};
+                else if (last_failed)
+                    state = {ui::Icon::Warning, ui::kWarn, "一部のコンパイルに失敗", "作成済みのキャッシュを使用できます。下の失敗理由を確認してください。"};
                 if (recommend_compile)
                     state = {ui::Icon::Warning, ui::kWarn, "事前コンパイルを推奨",
                              advice.why + "。事前コンパイルの目安: " + advice.time + "。省略するとプレイ中に処理します。"};
@@ -1250,7 +1298,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     ImGui::SameLine();
                     ImGui::AlignTextToFramePadding();
                     ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextDim);
-                    ImGui::TextUnformatted(app0_ok && eboot.ok ? "この PC のドライバーですべてのシェーダーをコンパイルします。中止できます。"
+                    ImGui::TextUnformatted(app0_ok && eboot.ok ? "この PC のドライバーでシェーダーと描画パイプラインをコンパイルします。中止できます。"
                                                                : "対応するゲームフォルダーと 1.09 の eboot が必要です。");
                     ImGui::PopStyleColor();
                 } else {
@@ -1272,16 +1320,22 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     if (cv.eta >= 0 && cv.running) std::snprintf(line, sizeof(line), "経過 %.0f 秒、残り約 %.0f 秒", cv.seconds, cv.eta);
                     else std::snprintf(line, sizeof(line), "%.0f 秒", cv.seconds);
                     std::string stats = line;
-                    std::snprintf(line, sizeof(line), "  |  DXC %llu、SPIR-V 維持 %llu、失敗 %llu",
+                    std::snprintf(line, sizeof(line), "  |  DXC %llu、SPIR-V 維持 %llu、失敗 %llu、単体対象外 %llu",
                                   static_cast<unsigned long long>(cv.hlsl), static_cast<unsigned long long>(cv.lift),
-                                  static_cast<unsigned long long>(cv.failed));
+                                  static_cast<unsigned long long>(cv.failed), static_cast<unsigned long long>(cv.deferred));
                     dim_text(stats + line);
+                    if (cv.deferred)
+                        dim_text("単体対象外はテッセレーションの評価段階です。対応する描画設定と組み合わせ、記録済みパイプラインの再生時または描画時にコンパイルします。",
+                                 ui::kTextDim);
                     if (cv.recipes_total) {
                         std::snprintf(line, sizeof(line), "過去のプレイと同梱リストのパイプライン: %llu / %llu",
                                       static_cast<unsigned long long>(cv.recipes_done), static_cast<unsigned long long>(cv.recipes_total));
                         dim_text(line);
                     }
-                    if (cv.finished) dim_text("完了しました。次回起動時はキャッシュを使用します。", ui::kGood, false);
+                    if (cv.finished)
+                        dim_text(cv.failed ? "完了しましたが、一部のコンパイルに失敗があります。下の理由を確認してください。"
+                                           : "完了しました。作成したキャッシュは次回起動時に使用します。",
+                                 cv.failed ? ui::kWarn : ui::kGood, false);
                     if (cv.cancelled) dim_text("中止しました。完成済みのキャッシュは保持し、残りはゲーム中に処理します。", ui::kWarn, false);
                     if (!cv.error.empty()) dim_text(cv.error, ui::kWarn, false);
                     for (const std::string& r : cv.reasons) dim_text("- " + r);
@@ -1310,14 +1364,12 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 }
                 ui::card_begin("##last", ImVec2(w, 0), "前回のコンパイル");
                 std::string details = "On " + device + ": shaders " + stages + "; " + hlsl + ".";
+                const ShaderCompileResultCounts counts = shader_compile_result_counts(cache_state.last);
+                if (counts.deferred)
+                    details += "\n単体コンパイル対象外 " + std::to_string(counts.deferred) +
+                               ": テッセレーションの評価段階です。対応する描画設定と組み合わせ、記録済みパイプラインの再生時または描画時にコンパイルします。";
                 if (!pipelines.empty() && pipelines.rfind("0 of 0", 0) != 0) details += "\nPipelines " + pipelines + ".";
-                for (const std::string& r : failed) {
-                    if (r.find("LDS use outside a compute shader") != std::string::npos)
-                        details += "\n単体コンパイル対象外（" + r.substr(r.rfind(' ') + 1) +
-                                   "）: 別の段階と組み合わせる LDS 書き込み用頂点シェーダーです。ゲーム中の描画時にコンパイルします。";
-                    else
-                        details += "\nFailed: " + r;
-                }
+                for (const std::string& r : failed) details += "\n失敗: " + r;
                 for (const std::string& r : lift) details += "\n変換済み SPIR-V を維持: " + r;
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextUnformatted((capitalised(res == "done" ? "finished" : res) + ", " + when + "  |  " + seconds + " s  |  bbhost " + version).c_str());
@@ -1337,6 +1389,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             plugin_seen = true;
         } else if (page == kPageTrophies) {
             trophy_ui_draw(trophy_ui, f[kData].str().empty() ? config_default_data_dir() : f[kData].str(), 0.0f);
+        } else if (page == kPageHistory) {
+            play_history_ui_draw(history_ui, f[kData].str().empty() ? config_default_data_dir() : f[kData].str());
         } else if (page == kPageSettings) {
             const float w = ImGui::GetContentRegionAvail().x;
             ui::card_begin("##folders", ImVec2(w, 0), "フォルダー");
@@ -1437,7 +1491,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         }
         ImGui::End();
 
-        if (test && !std::strcmp(test, "trophies") && ++frames > 30) done = true;
+        if (test && (!std::strcmp(test, "trophies") || !std::strcmp(test, "play-history") || !std::strcmp(test, "chalice-history")) && ++frames > 30) done = true;
         ImGui::Render();
         // Menu hue and Menu vibrance, on everything the frame draws.
         float hue = 0.0f, vibrance = 0.0f;
@@ -1485,6 +1539,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             }
         }
         SDL_RenderPresent(ren);
+        frame_due += kFrameNs;
+        const Uint64 now = SDL_GetTicksNS();
+        if (now < frame_due) SDL_DelayNS(frame_due - now);
+        else if (now - frame_due > kFrameNs) frame_due = now;
     }
 
     // Closing the window while a compile runs: it is told to stop and write

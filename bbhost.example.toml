@@ -29,6 +29,9 @@ ime = "type"
 width = 1920
 height = 1080
 fps_cap = 30
+# エフェクトの更新方法。smooth: 滑らか、30: 原作、auto: 毎秒60回、fps: 毎フレーム。
+# 1〜960 の数値も指定できます。変更後は再起動が必要です。F10 の保存値が優先されます。
+effect_steps = "smooth"
 # 実際のフレーム時間に合わせて動作する試験的な設定。変更後は再起動が必要です。
 frame_clock = false
 headless = false

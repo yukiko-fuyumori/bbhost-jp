@@ -17,5 +17,9 @@ inline const char* host_japanese_value(const char* value) {
     if (!std::strcmp(value, "Low")) return "低";
     if (!std::strcmp(value, "Lowest")) return "最低";
     if (!std::strcmp(value, "Lifted")) return "変換済み SPIR-V";
+    if (!std::strcmp(value, "Smooth")) return "なめらか";
+    if (!std::strcmp(value, "Original (30)")) return "原作（毎秒30回）";
+    if (!std::strcmp(value, "60 a second")) return "毎秒60回";
+    if (!std::strcmp(value, "Your frame rate")) return "フレームレートに合わせる";
     return value;
 }

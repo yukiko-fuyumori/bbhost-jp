@@ -18,6 +18,9 @@
 namespace {
 
 const char* choice_label(const std::string& value) {
+    if (value == "Once") return "１回";
+    if (value == "N times") return "指定回数";
+    if (value == "Loop until stopped") return "停止するまで繰り返す";
     static const std::pair<const char*, const char*> labels[] = {
         {"story", "物語順"}, {"random", "ランダム"}, {"same area", "同じエリア"},
         {"whole game", "全エリア"}, {"evenly", "均等"}, {"like the original", "原作準拠"},

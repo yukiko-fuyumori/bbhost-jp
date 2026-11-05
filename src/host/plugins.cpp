@@ -1,4 +1,5 @@
 #include "host/plugins.h"
+#include "engine/play_history.h"
 #include "host/plugin_address.h"
 
 #include "bbhost_plugin.h"
@@ -1163,6 +1164,7 @@ const BbHostApi g_api = {
     &api_show_text,
     &api_on_scene_category,
     &api_draw_style,
+    &play_history_pause,
 };
 
 std::string read_file(const std::string& path) {

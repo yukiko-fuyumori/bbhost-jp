@@ -666,6 +666,7 @@ int main(int argc, char** argv) {
     // The programs, with the options the renderer lifts them with at creation.
     std::vector<Job> work;
     std::size_t seen = 0;
+    std::size_t domain_context = 0;
     int next_set = 0;
     for (const std::string& path : bundles) {
         std::vector<gcn::BundleEntry> entries;
@@ -689,6 +690,14 @@ int main(int argc, char** argv) {
             std::string base = e.name;
             if (const std::size_t slash = base.find_last_of("\\/"); slash != std::string::npos) base = base.substr(slash + 1);
             if (!only.empty() && !only.count(base) && !only.count(e.name)) continue;
+            // A domain program shares Shdr type 1 with ordinary vertex
+            // programs, but its invocation inputs and LDS need the draw's
+            // tessellation configuration. tess_jobs supplies that context
+            // for supported sets; the standalone VS path must not guess it.
+            if (is_vs && gcn::shader_needs_tessellation_context(code)) {
+                ++domain_context;
+                continue;
+            }
             // The entry's folders too: one program name can be in several (Lightprepass0\, Deferred\).
             std::string full = e.name;
             for (char& c : full) {
@@ -831,6 +840,10 @@ int main(int argc, char** argv) {
             j.container = std::move(e.data);
             if (seen++ % static_cast<std::size_t>(sample) == 0) work.push_back(std::move(j));
         }
+    }
+    if (domain_context) {
+        std::printf("domain shader entries needing draw context: %zu (excluded from standalone VS jobs; "
+                    "supported tessellation stages use --tess)\n", domain_context);
     }
 
     Totals t;

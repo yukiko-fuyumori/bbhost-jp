@@ -13,10 +13,12 @@
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
 #include "host/gxvk.h"
+#include "host/gxvk_table.h"
 #include "host/import_mode.h"
 #include "host/import_prefetch.h"
 #include "host/memory_policy.h"
 #include "host/host_lists.h"
+#include "host/import_retire.h"
 #include "host/import_table.h"
 #include "host/label_landing.h"
 #include "host/ring_budget.h"
@@ -25,6 +27,9 @@
 #include "host/shader_bundles.h"
 #include "host/translation_cache.h"
 #include "host/twin_filter.h"
+#include "host/cb_capture.h"
+#include "host/gxvk_homes.h"
+#include "host/gxvk_lists.h"
 #include "host/options.h"
 
 #include "gcn/container.h"
@@ -69,6 +74,7 @@ namespace gpu {
 Gpu g;
 std::atomic<std::uint64_t> g_validation_messages{0};  // warnings and errors the validation layer reported
 thread_local constinit const char* t_import_site = nullptr;     // gpu_internal.h: the window imports' census
+thread_local constinit int t_import_fall = -1;                  // gpu_internal.h: the census by window
 
 void device_lost_locked(const char* where, bool declared = false);  // below, with the reports it makes
 bool take_marked_start(std::string& why);    // the same: a start after a lost device runs with markers
@@ -183,9 +189,13 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
         }
     }
     if (log) {
-        // The objects and the scope first: host_log keeps 1 KiB of a line.
+        // The objects and the scope first: host_log keeps 1 KiB of a line - the rest of a long message on lines of its own.
+        const char* msg = data && data->pMessage ? data->pMessage : "?";
         host_log("vk validation: [%s%s%s] %s", objects.c_str(), t_validation_scope ? "; building " : "", t_validation_scope ? t_validation_scope : "",
-                 data && data->pMessage ? data->pMessage : "?");
+                 msg);
+        const std::size_t len = std::strlen(msg), shown = 1000 > objects.size() + 40 ? 1000 - objects.size() - 40 : 0;
+        for (std::size_t at = shown; shown && at < len && at < 8000; at += 900)
+            host_log("vk validation (more): %.900s", msg + at);
     }
     return VK_FALSE;
 }
@@ -509,6 +519,7 @@ void free_import(Chunk& c) {
     c = Chunk{};
 }
 
+
 // [ptr, ptr + size) of the mirror into c as one host-pointer import.
 VkResult host_span(Chunk& c, void* ptr, std::uint64_t size) {
     VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -770,6 +781,34 @@ VKAPI_ATTR VkBool32 VKAPI_CALL va_binding_callback(VkDebugUtilsMessageSeverityFl
     return VK_FALSE;
 }
 
+// Idle window imports let go (host/import_retire.h; the memory policy decides
+// it, host/memory_policy.h, BBHOST_IMPORT_RETIRE winning): 1 lets go of a
+// window import none of whose windows anything has used for
+// BBHOST_IMPORT_RETIRE_S seconds (60), at most BBHOST_IMPORT_RETIRE_MB (128)
+// MiB a second, so the frees - each an unpinning in the driver, at a slot's
+// retirement on the command processor - spread over the seconds after an
+// area's change; 2 counts what 1 would let go and the windows it would have
+// imported again, and lets go of nothing; 0 keeps every window imported once
+// made. 0 until the policy is decided: a window used before has no stamp, which
+// the first check gives it.
+const import_retire::Switch g_retire =
+    import_retire::parse(nullptr, std::getenv("BBHOST_IMPORT_RETIRE_S"), std::getenv("BBHOST_IMPORT_RETIRE_MB"));
+std::atomic<int> g_retire_mode{0};
+// The command processor's clock at its last submission (steady ms): what a use
+// stamps on its windows, without a clock read of its own.
+std::atomic<std::uint64_t> g_import_now_ms{0};
+// Bumped at every import let go: the import thread's view of what is imported
+// (prefetch_thread's `known`) starts again.
+std::atomic<std::uint64_t> g_import_retire_gen{0};
+// Under g.mu: checks made, imports let go (and their MiB); windows used again
+// after it - imported again (their MiB, the driver's time of the paths that
+// asked, the longest), each by the path that asked; with 2, what 1 would have
+// let go and imported again.
+std::uint64_t g_retire_checks = 0, g_retire_n = 0, g_retire_bytes = 0, g_retire_skipped = 0;
+std::uint64_t g_again_n = 0, g_again_bytes = 0, g_again_us = 0, g_again_max_us = 0, g_again_prefetch = 0;
+std::uint64_t g_would_n = 0, g_would_bytes = 0, g_would_again_n = 0, g_would_again_bytes = 0, g_would_idle_most = 0;
+std::uint64_t g_would_ms[gcn::kDmemChunks][kImportWindows] = {};  // =2: when the window would have been let go (0: not)
+
 // BBHOST_IMPORT_TABLE_DEFER (on unless 0): a window import that replaces
 // older ones (a merge) takes over their windows' page-table entries only once
 // every submission made before it has run (host/import_table.h); =0 points them
@@ -862,17 +901,23 @@ struct SiteUse {
     const char* site = nullptr;
     std::uint64_t n = 0, bytes = 0;
 };
-SiteUse g_site_uses[64];  // under g.mu
+constexpr int kSiteSlots = 64;
+SiteUse g_site_uses[kSiteSlots];  // under g.mu
+// The slot of a path (its name's pointer: ImportSite's literal), -1 once every slot is taken.
+int site_slot_locked(const char* site) {
+    for (int k = 0; k < kSiteSlots; ++k) {
+        SiteUse& u = g_site_uses[k];
+        if (!u.site) u.site = site;
+        if (u.site == site) return k;
+    }
+    return -1;
+}
 void note_site_use_locked(std::uint64_t bytes) {
     if (!g_census) return;
-    const char* const site = t_import_site ? t_import_site : "other";
-    for (SiteUse& u : g_site_uses) {
-        if (!u.site) u.site = site;
-        if (u.site != site) continue;
-        ++u.n;
-        u.bytes += bytes;
-        return;
-    }
+    const int k = site_slot_locked(t_import_site ? t_import_site : "other");
+    if (k < 0) return;
+    ++g_site_uses[k].n;
+    g_site_uses[k].bytes += bytes;
 }
 // The GX buffers GPU copies wrote (copy tokens' destinations, copy versions'):
 // by generation, with their usage, bind flags and size - candidates for a
@@ -903,6 +948,116 @@ std::atomic<std::uint64_t> g_import_who_n[kImportWhos], g_import_who_bytes[kImpo
 // else wants it waits too), the mapping thread's for a whole span.
 std::atomic<std::uint64_t> g_import_who_us[kImportWhos], g_import_wait_max_us{0};
 std::atomic<std::uint64_t> g_imports_retired{0}, g_import_retired_bytes{0};
+// Retired imports freed once their slot's work has run (the driver's time of each - an import's pages unpinned - on the
+// thread that frees them), and the command processor's part of it: the free itself without the free thread, the hand-over
+// with it.
+std::atomic<std::uint64_t> g_import_freed{0}, g_import_freed_bytes{0}, g_import_free_us{0}, g_import_free_max_us{0};
+std::atomic<std::uint64_t> g_import_free_cp_us{0}, g_import_free_cp_max_us{0};
+
+// ---- Retired window imports freed off the command processor (BBHOST_IMPORT_FREE_THREAD, on unless 0) ----
+// A window import a merge replaced, or one let go while idle, is freed once
+// every submission that could name it has run - its slot's retirement - and
+// the free itself is the driver unpinning its pages: on an RTX 4070 up to 14 ms
+// for one, 95-181 ms over a 3.5-minute tour, on the command processor under the
+// renderer's lock. The slot's retirement now hands each to a thread of its own
+// (bb-import-free) that frees it: the order stays - nothing is handed over
+// before that retirement - and Vulkan lets memory and buffers be freed on any
+// thread, as the import thread already does with a raced import. =0 frees
+// them at the retirement, on the command processor, as before.
+const bool g_free_thread_on = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_FREE_THREAD");
+    return !(e && e[0] == '0');
+}();
+// The thread runs in the background (host_thread_background) and waits
+// BBHOST_IMPORT_FREE_GAP_MS (50) after each free before the next: freed back
+// to back beside the game, the frees took ~1.7 times as long and the main
+// loop's work at Laurence's staircase rose 0.23 ms (uncapped -2.5%, an RTX
+// 4070 as a 4 GB card) - spread out and yielding, they are meant to meet
+// nothing. A burst of retired imports (a merge's, an area's) is freed over a
+// second or two instead.
+const std::uint32_t g_free_gap_ms = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_FREE_GAP_MS");
+    return e && *e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10)) : 50u;
+}();
+// BBHOST_IMPORT_FREE_LOG=1: each free logged with its flip and wall clock, so a
+// harness can line frees up with the frame intervals.
+const bool g_free_log = [] {
+    const char* e = std::getenv("BBHOST_IMPORT_FREE_LOG");
+    return e && e[0] == '1';
+}();
+struct DeadImport {
+    Chunk chunk;
+    int slot = 0;
+    std::uint64_t serial = 0;
+};
+std::mutex g_free_mu;
+std::condition_variable g_free_cv;
+std::deque<DeadImport> g_free_q;  // under g_free_mu
+bool g_free_started = false;      // under g_free_mu
+std::atomic<std::uint64_t> g_free_queue_most{0};
+
+// One import freed, timed (va trace, counts); `cp`: on the command processor.
+void free_dead_import_now(Chunk& c, int slot, std::uint64_t serial, bool cp) {
+    va_note("import freed", c.address, c.size, static_cast<std::uint64_t>(slot), serial);
+    const std::uint64_t size = c.size;
+    const auto t0 = std::chrono::steady_clock::now();
+    free_import(c);
+    const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    if (g_free_log) {
+        const double wall = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        host_log("gpu: import freed: %llu MiB in %.2f ms at flip %llu %.3f, %s", static_cast<unsigned long long>(size >> 20), us / 1e3,
+                 static_cast<unsigned long long>(hle_video_flip_count()), wall, cp ? "on the command processor" : "on bb-import-free");
+    }
+    g_import_freed.fetch_add(1, std::memory_order_relaxed);
+    g_import_freed_bytes.fetch_add(size, std::memory_order_relaxed);
+    g_import_free_us.fetch_add(us, std::memory_order_relaxed);
+    if (us > g_import_free_max_us.load(std::memory_order_relaxed)) g_import_free_max_us.store(us, std::memory_order_relaxed);
+    if (cp) {
+        g_import_free_cp_us.fetch_add(us, std::memory_order_relaxed);
+        if (us > g_import_free_cp_max_us.load(std::memory_order_relaxed)) g_import_free_cp_max_us.store(us, std::memory_order_relaxed);
+    }
+}
+
+void import_free_thread() {
+    host_thread_set_name("bb-import-free");
+    host_thread_background();
+    for (;;) {
+        DeadImport d;
+        {
+            std::unique_lock<std::mutex> lk(g_free_mu);
+            g_free_cv.wait(lk, [] { return !g_free_q.empty(); });
+            d = std::move(g_free_q.front());
+            g_free_q.pop_front();
+        }
+        free_dead_import_now(d.chunk, d.slot, d.serial, false);
+        if (g_free_gap_ms) std::this_thread::sleep_for(std::chrono::milliseconds(g_free_gap_ms));
+    }
+}
+
+// At a slot's retirement (every submission that could name it has run): the
+// import freed on the free thread, or here (BBHOST_IMPORT_FREE_THREAD=0).
+void free_dead_import(Chunk& c, int slot, std::uint64_t serial) {
+    if (!g_free_thread_on) {
+        free_dead_import_now(c, slot, serial, true);
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(g_free_mu);
+        g_free_q.push_back(DeadImport{std::move(c), slot, serial});
+        c = Chunk{};
+        const std::uint64_t n = g_free_q.size();
+        if (n > g_free_queue_most.load(std::memory_order_relaxed)) g_free_queue_most.store(n, std::memory_order_relaxed);
+        if (!g_free_started) {
+            g_free_started = true;
+            std::thread(import_free_thread).detach();
+        }
+    }
+    g_free_cv.notify_one();
+    const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    g_import_free_cp_us.fetch_add(us, std::memory_order_relaxed);
+    if (us > g_import_free_cp_max_us.load(std::memory_order_relaxed)) g_import_free_cp_max_us.store(us, std::memory_order_relaxed);
+}
 std::atomic<std::uint64_t> g_dispatch_read_imports{0}, g_dispatch_untraced{0};  // window imports of what dispatches read
 
 // An import can fail on a player's machine as well as from a full card: the
@@ -1087,6 +1242,19 @@ bool set_page_locked(std::uint64_t va, std::uint64_t dev) {
 }
 
 // The guest pages over [lo, hi) of chunk `index` - every mapping of them -
+// point at the sink (an idle window let go, BBHOST_IMPORT_RETIRE).
+void map_sink_pages_locked(std::uint32_t index, std::uint64_t lo, std::uint64_t hi) {
+    const std::uint64_t page = 1ull << gcn::kPageShift;
+    const std::uint64_t base = static_cast<std::uint64_t>(index) * kChunkBytes;
+    for (const GuestMapInfo& mi : g.maps) {
+        if (!mi.dmem || !(mi.prot & 1) || mi.len == 0 || (mi.va & (page - 1)) || (mi.len & (page - 1))) continue;
+        const std::uint64_t a = std::max(static_cast<std::uint64_t>(mi.phys), base + lo);
+        const std::uint64_t b = std::min(static_cast<std::uint64_t>(mi.phys) + mi.len, base + hi);
+        for (std::uint64_t phys = a & ~(page - 1); phys < b; phys += page) set_page_locked(mi.va + (phys - static_cast<std::uint64_t>(mi.phys)), g.sink.address);
+    }
+}
+
+// The guest pages over [lo, hi) of chunk `index` - every mapping of them -
 // point into import `c`.
 void map_import_pages_locked(std::uint32_t index, const Chunk& c, std::uint64_t lo, std::uint64_t hi) {
     const std::uint64_t page = 1ull << gcn::kPageShift;
@@ -1259,12 +1427,25 @@ void count_lagging_tables_locked() {
 // job cannot see yet (amdgpu maps a new buffer for the submissions after it) -
 // they keep it until publish_import_tables_locked finds the queue has. The
 // imports neither view names any more retire (host/import_table.h).
+void window_made_locked(std::uint32_t index, std::uint32_t a, std::uint32_t b, int who);  // the census by window, below
 void install_import_locked(std::uint32_t index, Chunk* c) {
     DmemChunk& d = g.dmem[index];
     const std::uint64_t end = std::min(c->lo + c->size, kChunkBytes);
     if (end <= c->lo) return;
     const std::uint32_t a = static_cast<std::uint32_t>(c->lo >> kImportWindowShift);
     const std::uint32_t b = static_cast<std::uint32_t>((end - 1) >> kImportWindowShift);
+    if (g_census) window_made_locked(index, a, b, t_import_who);
+    if (g_retire_mode.load(std::memory_order_relaxed)) {
+        const std::uint64_t now = g_import_now_ms.load(std::memory_order_relaxed);
+        for (std::uint32_t w = a; w <= b; ++w) {
+            d.used_ms[w].store(now, std::memory_order_relaxed);
+            if (d.retired_ms[w]) {  // let go before: imported again (dmem_import counts the paths that asked; here the import thread's)
+                if (t_import_who == kIwPrefetch) ++g_again_prefetch;
+                d.retired_ms[w] = 0;
+            }
+            g_would_ms[index][w] = 0;
+        }
+    }
     c->made_serial = g.flushes;  // the recording open now goes to the queue after it was made
     c->made_ns = host_clock_monotonic_ns();
     bool replaces = false;
@@ -1358,6 +1539,118 @@ void publish_import_tables_locked() {
         g_table_published += done.written;
     }
     count_lagging_tables_locked();
+}
+
+std::int64_t steady_ms();  // below, beside the image heap
+
+// The windows [a, b] of chunk `index` that import `c` holds (in the chunk).
+bool import_windows_of(const Chunk& c, std::uint32_t& a, std::uint32_t& b) {
+    const std::uint64_t end = std::min(c.lo + c.size, kChunkBytes);
+    if (end <= c.lo) return false;
+    a = static_cast<std::uint32_t>(c.lo >> kImportWindowShift);
+    b = static_cast<std::uint32_t>((end - 1) >> kImportWindowShift);
+    return true;
+}
+
+// Idle import `c` of chunk `index` let go (BBHOST_IMPORT_RETIRE=1): its
+// windows' entries at the sink, the windows naming nothing, the import into the
+// current slot's dead imports - freed once the work recorded with it has run.
+void let_go_idle_import_locked(std::uint32_t index, Chunk* c, std::uint64_t now) {
+    DmemChunk& d = g.dmem[index];
+    std::uint32_t a = 0, b = 0;
+    if (!import_windows_of(*c, a, b)) return;
+    const std::uint64_t end = std::min(c->lo + c->size, kChunkBytes);
+    for (std::uint32_t w = a; w <= b; ++w) {
+        const std::uint64_t lo = std::max(c->lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+        const std::uint64_t hi = std::min(end, static_cast<std::uint64_t>(w + 1) << kImportWindowShift);
+        if (d.table[w] == c && hi > lo) map_sink_pages_locked(index, lo, hi);
+        d.table[w] = nullptr;
+        d.window[w] = nullptr;
+        d.retired_ms[w] = now;
+    }
+    ++g_retire_n;
+    g_retire_bytes += c->size;
+    if (g_va_trace) {
+        char det[96];
+        std::snprintf(det, sizeof(det), "chunk %u +0x%llx windows %u-%u: idle, let go", index, static_cast<unsigned long long>(c->lo), a, b);
+        va_note("import let go", c->address, c->size, index, c->lo, det);
+    }
+    retire_import_locked(index, c);  // nothing names it now
+    g_import_retire_gen.fetch_add(1, std::memory_order_relaxed);
+}
+
+// After every submission (submit_locked) - no recording and no run open, and
+// the dead imports go to the slot the next recording fills: the clock the
+// uses stamp, and once a second the window imports none of whose windows was
+// used for BBHOST_IMPORT_RETIRE_S let go (=1) or counted (=2). One a merge's
+// page-table view still moves over, or a copy version names, waits for a later
+// check.
+void retire_idle_imports_locked() {
+    if (!g_retire_mode.load(std::memory_order_relaxed) || imports_whole()) return;
+    const std::uint64_t now = static_cast<std::uint64_t>(std::max<std::int64_t>(steady_ms(), 1));
+    g_import_now_ms.store(now, std::memory_order_relaxed);
+    static std::uint64_t last = 0;
+    if (now - last < 1000) return;
+    last = now;
+    ++g_retire_checks;
+    std::uint64_t idle_now = 0, let_go = 0;
+    std::vector<Chunk*> idle;
+    for (std::uint32_t k = 0; k < gcn::kDmemChunks; ++k) {
+        DmemChunk& d = g.dmem[k];
+        idle.clear();
+        for (const auto& up : d.imports) {
+            Chunk* c = up.get();
+            std::uint32_t a = 0, b = 0;
+            if (!import_windows_of(*c, a, b)) continue;
+            if (!import_retire::idle(d.window, d.table, d.used_ms, a, b, c, now, g_retire.after_ms)) continue;
+            if (copy_versions_name_buffer_locked(c->buffer)) {
+                ++g_retire_skipped;
+                continue;
+            }
+            idle.push_back(c);
+        }
+        for (Chunk* c : idle) {
+            idle_now += c->size;
+            if (g_retire_mode.load(std::memory_order_relaxed) == 1) {
+                if (!import_retire::fits(let_go, g_retire.per_check)) continue;  // the next check's
+                let_go += c->size;
+                let_go_idle_import_locked(k, c, now);
+                continue;
+            }
+            // =2: counted once until a window of it is used again.
+            std::uint32_t a = 0, b = 0;
+            import_windows_of(*c, a, b);
+            bool fresh = false;
+            for (std::uint32_t w = a; w <= b; ++w) {
+                if (g_would_ms[k][w]) continue;
+                g_would_ms[k][w] = now;
+                fresh = true;
+            }
+            if (fresh) {
+                ++g_would_n;
+                g_would_bytes += c->size;
+            }
+        }
+    }
+    if (g_retire_mode.load(std::memory_order_relaxed) == 1) count_lagging_tables_locked();
+    g_would_idle_most = std::max(g_would_idle_most, idle_now);
+}
+
+// A use of [in, in + bytes) of chunk `index`, with BBHOST_IMPORT_RETIRE on:
+// its windows' stamp, and with =2 a window it would have let go imported again.
+void note_windows_used(DmemChunk& d, std::uint32_t index, std::uint64_t in, std::uint64_t bytes) {
+    const std::uint64_t now = g_import_now_ms.load(std::memory_order_relaxed);
+    const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
+    const std::uint32_t w1 = static_cast<std::uint32_t>((std::min(in + std::max<std::uint64_t>(bytes, 1), kChunkBytes) - 1) >> kImportWindowShift);
+    for (std::uint32_t w = w0; w <= w1; ++w) {
+        if (d.used_ms[w].load(std::memory_order_relaxed) != now) d.used_ms[w].store(now, std::memory_order_relaxed);
+        // (=2's count on the command processor alone: a run part's use counts at its commit's.)
+        if (g_retire_mode.load(std::memory_order_relaxed) == 2 && g_would_ms[index][w] && !t_bump_sink) {
+            g_would_ms[index][w] = 0;
+            ++g_would_again_n;
+            g_would_again_bytes += 1ull << kImportWindowShift;
+        }
+    }
 }
 }  // namespace
 
@@ -1453,6 +1746,328 @@ std::string import_idle_report_locked() {
     return buf;
 }
 
+// ---- The census by window (BBHOST_IMPORT_CENSUS=1; off, nothing is counted) ----
+// Every use of direct memory an import answers or is made for (dmem_import),
+// by the 16 MiB window it falls in: the path that asked (t_import_site), what
+// lies at the address it asked for - its owner: GX's upload heap, a GX buffer
+// kept by handle (stage 1b; such a binding took today's path), another GX
+// buffer by kind, a GX texture, the middleware (BBHOST_RESOURCE_CENSUS=1),
+// nothing of GX's - and when. At a report, every window imported: those that
+// serve GX-owned memory alone and those a handle covers - what stage 6 may stop
+// importing - and those a minute (or 3,600 flips) without a use - what retiring
+// idle windows would give back - in bytes, with what lies in them. With whole
+// spans the same uses say which windows window imports would need.
+namespace {
+enum WinOwner : int {
+    kWoHeap,         // GX's upload heap (renamed copies, Map renames, the ring allocator's)
+    kWoKept,         // a GX buffer kept by handle (stage 1b)
+    kWoDynamic,      // a dynamic GX buffer, in its own memory
+    kWoGpuWritten,   // a GX buffer the GPU writes (unordered access, stream output)
+    kWoConstant,     // a GX constant buffer, in its own memory
+    kWoBuffer,       // another GX buffer (default without data, staging)
+    kWoTexture,      // a GX texture
+    kWoYebis,        // YEBIS's device's (BBHOST_RESOURCE_CENSUS=1)
+    kWoScaleform,    // a Scaleform texture's plane (BBHOST_RESOURCE_CENSUS=1)
+    kWoNone,         // no GX object
+    kWoUnnamed,      // the path named no address (the buffer shadow's mirror pages)
+    kWinOwners
+};
+const char* const kWinOwnerName[kWinOwners] = {"GX's upload heap", "a GX buffer kept by handle", "a dynamic GX buffer",
+                                               "a GX buffer the GPU writes", "a GX constant buffer", "another GX buffer", "a GX texture",
+                                               "YEBIS", "Scaleform", "no GX object", "no address named"};
+constexpr std::uint32_t kWoGx = (1u << kWoHeap) | (1u << kWoKept) | (1u << kWoDynamic) | (1u << kWoGpuWritten) | (1u << kWoConstant) |
+                                (1u << kWoBuffer) | (1u << kWoTexture);
+struct WindowUses {
+    std::uint64_t sites = 0;   // bit k: the path in g_site_uses[k] used it
+    std::uint32_t owners = 0;  // bit per WinOwner met at its uses
+    std::uint64_t uses = 0, bytes = 0;
+    std::uint64_t first_ms = 0, last_ms = 0, last_flip = 0;
+    int maker = -1;  // the ImportWho of the first import that covered it (window imports)
+};
+WindowUses g_wuse[gcn::kDmemChunks][kImportWindows];                                    // under g.mu
+std::uint64_t g_wuse_n[kSiteSlots][kWinOwners], g_wuse_bytes[kSiteSlots][kWinOwners];  // by path and owner, under g.mu
+// The uses of GX buffers' memory (a GX buffer kept by handle, another GX buffer) by why the binding took today's path
+// (stage 1b's result, t_import_fall; the last: none asked), under g.mu.
+constexpr int kWinFalls = 12;
+const char* const kWinFallName[kWinFalls] = {"no GX object", "not kept", "a stale handle", "taken back since the call", "retired by a write",
+                                             "past the buffer's end", "no memory for the copy", "its bytes out of reach", "indirect indices",
+                                             "shared with another buffer", "the copies' budget", "none asked, or compared"};
+static_assert(gxvk::kFalls == kWinFalls - 1, "a name for each of stage 1b's results");
+std::uint64_t g_wuse_fall_n[2][kWinFalls], g_wuse_fall_bytes[2][kWinFalls];
+
+int win_owner_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (!va) return kWoUnnamed;
+    if (!bytes) bytes = 1;
+    std::uint64_t lo = 0, hi = 0;
+    if (gxvk::upload_heap(&lo, &hi) && va < hi && va + bytes > lo) return kWoHeap;
+    GxResourceInfo info;
+    if (gx_resource_overlapping(va, bytes, &info) && info.alive) {
+        if (info.type != 1) return kWoTexture;
+        if (gxvk::kept_at(va, bytes)) return kWoKept;
+        if (info.usage == 2) return kWoDynamic;
+        if (info.bind & 0x90) return kWoGpuWritten;
+        if (info.bind & 0x4) return kWoConstant;
+        return kWoBuffer;
+    }
+    const int mw = gx_middleware_at(va, bytes);
+    return mw == 1 ? kWoYebis : mw == 2 ? kWoScaleform : kWoNone;
+}
+
+// A use of [in, in + bytes) of chunk `index` (the caller asks g_census).
+void window_use_locked(std::uint32_t index, std::uint64_t in, std::uint64_t bytes) {
+    if (index >= gcn::kDmemChunks || in >= kChunkBytes) return;
+    if (!bytes) bytes = 1;
+    const int k = site_slot_locked(t_import_site ? t_import_site : "other");
+    const int own = win_owner_locked(t_import_va, bytes);
+    const std::uint64_t now = static_cast<std::uint64_t>(steady_ms()), flip = hle_video_flip_count();
+    const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
+    const std::uint32_t w1 = static_cast<std::uint32_t>((std::min(in + bytes, kChunkBytes) - 1) >> kImportWindowShift);
+    for (std::uint32_t w = w0; w <= w1; ++w) {
+        WindowUses& u = g_wuse[index][w];
+        if (k >= 0) u.sites |= 1ull << k;
+        u.owners |= 1u << own;
+        ++u.uses;
+        if (w == w0) u.bytes += bytes;
+        if (!u.first_ms) u.first_ms = now;
+        u.last_ms = now;
+        u.last_flip = flip;
+    }
+    if (k >= 0) {
+        ++g_wuse_n[k][own];
+        g_wuse_bytes[k][own] += bytes;
+    }
+    if (own == kWoKept || own == kWoBuffer) {
+        const int f = t_import_fall >= 0 && t_import_fall < kWinFalls - 1 ? t_import_fall : kWinFalls - 1;
+        ++g_wuse_fall_n[own == kWoKept ? 0 : 1][f];
+        g_wuse_fall_bytes[own == kWoKept ? 0 : 1][f] += bytes;
+    }
+}
+// Windows [a, b] of chunk `index` covered by an import `who` made (window imports).
+void window_made_locked(std::uint32_t index, std::uint32_t a, std::uint32_t b, int who) {
+    if (index >= gcn::kDmemChunks) return;
+    for (std::uint32_t w = a; w <= b && w < kImportWindows; ++w) {
+        if (g_wuse[index][w].maker < 0) g_wuse[index][w].maker = who;
+    }
+}
+}  // namespace
+
+// The census's lines: a summary at every video memory report; at exit also the
+// uses by path and owner, and every window imported.
+std::string import_window_census_report_locked(bool at_exit) {
+    if (!g_census) return {};
+    using ull = unsigned long long;
+    const auto mib = [](std::uint64_t b) { return static_cast<ull>((b + (1ull << 19)) >> 20); };
+    const std::uint64_t now = static_cast<std::uint64_t>(steady_ms()), flip = hle_video_flip_count();
+    // The windows' classes by what their uses met.
+    enum Cls : int { kClGx, kClHandle, kClMixed, kClNotGx, kClUnnamed, kClNever, kClasses };
+    static const char* const kClName[kClasses] = {"GX-owned alone", "a handle's alone", "GX's and others'", "nothing of GX's",
+                                                  "no address named", "never used"};
+    std::uint64_t n[kClasses] = {}, bytes[kClasses] = {}, idle[kClasses] = {}, idle_f[kClasses] = {};
+    std::uint64_t lies[kGxBytesKinds] = {}, lies_heap = 0, lies_none = 0, windows = 0, wbytes = 0, live = 0;
+    std::uint64_t cls_lies[kClasses][kGxBytesKinds + 2] = {};  // + the heap, + nothing of GX's
+    std::size_t nlive = 0;
+    std::uint64_t heap_lo = 0, heap_hi = 0;
+    const bool have_heap = gxvk::upload_heap(&heap_lo, &heap_hi);
+    static const char* const whos[] = {"a binding", "a device address", "a walk", "the prefetch", "a whole span"};
+    std::string detail;
+    char b[2048];
+    for (std::uint32_t k = 0; k < gcn::kDmemChunks; ++k) {
+        const DmemChunk& d = g.dmem[k];
+        for (const auto& c : d.imports) live += c->size;
+        nlive += d.imports.size();
+        for (std::uint32_t w = 0; w < kImportWindows; ++w) {
+            const Chunk* c = d.window[w];
+            if (!c) continue;
+            const std::uint64_t lo = std::max(c->lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+            const std::uint64_t hi = std::min({c->lo + c->size, static_cast<std::uint64_t>(w + 1) << kImportWindowShift, kChunkBytes});
+            if (hi <= lo) continue;
+            const WindowUses& u = g_wuse[k][w];
+            const std::uint32_t gx = u.owners & kWoGx, other = u.owners & ~kWoGx;
+            const int cls = !u.uses ? kClNever
+                            : !other ? (gx == (1u << kWoKept) ? kClHandle : kClGx)
+                            : !gx    ? (other == (1u << kWoUnnamed) ? kClUnnamed : kClNotGx)
+                                     : kClMixed;
+            ++windows;
+            wbytes += hi - lo;
+            ++n[cls];
+            bytes[cls] += hi - lo;
+            if (!u.last_ms || now - u.last_ms >= kIdleLetGoMs) idle[cls] += hi - lo;
+            if (!u.last_ms || flip - u.last_flip >= 3600) idle_f[cls] += hi - lo;
+            // What lies there: the live resources over its pages, by the first
+            // mapping of each (a page mapped twice counted once).
+            std::uint64_t here[kGxBytesKinds] = {}, here_heap = 0;
+            const std::uint64_t plo = static_cast<std::uint64_t>(k) * kChunkBytes + lo, phi = static_cast<std::uint64_t>(k) * kChunkBytes + hi;
+            struct Piece {
+                std::uint64_t lo, hi, va;  // physical [lo, hi), mapped at va
+            };
+            std::vector<Piece> pieces;
+            for (const GuestMapInfo& mi : g.maps) {
+                if (!mi.dmem || mi.phys < 0) continue;
+                const std::uint64_t mlo = static_cast<std::uint64_t>(mi.phys), mhi = mlo + mi.len;
+                if (mhi <= plo || mlo >= phi) continue;
+                pieces.push_back({std::max(mlo, plo), std::min(mhi, phi), mi.va + (std::max(mlo, plo) - mlo)});
+            }
+            std::sort(pieces.begin(), pieces.end(), [](const Piece& x, const Piece& y) { return x.lo < y.lo; });
+            std::uint64_t covered = plo;
+            for (const Piece& pc : pieces) {
+                const std::uint64_t a = std::max(pc.lo, covered);
+                if (pc.hi <= a) continue;
+                const std::uint64_t va = pc.va + (a - pc.lo), len = pc.hi - a;
+                gx_resources_bytes_by_kind(va, len, here);
+                if (have_heap && va < heap_hi && va + len > heap_lo) here_heap += std::min(va + len, heap_hi) - std::max(va, heap_lo);
+                covered = pc.hi;
+            }
+            std::uint64_t gx_here = here_heap;
+            for (int q = 0; q < kGxBytesKinds; ++q) {
+                lies[q] += here[q];
+                cls_lies[cls][q] += here[q];
+                gx_here += here[q];
+            }
+            lies_heap += here_heap;
+            cls_lies[cls][kGxBytesKinds] += here_heap;
+            const std::uint64_t none_here = hi - lo > gx_here ? hi - lo - gx_here : 0;
+            lies_none += none_here;
+            cls_lies[cls][kGxBytesKinds + 1] += none_here;
+            if (!at_exit) continue;
+            std::string owners, paths;
+            for (int o = 0; o < kWinOwners; ++o) {
+                if (u.owners & (1u << o)) owners += std::string(owners.empty() ? "" : ", ") + kWinOwnerName[o];
+            }
+            for (int s = 0; s < kSiteSlots; ++s) {
+                if ((u.sites >> s) & 1) paths += std::string(paths.empty() ? "" : "; ") + (g_site_uses[s].site ? g_site_uses[s].site : "?");
+            }
+            const int mk = u.maker >= 0 && u.maker < kImportWhos ? u.maker : imports_whole() ? kIwSpan : -1;
+            std::snprintf(b, sizeof(b),
+                          "\n[bbhost]     window %u.%02u (%llu MiB, %s; made by %s): %llu uses (%llu MiB asked), the last %.0f s and %llu "
+                          "flips ago; owners: %s; paths: %s; lies there (MiB): kept-able %llu, dynamic %llu, GPU-written %llu, constant %llu, "
+                          "other buffers %llu, textures %llu, the upload heap %llu",
+                          k, w, mib(hi - lo), kClName[cls], mk >= 0 ? whos[mk] : "?", static_cast<ull>(u.uses), mib(u.bytes),
+                          u.last_ms ? static_cast<double>(now - u.last_ms) / 1e3 : -1.0, static_cast<ull>(u.last_ms ? flip - u.last_flip : 0),
+                          owners.empty() ? "none" : owners.c_str(), paths.empty() ? "none" : paths.substr(0, 400).c_str(), mib(here[0]),
+                          mib(here[1]), mib(here[2]), mib(here[3]), mib(here[4]), mib(here[5]), mib(here_heap));
+            detail += b;
+        }
+    }
+    std::uint64_t flex = 0;
+    for (const auto& kv : g.anon_imports) flex += kv.second.size;
+    std::uint64_t idle_all = 0, idle_f_all = 0;
+    for (int q = 0; q < kClasses; ++q) {
+        idle_all += idle[q];
+        idle_f_all += idle_f[q];
+    }
+    std::snprintf(b, sizeof(b),
+                  "import census by window (BBHOST_IMPORT_CENSUS=1, %s): %llu windows imported now, %llu MiB (live imports %llu MiB in %zu, "
+                  "flexible %llu MiB) - by what their uses met: GX-owned alone %llu (%llu MiB), a handle's alone %llu (%llu), GX's and others' "
+                  "%llu (%llu), nothing of GX's %llu (%llu), no address named %llu (%llu), never used %llu (%llu); idle 60 s or more %llu MiB "
+                  "(GX-owned alone %llu, a handle's %llu, GX's and others' %llu, nothing of GX's %llu, no address %llu, never used %llu), "
+                  "3,600 flips or more %llu MiB\n[bbhost]   import census by window: what lies in the windows imported now (MiB): GX buffers 1b "
+                  "keeps %llu, dynamic %llu, the GPU writes %llu, constant %llu, other %llu, textures %llu, GX's upload heap %llu, nothing of "
+                  "GX's %llu",
+                  imports_whole() ? "whole spans: the windows window imports would need" : "window imports", static_cast<ull>(windows),
+                  mib(wbytes), mib(live), nlive, mib(flex), static_cast<ull>(n[kClGx]), mib(bytes[kClGx]), static_cast<ull>(n[kClHandle]),
+                  mib(bytes[kClHandle]), static_cast<ull>(n[kClMixed]), mib(bytes[kClMixed]), static_cast<ull>(n[kClNotGx]), mib(bytes[kClNotGx]),
+                  static_cast<ull>(n[kClUnnamed]), mib(bytes[kClUnnamed]), static_cast<ull>(n[kClNever]), mib(bytes[kClNever]), mib(idle_all),
+                  mib(idle[kClGx]), mib(idle[kClHandle]), mib(idle[kClMixed]), mib(idle[kClNotGx]), mib(idle[kClUnnamed]), mib(idle[kClNever]),
+                  mib(idle_f_all), mib(lies[0]), mib(lies[1]), mib(lies[2]), mib(lies[3]), mib(lies[4]), mib(lies[5]), mib(lies_heap),
+                  mib(lies_none));
+    std::string out = b;
+    // By import: the live imports idle as a whole (every window of theirs a
+    // minute without a use) - what letting go of whole imports gives back -
+    // and the idle windows inside imports a window of which is still used -
+    // what only splitting an import would.
+    {
+        std::uint64_t whole_n = 0, whole_bytes = 0, held_windows = 0, held_bytes = 0, hot_n = 0;
+        for (std::uint32_t k = 0; k < gcn::kDmemChunks; ++k) {
+            const DmemChunk& d = g.dmem[k];
+            for (const auto& c : d.imports) {
+                const std::uint64_t end = std::min(c->lo + c->size, kChunkBytes);
+                if (end <= c->lo) continue;
+                const std::uint32_t a = static_cast<std::uint32_t>(c->lo >> kImportWindowShift);
+                const std::uint32_t z = static_cast<std::uint32_t>((end - 1) >> kImportWindowShift);
+                std::uint64_t idle_w = 0, idle_wb = 0;
+                bool hot = false;
+                for (std::uint32_t w = a; w <= z; ++w) {
+                    const WindowUses& u = g_wuse[k][w];
+                    const std::uint64_t lo = std::max(c->lo, static_cast<std::uint64_t>(w) << kImportWindowShift);
+                    const std::uint64_t hi = std::min(end, static_cast<std::uint64_t>(w + 1) << kImportWindowShift);
+                    if (!u.last_ms || now - u.last_ms >= kIdleLetGoMs) {
+                        ++idle_w;
+                        idle_wb += hi - lo;
+                    } else {
+                        hot = true;
+                    }
+                }
+                if (!hot) {
+                    ++whole_n;
+                    whole_bytes += c->size;
+                } else {
+                    ++hot_n;
+                    held_windows += idle_w;
+                    held_bytes += idle_wb;
+                }
+            }
+        }
+        std::snprintf(b, sizeof(b),
+                      "\n[bbhost]   import census by window, by import: idle as a whole (every window a minute without a use) %llu imports "
+                      "(%llu MiB); in the %llu imports a window of which was used within the minute, idle windows %llu (%llu MiB)",
+                      static_cast<ull>(whole_n), mib(whole_bytes), static_cast<ull>(hot_n), static_cast<ull>(held_windows), mib(held_bytes));
+        out += b;
+    }
+    if (!at_exit) return out;
+    // What lies in each class's windows.
+    for (int q = 0; q < kClasses; ++q) {
+        if (!n[q]) continue;
+        const std::uint64_t* l = cls_lies[q];
+        std::snprintf(b, sizeof(b),
+                      "\n[bbhost]     the %s windows' %llu MiB hold (MiB): GX buffers 1b keeps %llu, dynamic %llu, the GPU writes %llu, constant "
+                      "%llu, other %llu, textures %llu, GX's upload heap %llu, nothing of GX's %llu",
+                      kClName[q], mib(bytes[q]), mib(l[0]), mib(l[1]), mib(l[2]), mib(l[3]), mib(l[4]), mib(l[5]), mib(l[kGxBytesKinds]),
+                      mib(l[kGxBytesKinds + 1]));
+        out += b;
+    }
+    // The uses by path and owner, the most used path first.
+    std::vector<int> order;
+    for (int s = 0; s < kSiteSlots; ++s) {
+        if (g_site_uses[s].site) order.push_back(s);
+    }
+    std::sort(order.begin(), order.end(), [](int x, int y) {
+        std::uint64_t a = 0, c = 0;
+        for (int o = 0; o < kWinOwners; ++o) a += g_wuse_n[x][o], c += g_wuse_n[y][o];
+        return a > c;
+    });
+    out += "\n[bbhost]     uses an import answered or was made for, by path and what lies at the address:";
+    for (const int s : order) {
+        std::string line;
+        std::uint64_t total = 0;
+        for (int o = 0; o < kWinOwners; ++o) {
+            if (!g_wuse_n[s][o]) continue;
+            total += g_wuse_n[s][o];
+            std::snprintf(b, sizeof(b), "%s%s %llu (%llu MiB)", line.empty() ? "" : ", ", kWinOwnerName[o], static_cast<ull>(g_wuse_n[s][o]),
+                          mib(g_wuse_bytes[s][o]));
+            line += b;
+        }
+        if (!total) continue;
+        std::snprintf(b, sizeof(b), "\n[bbhost]       %s: %llu - %s", g_site_uses[s].site, static_cast<ull>(total), line.c_str());
+        out += b;
+    }
+    for (int kind = 0; kind < 2; ++kind) {
+        std::string line;
+        for (int f = 0; f < kWinFalls; ++f) {
+            if (!g_wuse_fall_n[kind][f]) continue;
+            std::snprintf(b, sizeof(b), "%s%s %llu (%llu MiB)", line.empty() ? "" : ", ", kWinFallName[f], static_cast<ull>(g_wuse_fall_n[kind][f]),
+                          mib(g_wuse_fall_bytes[kind][f]));
+            line += b;
+        }
+        if (line.empty()) continue;
+        std::snprintf(b, sizeof(b), "\n[bbhost]     uses of %s by why the binding took today's path (stage 1b): ", kind ? "another GX buffer" : "a GX buffer kept by handle");
+        out += b;
+        out += line;
+    }
+    out += "\n[bbhost]     the windows imported now, one by one:";
+    out += detail;
+    return out;
+}
+
 // A window whose import failed less than kImportBackoffMs ago is not asked of
 // the driver again (counted); and a failure's time, over its windows.
 bool import_backing_off(const DmemChunk& d, std::uint32_t w0, std::uint32_t w1) {
@@ -1479,7 +2094,10 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
         // windows do not cover lies outside every GPU-visible mapping.
         if (in >= kChunkBytes || bytes > kChunkBytes - in) return nullptr;
         const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
-        if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) return c;
+        if (const Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) {
+            if (g_census) [[unlikely]] window_use_locked(index, in, bytes);
+            return c;
+        }
         if (in < d.span_lo || in + bytes > d.span_hi) return nullptr;  // not GPU-visible: the sink
         if (run_part_stop(kRunStopIndex)) return nullptr;  // imported in order (BBHOST_RUN_COMMIT)
         const std::uint32_t w1 = static_cast<std::uint32_t>((in + bytes - 1) >> kImportWindowShift);
@@ -1503,6 +2121,7 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
             }
             d.window[w] = c;
         }
+        if (g_census) window_use_locked(index, in, bytes);
         return c;
     }
     // Windows (BBHOST_IMPORT_WINDOWS=1): the whole windows the range touches,
@@ -1518,6 +2137,8 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     const std::uint32_t w0 = static_cast<std::uint32_t>(in >> kImportWindowShift);
     if (Chunk* c = d.window[w0]; c && chunk_covers(*c, in, bytes)) {
         idle_note_use_locked(*c);
+        if (g_census) [[unlikely]] window_use_locked(index, in, bytes);
+        if (g_retire_mode.load(std::memory_order_relaxed)) note_windows_used(d, index, in, bytes);
         return c;
     }
     const std::uint64_t reach = past_end ? span_reach(index) : std::min<std::uint64_t>(d.span_hi, kChunkBytes);
@@ -1540,15 +2161,31 @@ const Chunk* dmem_import(std::uint32_t index, std::uint64_t in, std::uint64_t by
     const std::uint32_t wa = static_cast<std::uint32_t>(lo >> kImportWindowShift);
     const std::uint32_t wb = static_cast<std::uint32_t>((std::min(hi, kChunkBytes) - 1) >> kImportWindowShift);
     if (import_backing_off(d, wa, wb)) return nullptr;
+    // A window let go while idle (BBHOST_IMPORT_RETIRE=1), wanted again: the
+    // driver's time of this import is the path's wait for it.
+    bool again = false;
+    if (g_retire_mode.load(std::memory_order_relaxed) == 1) {
+        for (std::uint32_t w = wa; w <= wb; ++w) again |= d.retired_ms[w] != 0;
+    }
+    const auto t_again = again ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Chunk* c = import_span(index, lo, hi);
     if (!c) {
         import_failed_at(d, wa, wb);
         return nullptr;
     }
+    if (again) {
+        const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_again).count());
+        ++g_again_n;
+        g_again_bytes += c->size;
+        g_again_us += us;
+        g_again_max_us = std::max(g_again_max_us, us);
+    }
     note_import_asker_locked(c->size);
     install_import_locked(index, c);
     if (g_idle_census) c->made_ms = static_cast<std::uint64_t>(steady_ms());
     idle_note_use_locked(*c);
+    if (g_census) window_use_locked(index, in, bytes);
+    if (g_retire_mode.load(std::memory_order_relaxed)) note_windows_used(d, index, in, bytes);
     return c;
 }
 
@@ -1651,6 +2288,7 @@ void prefetch_thread() {
         std::uint64_t lo, hi;
     };
     std::vector<Run> runs;
+    std::uint64_t retire_gen = 0;
     for (;;) {
         PrefetchJob job;
         {
@@ -1658,6 +2296,12 @@ void prefetch_thread() {
             g_pf_cv.wait(lk, [] { return !g_pf_jobs.empty(); });
             job = g_pf_jobs.front();
             g_pf_jobs.pop_front();
+        }
+        // A window let go while idle (BBHOST_IMPORT_RETIRE) is imported no more:
+        // what this thread saw imported is looked at again.
+        if (const std::uint64_t gen = g_import_retire_gen.load(std::memory_order_relaxed); gen != retire_gen) {
+            retire_gen = gen;
+            std::fill(std::begin(known), std::end(known), 0);
         }
         if (const std::uint64_t gen = hle_kernel_maps_generation(); gen != maps_gen) {
             maps_gen = gen;
@@ -2542,15 +3186,15 @@ static void shader_caches_check_build() {
 
 // Rebuild the guest page tables when the mapping list changed.
 bool rebuild_page_tables() {
-    static std::uint64_t seen_gen = 0;
+    static std::atomic<std::uint64_t> seen_gen{0};  // (atomic: stage 4b.1b's pool asks it beside the command processor)
     const std::uint64_t gen = hle_kernel_maps_generation();
-    if (gen == seen_gen) {
+    if (gen == seen_gen.load(std::memory_order_acquire)) {
         return true;
     }
     // A run part's draw (BBHOST_RUN_COMMIT): rebuilt in order, by the command
     // processor's commit of it.
     if (run_part_stop(kRunStopTables)) return false;
-    seen_gen = gen;
+    seen_gen.store(gen, std::memory_order_release);
     std::vector<GuestMapInfo> maps;
     hle_kernel_snapshot_maps(maps);
     std::uint64_t h = 1469598103934665603ull;
@@ -2943,10 +3587,21 @@ Located located_in(const GuestMapInfo& mi, std::uint64_t va, std::uint64_t bytes
 }  // namespace
 
 Located locate(std::uint64_t va, std::uint64_t bytes) {
+    // A constant buffer's device-local home (stage 4b.3c, host/gxvk_homes.h): made at the buffer's creation, so no
+    // answer of the order (the census notes none). A range across a home's edge reads guest memory: the home copied
+    // back there and ended first (counted; a copy-back writes its buffer whole).
+    if (gxvk_homes::bind_on()) {
+        Located h;
+        if (homes_holding_locked(va, bytes, &h)) return h;
+        if (homes_straddle_locked(va, bytes)) homes_end_meeting_locked(va, bytes);
+    }
     // A GX buffer the GPU writes, kept as a device-local twin (BBHOST_GX_TWINS=1).
     if (twins_on()) {
         Located t;
-        if (twin_locate_locked(va, bytes, t)) return t;
+        if (twin_locate_locked(va, bytes, t)) {
+            gxvk_lists::note_order(gxvk_lists::kOrderTwin);  // stage 4's census (host/gxvk_lists.h)
+            return t;
+        }
     }
     return locate_guest(va, bytes);
 }
@@ -3038,7 +3693,7 @@ bool g_use_buffer_marker = false;  // VK_AMD_buffer_marker checkpoints (gpu_chec
 struct Candidate {
     VkPhysicalDevice device = VK_NULL_HANDLE;
     std::uint32_t family = 0, queues = 0;
-    bool sparse = false, maint8 = false, swapchain = false, push = false, fault = false, checkpoints = false, buffer_marker = false;
+    bool sparse = false, maint8 = false, maint7 = false, swapchain = false, push = false, fault = false, checkpoints = false, buffer_marker = false;
     bool memory_fd = false, dma_buf = false;
     bool address_report = false;  // VK_EXT_device_address_binding_report (BBHOST_VA_TRACE=2)
     int type_rank = 0;
@@ -3074,6 +3729,7 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
             if (std::strcmp(e.extensionName, "VK_EXT_external_memory_host") == 0) host_import = true;
             if (std::strcmp(e.extensionName, "VK_EXT_memory_budget") == 0) memory_budget = true;
             if (std::strcmp(e.extensionName, "VK_KHR_maintenance8") == 0) c.maint8 = true;
+            if (std::strcmp(e.extensionName, "VK_KHR_maintenance7") == 0) c.maint7 = true;
             if (std::strcmp(e.extensionName, "VK_KHR_push_descriptor") == 0) c.push = true;
             if (std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) c.swapchain = true;
             if (std::strcmp(e.extensionName, "VK_EXT_device_fault") == 0) c.fault = true;
@@ -3357,6 +4013,7 @@ bool init_locked() {
         g.family_queues = c.queues;
         g.has_sparse = c.sparse;
         g.has_maint8 = c.maint8;
+        g.has_maint7 = c.maint7;  // (the feature asked below)
         g.has_push_descriptor = c.push;
         g.has_device_fault = c.fault;
         if (c.address_report && g_va_trace >= 2 && g_va_messenger) {
@@ -3401,6 +4058,22 @@ bool init_locked() {
             g_imports_whole.compare_exchange_strong(undecided, mp.windows ? 0 : 1, std::memory_order_relaxed);
         }
         twins_decide(c.type_rank == 4);
+        homes_decide(g.integrated, host_gpu_memory_policy().device == memory_policy::Device::kSmallVram, g.tight);
+        {
+            // Stage 4b.2's switch follows the homes when it is unset (host/gxvk_lists.h settle). Off by their default,
+            // the homes' own line said why (null: no second line).
+            const bool hb = gxvk_homes::made_on() && gxvk_homes::bind_on();
+            const gxvk_homes::Mode hm = gxvk_homes::env_mode();
+            const char* why = hb                                  ? ""
+                              : hm == gxvk_homes::Mode::kAuto    ? nullptr
+                              : hm == gxvk_homes::Mode::kOff     ? "the constant buffers' homes are off (BBHOST_GXVK_HOMES=0)"
+                              : hm == gxvk_homes::Mode::kCompare ? "the constant buffers' homes are compared, not bound (BBHOST_GXVK_HOMES=compare)"
+                              : hm == gxvk_homes::Mode::kTwins   ? "the constant buffers' homes are twins (BBHOST_GXVK_HOMES=twins)"
+                              : g.integrated                     ? "the homes are off on an integrated GPU"
+                              : g.tight                          ? "the homes are off with tight memory"
+                                                                 : "the homes are off with small video memory";
+            gxvk_lists::settle(hb, why);
+        }
 #if !defined(_WIN32)
         g.can_dmabuf = c.memory_fd && c.dma_buf;
 #endif
@@ -3653,6 +4326,8 @@ bool init_locked() {
              one_queue && one_queue[0] == '1' ? " (BBHOST_VK_QUEUES=1)" : "");
     std::vector<const char*> dext = {"VK_EXT_external_memory_host"};
     if (g.has_maint8) dext.push_back("VK_KHR_maintenance8");
+    if (g.has_maint7 && !segments_secondary()) g.has_maint7 = false;  // (asked only for stage 4b.2's secondaries)
+    if (g.has_maint7) dext.push_back("VK_KHR_maintenance7");
     if (g.has_push_descriptor) dext.push_back("VK_KHR_push_descriptor");
     // VK_EXT_device_fault: on a device loss the driver can tell us the faulting
     // address and what it was doing, which is the difference between "the GPU
@@ -3720,6 +4395,21 @@ bool init_locked() {
         if (q8.maintenance8) {
             fm8.pNext = f13.pNext;
             f13.pNext = &fm8;
+        }
+    }
+    // Stage 4b.2's segments: a pass holds the command processor's own draws and
+    // the pool's secondary command buffers both (VK_RENDERING_CONTENTS_INLINE_BIT_KHR).
+    VkPhysicalDeviceMaintenance7FeaturesKHR fm7{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR};
+    if (g.has_maint7) {
+        VkPhysicalDeviceMaintenance7FeaturesKHR q7{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        qf.pNext = &q7;
+        vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+        g.has_maint7 = q7.maintenance7 == VK_TRUE;
+        if (g.has_maint7) {
+            fm7.maintenance7 = VK_TRUE;
+            fm7.pNext = f13.pNext;
+            f13.pNext = &fm7;
         }
     }
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT feds3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
@@ -4275,9 +4965,12 @@ bool init_locked() {
         }
     }
     g.desc_pool = g.slots[0].pool;
-    // Params ring (host visible), one region per slot.
+    // Params ring (host visible), one region per slot - and with stage 4b.2's
+    // segments a region past them for the pool's secondary command buffers.
+    g.ubo_list_base = kMaxQueued * kStageSlots * static_cast<std::uint32_t>(g.slot_count);
+    g.ubo_list_blocks = gxvk_lists::segments() ? kListParamsBlocks : 0;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = static_cast<VkDeviceSize>(kParamsStride) * kMaxQueued * kStageSlots * g.slot_count;
+    bci.size = static_cast<VkDeviceSize>(kParamsStride) * (g.ubo_list_base + g.ubo_list_blocks);
     bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     vkCreateBuffer(g.device, &bci, nullptr, &g.ubo);
     VkMemoryRequirements req{};
@@ -4380,7 +5073,8 @@ bool init_locked() {
              g.subgroup_stages, (g.subgroup_stages & VK_SHADER_STAGE_VERTEX_BIT) ? "vertex " : "",
              (g.subgroup_stages & VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) ? "tess-eval " : "",
              (g.subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) ? "compute" : "", g.host_pointer_align,
-             g.has_maint8 ? ", maintenance8" : "", g.present_capable ? ", presentable" : "",
+             g.has_maint8 ? (g.has_maint7 ? ", maintenance7, maintenance8" : ", maintenance8") : g.has_maint7 ? ", maintenance7" : "",
+             g.present_capable ? ", presentable" : "",
              g.has_tessellation ? ", tessellation" : "");
     // Before g.ok: the precompile workers wait for it, and their first
     // translations look in the cache. After the device's features went to the
@@ -4498,6 +5192,7 @@ void begin_recording_locked() {
         g.recording = true;
         twins_arm_wanted_locked();  // BBHOST_PARTICLE_TWINS: from this recording's first use of each
         gxvk_begin_recording_locked();  // GX buffers by handle: retired entries taken back
+        homes_begin_recording_locked();  // stage 4b.3c: the homes made and ended since, ended ones taken back
         busy_begin_locked(g.slots[g.slot]);
         gpu_checkpoint(kGpuMarkSubmission, g.flushes * 4 + 1);
         glitch_begin_recording_locked();
@@ -4544,7 +5239,21 @@ void put_params_lines(std::uint8_t* dst, const gcn::StageParams& params) {
 std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescriptorBufferInfo& out) {
     if (draw_ctx()) list_resolve::count(list_resolve::kCtxOutParams);  // BBHOST_DRAW_CONTEXT's census
     std::uint32_t slot;
-    if (RunDraw* const r = t_run_draw; r && r->part) {
+    RunDraw* const r = t_run_draw;
+    if (r && r->list) {
+        // Stage 4b.1b: a list-mode draw keeps its blocks; the splice copies
+        // them into slots of the recording it lands in and puts their offsets
+        // where block k's index k stands now (recorder_splice_list_packet).
+        ListParams& lp = r->list->params;
+        if (lp.n == 2) {
+            if (r->stop < 0) r->stop = kRunStopParams;
+            out = {g.ubo, 1, sizeof(gcn::StageParams)};
+            return 1;
+        }
+        lp.p[lp.n] = params;
+        out = {g.ubo, lp.n, sizeof(gcn::StageParams)};
+        return lp.n++;
+    } else if (r && r->part) {
         // A run part's draw: from its reservation. One past it stops the draw
         // (render.cpp kRunStopParams), which is then committed again in order:
         // the block goes over its own last slot meanwhile.
@@ -4564,6 +5273,10 @@ std::uint32_t alloc_params_slot_locked(const gcn::StageParams& params, VkDescrip
 }
 
 void rewrite_params_slot_locked(const gcn::StageParams& params, const VkDescriptorBufferInfo& slot) {
+    if (RunDraw* const r = t_run_draw; r && r->list) {  // a list-mode draw's kept block (alloc_params_slot_locked)
+        if (slot.offset < r->list->params.n) r->list->params.p[slot.offset] = params;
+        return;
+    }
     put_params_lines(static_cast<std::uint8_t*>(g.ubo_map) + static_cast<std::size_t>(slot.offset), params);
 }
 
@@ -5784,9 +6497,9 @@ bool note_compute_created(const std::string& name, std::uint64_t flip) {
 namespace {
 // The pipeline a dispatch of this program would build under its key, on a
 // precompile worker: from a container (precompile_compute) or a compute
-// record (precompile_compute_recorded). False when it failed or another build
-// had the key.
-bool precompile_compute_key(const std::string& name, const std::vector<std::uint32_t>& words, const gcn::Program& prog, std::uint32_t rsrc1,
+// record (precompile_compute_recorded), with duplicate work distinguished
+// from a translation or driver failure.
+ComputePrecompileResult precompile_compute_key(const std::string& name, const std::vector<std::uint32_t>& words, const gcn::Program& prog, std::uint32_t rsrc1,
                             std::uint32_t rsrc2, const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
                             const std::vector<bool>& modes, std::uint64_t created_flip, std::chrono::steady_clock::time_point t0) {
     const std::uint64_t key = compute_key(fnv1a(words.data(), words.size() * 4), rsrc1, rsrc2, threads, dims, modes);
@@ -5802,7 +6515,7 @@ bool precompile_compute_key(const std::string& name, const std::vector<std::uint
         if (!g_cs_pre.by_key.emplace(key, PrecompiledCompute::Entry{}).second) {  // a dispatch built it first
             r.state = PrecompiledCompute::kDone;
             g_cs_pre.skipped += 1;
-            return false;
+            return ComputePrecompileResult::AlreadyQueued;
         }
         r.state = PrecompiledCompute::kCompiling;
     }
@@ -5900,7 +6613,7 @@ bool precompile_compute_key(const std::string& name, const std::vector<std::uint
                  static_cast<unsigned long long>(us / 1000), standin ? " (unoptimized, standing in)" : "", why.empty() ? "" : ", failed: ",
                  why.c_str());
     }
-    return why.empty();
+    return why.empty() ? ComputePrecompileResult::Built : ComputePrecompileResult::Failed;
 }
 }  // namespace
 
@@ -5940,12 +6653,12 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
 // On a precompile worker: a compute record's pipeline (the pipeline manifest's,
 // a list's), under the key its dispatch made - the record's images and
 // samplers, not a guess from the program.
-bool precompile_compute_recorded(const std::string& name, const std::vector<std::uint32_t>& words, std::uint32_t rsrc1, std::uint32_t rsrc2,
+ComputePrecompileResult precompile_compute_recorded(const std::string& name, const std::vector<std::uint32_t>& words, std::uint32_t rsrc1, std::uint32_t rsrc2,
                                  const std::uint32_t threads[3], const std::vector<std::pair<std::uint32_t, bool>>& dims,
                                  const std::vector<bool>& modes) {
     const auto t0 = std::chrono::steady_clock::now();
     const gcn::Program prog = gcn::decode(words.data(), words.size());
-    if (!prog.errors.empty()) return false;
+    if (!prog.errors.empty()) return ComputePrecompileResult::Failed;
     gcn::TranslateOptions paths_options;  // as paths_for
     paths_options.stage = gcn::Stage::Compute;
     paths_options.rsrc1 = rsrc1;
@@ -6777,10 +7490,7 @@ void retire_slot_locked(int k) {
     vb_race_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
-    for (Chunk& c : sl.dead_imports) {  // window imports a merged one replaced
-        va_note("import freed", c.address, c.size, static_cast<std::uint64_t>(k), sl.serial);
-        free_import(c);
-    }
+    for (Chunk& c : sl.dead_imports) free_dead_import(c, k, sl.serial);  // window imports replaced by a merge or let go while idle
     sl.dead_imports.clear();
     for (DevBuffer& b : sl.garbage) {
         va_note("buffer freed", b.address, b.size, static_cast<std::uint64_t>(k), sl.serial);
@@ -7849,6 +8559,8 @@ std::string video_memory_report_locked(bool at_exit) {
     }
     // The window imports' idle census (BBHOST_IMPORT_IDLE_CENSUS=1).
     if (const std::string idle = import_idle_report_locked(); !idle.empty()) out += "\n[bbhost]   " + idle;
+    // The census by window (BBHOST_IMPORT_CENSUS=1).
+    if (const std::string wc = import_window_census_report_locked(at_exit); !wc.empty()) out += "\n[bbhost]   " + wc;
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     std::snprintf(buf, sizeof(buf), " (the census took %lld us)", static_cast<long long>(us));
     out += buf;
@@ -8587,6 +9299,7 @@ void submit_locked() {
     g.desc_pool = g.slots[g.slot].pool;
     g_submit_ending = false;
     publish_import_tables_locked();  // window imports the queue sees now take over their windows' entries
+    retire_idle_imports_locked();    // idle window imports let go (BBHOST_IMPORT_RETIRE)
     stall_test_wait_locked();  // BBHOST_TEST_GPU_STALL
 }
 
@@ -8784,8 +9497,10 @@ const memory_policy::Policy& host_gpu_memory_policy() {
         sw.small = std::getenv("BBHOST_SMALL_VRAM");
         const std::int64_t free = g_start_free.load();
         const bool nvidia = g_vendor.load() == 0x10de;
+        sw.retire = std::getenv("BBHOST_IMPORT_RETIRE");
         const memory_policy::Policy p = memory_policy::decide(d, kWindowsHost, free > 0 ? static_cast<std::uint64_t>(free) : 0, nvidia, sw);
         host_log("gpu: memory: %s", memory_policy::describe(p, sw).c_str());
+        g_retire_mode.store(p.retire, std::memory_order_relaxed);
         return p;
     }();
     g_policy_known.store(true, std::memory_order_release);
@@ -9607,18 +10322,18 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
     // reaches - every buffer of the walking variant, the walks left in the
     // lean one - are copied back and let go first: the walk reads guest memory.
     if (twins_on()) {
-        const auto release = [&](const gcn::ResourcePath& path, bool pointer, std::uint64_t min_bytes) {
+        const auto release = [&](const gcn::ResourcePath& path, bool pointer, std::uint64_t min_bytes, bool store = false) {
             std::uint32_t v[4]{};
             if (!resolve_resource(path, d.user_data, pointer ? 2 : 4, v)) return;
             const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(pointer ? v[1] : (v[1] & 0xff)) << 32);
             const std::uint32_t stride = pointer ? 0 : (v[1] >> 16) & 0x3fff;
             const std::uint64_t bytes = pointer ? 0 : stride ? std::uint64_t{v[2]} * stride : v[2];
-            if (base) twins_release_locked(base, std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20), 0);
+            if (base) twins_release_locked(base, std::min<std::uint64_t>(std::max(bytes, min_bytes), 64ull << 20), store ? 3 : 0);
         };
         const gcn::TranslateResult& walks = lean ? lean->meta : pl.meta;
         if (!lean) {
-            for (const gcn::BufferBinding& b : pl.meta.buffers) release(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
-            for (const gcn::ResourcePath& p : pl.meta.store_buffers) release(p, false, 16);
+            for (const gcn::BufferBinding& b : pl.meta.buffers) release(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16), b.written);
+            for (const gcn::ResourcePath& p : pl.meta.store_buffers) release(p, false, 16, true);
         }
         for (const gcn::TranslateResult::BufferRead& r : walks.read_buffers) {
             release(r.path, r.pointer, r.pointer ? (r.max_dw ? r.max_dw * 4ull : 64ull << 10) : 16);
@@ -10242,6 +10957,11 @@ void transfer_begin_locked() {
 // records it through rec(), not into the open packet; the barrier goes there too.
 void transfer_order_locked(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize bytes,
                            bool in_place = false) {
+    // A pending twin-home copy (stage 4b.3a(i)) into the bytes this transfer writes: put in place first, as it came first.
+    if (gpu::home_copies_before_transfer_locked(dst, dst_off, bytes)) g_batch_spans.clear();
+    // ...and a pending copy into a home (stage 4b.3c) this transfer reads or writes.
+    if (gpu::homes_pending_locked() && (gpu::homes_before_transfer_locked(dst, dst_off, bytes) || (src && gpu::homes_before_transfer_locked(src, src_off, bytes))))
+        g_batch_spans.clear();
     bool wait = false;
     for (const BatchSpan& s : g_batch_spans) {
         if ((s.buffer == dst && s.lo < dst_off + bytes && dst_off < s.hi) ||
@@ -10263,6 +10983,18 @@ void transfer_order_locked(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, VkD
 void transfer_end_locked() { g.transfers.fetch_add(1); }
 
 }  // namespace
+
+// A buffer copy at this point of the stream, in a transfer batch (stage 4b.3c's homes copied back to their memory).
+bool gpu::copy_in_stream_locked(VkBuffer src, VkDeviceSize so, VkBuffer dst, VkDeviceSize dso, VkDeviceSize bytes) {
+    if (!src || !dst || !bytes) return false;
+    transfer_begin_locked();
+    transfer_order_locked(src, so, dst, dso, bytes);
+    const VkBufferCopy region{so, dso, bytes};
+    DrawCmds* c = DrawCmds::open();
+    if (!c || !c->copy_buffer(src, dst, region)) rec().copy_buffer(src, dst, 1, &region);
+    transfer_end_locked();
+    return true;
+}
 
 namespace gpu {
 
@@ -10336,6 +11068,16 @@ std::atomic<std::uint64_t> g_twin_armed{0};
 // candidate's range, perhaps more (one let go or gone since). Its inserts and
 // erases move its shape, as the live twins' do: the miss filter's rebuild.
 twins::ShapedMap<std::uint64_t> g_twin_armed_ranges;
+// Levels 1 and 2: every candidate's range joins the armed ranges too, so the miss filter answers a binding that meets
+// no candidate and no live twin without the candidates' lock (at level 2 every locate() took it: the copy-backs' homes
+// make thousands of candidates). A candidate the registry makes (twins_buffer_made, no renderer's lock) joins when the
+// next recording begins; one a GPU copy makes, at once. BBHOST_TWIN_FAST_MISS12=0: as before (only level 3's filter).
+std::vector<std::uint64_t> g_twin_arm_q;  // under g_twin_cand_mu
+std::atomic<std::uint64_t> g_twin_arm_q_n{0};
+const bool g_twin_fast_miss12 = [] {
+    const char* e = std::getenv("BBHOST_TWIN_FAST_MISS12");
+    return !(e && e[0] == '0');
+}();
 bool twin_armed_meets_locked(std::uint64_t va, std::uint64_t bytes) { return twins::ranges_meet(g_twin_armed_ranges, va, bytes); }
 // Its range out of the filter, unless an armed candidate (a newer resource's)
 // still holds that memory. Not under g_twin_cand_mu (it takes it).
@@ -10354,6 +11096,35 @@ struct Twin {
     DevBuffer own;
 };
 twins::ShapedMap<Twin> g_twin_live;  // by memory, under g.mu (inserts and erases move its shape: twin_filter.h)
+// The live map's answer for an address - the twin holding it (its memory and entry) and the next twin's memory - kept
+// per thread by address while the map keeps its shape: a binding asks two or three times, and the same buffers are
+// bound draw after draw (at BBHOST_GX_TWINS=2 some 7,000 live twins, ~1,200 twin bindings and ~2,500 refusals a flip,
+// each a walk of the map).
+struct TwinAt {
+    std::uint64_t va = 0, shape = ~0ull;
+    std::uint64_t memory = 0, next = ~0ull;  // the holding twin's memory (twin set), the next twin's memory (~0: none)
+    const Twin* twin = nullptr;
+};
+thread_local TwinAt t_twin_at[256];
+const TwinAt& twin_live_at_locked(std::uint64_t va) {
+    TwinAt& a = t_twin_at[(va >> 4) & 255];
+    const std::uint64_t shape = g_twin_live.shape();
+    if (a.shape == shape && a.va == va) return a;
+    a.va = va;
+    a.shape = shape;
+    a.twin = nullptr;
+    a.memory = 0;
+    auto it = g_twin_live.upper_bound(va);
+    a.next = it != g_twin_live.end() ? it->first : ~0ull;
+    if (it != g_twin_live.begin()) {
+        --it;
+        if (va < it->first + it->second.bytes) {
+            a.twin = &it->second;
+            a.memory = it->first;
+        }
+    }
+    return a;
+}
 enum { kTwinGoneWalk, kTwinGoneEdge, kTwinGoneDead, kTwinGoneFill, kTwinGoneTexture, kTwinGoneCpuMapped, kTwinGoneWhys };
 std::atomic<std::uint64_t> g_twin_cands{0}, g_twin_made{0}, g_twin_made_bytes{0}, g_twin_served{0}, g_twin_addresses{0},
     g_twin_refused{0}, g_twin_partial{0}, g_twin_edge_in_pass{0}, g_twin_edge_ended_pass{0}, g_twin_gone[kTwinGoneWhys], g_twin_copy_cands{0},
@@ -10617,8 +11388,10 @@ bool twin_filter_misses_locked(std::uint64_t va, std::uint64_t bytes) {
 }
 }  // namespace
 
-bool twins_on() { return g_twins.load(std::memory_order_relaxed) != 0; }
+// (Stage 4b.3c's homes count: every path that asks the twins asks the homes first.)
+bool twins_on() { return g_twins.load(std::memory_order_relaxed) != 0 || gxvk_homes::bind_on(); }
 bool twins_settled_locked() {
+    if (!homes_settled_locked()) return false;  // (stage 4b.3c's homes: their events drained first)
     if (!g_twins) return true;
     if (twins_drop_pending_locked()) return false;
     if (g_twin_fast_miss != kFastMissOff) g_twin_filter.refresh(g_twin_live, g_twin_armed_ranges);
@@ -10634,7 +11407,11 @@ void twins_decide(bool discrete) {
     const char* cap_w = std::getenv("BBHOST_CAPTURE_DRAW");
     const bool capture = (cap_d && cap_d[0]) || (cap_w && cap_w[0]);
     const bool on = !capture && (p && p[0] == '1' ? true : discrete);
-    if (!g_twins.compare_exchange_strong(undecided, on ? 3 : 0)) return;  // set already (BBHOST_GX_TWINS, or =0)
+    // Stage 4b.3a(i) (BBHOST_GXVK_HOMES=1, host/cb_capture.h): the copy-backs' homes device-local too - level 2 - on a
+    // discrete GPU, unless BBHOST_GX_TWINS says otherwise.
+    const bool homes = on && discrete && gxvk_homes::env_mode() == gxvk_homes::Mode::kTwins;
+    if (!g_twins.compare_exchange_strong(undecided, homes ? 2 : on ? 3 : 0)) return;  // set already (BBHOST_GX_TWINS, or =0)
+    if (homes) host_log("gpu: GX buffers the GPU writes, and the copy-backs' homes, as device-local twins (BBHOST_GX_TWINS=2: BBHOST_GXVK_HOMES=twins)");
     host_log("gpu: the GPU particles' buffers %s (BBHOST_PARTICLE_TWINS%s)",
              on ? "as device-local twins once a dispatch that counts binds them" : "in guest memory",
              p && p[0] ? (p[0] == '1' ? "=1" : "=0") : capture ? ": off under a capture" : discrete ? ": on for a discrete GPU" : ": off on this GPU");
@@ -10655,6 +11432,15 @@ void twins_want_locked(std::uint64_t va) {
 }
 
 void twins_arm_wanted_locked() {
+    if (g_twin_arm_q_n.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(g_twin_cand_mu);
+        for (const std::uint64_t memory : g_twin_arm_q) {
+            if (auto c = g_twin_cand.find(memory); c != g_twin_cand.end() && c->second.armed && !c->second.let_go)
+                g_twin_armed_ranges.assign(memory, memory + c->second.bytes);
+        }
+        g_twin_arm_q.clear();
+        g_twin_arm_q_n.store(0, std::memory_order_relaxed);
+    }
     if (g_twin_want.empty()) return;
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
     for (const std::uint64_t memory : g_twin_want) {
@@ -10675,7 +11461,8 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     // (BBHOST_RUN_COMMIT) owes no drop: the fork settled them, and one owed
     // since is for a buffer let go after this run was submitted.
     const bool part = run_part();
-    if (g_twins.load(std::memory_order_relaxed) == 3 && (part || !twins_drop_pending_locked()) && twin_filter_misses_locked(va, bytes))
+    if ((g_twins.load(std::memory_order_relaxed) == 3 || g_twin_fast_miss12) && (part || !twins_drop_pending_locked()) &&
+        twin_filter_misses_locked(va, bytes))
         return false;
     if (!part) {
         twins_drain_gone_locked();
@@ -10684,15 +11471,14 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     // Inside a live twin (the common case): served without the candidates'
     // lock or the registry - a twin lives until its buffer is gone, let go or
     // mapped in place by the CPU, which drop it.
-    if (auto lt = g_twin_live.upper_bound(va); lt != g_twin_live.begin()) {
-        --lt;
-        const std::uint64_t m = lt->first;
-        if (va >= m && va + bytes <= m + lt->second.bytes) {
-            out.buffer = lt->second.buffer;
-            out.offset = lt->second.offset + (va - m);
-            out.avail = lt->second.bytes - (va - m);
+    if (const TwinAt& lt = twin_live_at_locked(va); lt.twin) {
+        const std::uint64_t m = lt.memory;
+        if (va >= m && va + bytes <= m + lt.twin->bytes) {
+            out.buffer = lt.twin->buffer;
+            out.offset = lt.twin->offset + (va - m);
+            out.avail = lt.twin->bytes - (va - m);
             if (address) {
-                *address = lt->second.address + (va - m);
+                *address = lt.twin->address + (va - m);
                 g_twin_addresses.fetch_add(1, std::memory_order_relaxed);
             } else {
                 g_twin_served.fetch_add(1, std::memory_order_relaxed);
@@ -10838,6 +11624,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
 }
 
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (gxvk_homes::bind_on() && homes_meet_locked(va, bytes)) return true;  // a home's guest bytes are stale too (stage 4b.3c)
     if (!g_twins || g_twin_live.empty() || !bytes) return false;
     const bool part = run_part();  // (BBHOST_RUN_COMMIT: as twin_locate_locked)
     if ((part || !twins_drop_pending_locked()) && twin_filter_misses_locked(va, bytes)) return false;  // meets no live twin
@@ -10847,23 +11634,35 @@ bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
         twins_drain_gone_locked();
         twins_drop_cpu_mapped_locked();
     }
-    auto it = g_twin_live.upper_bound(va);
-    const bool any = (it != g_twin_live.begin() && va < std::prev(it)->first + std::prev(it)->second.bytes) ||
-                     (it != g_twin_live.end() && it->first < va + bytes);
+    const TwinAt& a = twin_live_at_locked(va);
+    const bool any = a.twin || a.next < va + bytes;
     if (any) g_twin_refused.fetch_add(1, std::memory_order_relaxed);
     return any;
 }
 
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (gxvk_homes::bind_on() && homes_holding_locked(va, bytes, nullptr)) return true;  // its writes leave guest memory too
     if (!g_twins || g_twin_live.empty() || !bytes) return false;
     if (twin_filter_misses_locked(va, bytes)) return false;  // meets no live twin
-    auto it = g_twin_live.upper_bound(va);
-    if (it == g_twin_live.begin()) return false;
-    --it;
-    return va >= it->first && va + bytes <= it->first + it->second.bytes;
+    const TwinAt& a = twin_live_at_locked(va);
+    return a.twin && va + bytes <= a.memory + a.twin->bytes;
+}
+
+bool twin_live_holding_locked(std::uint64_t va, std::uint64_t bytes, Located& out) {
+    if (!g_twins || g_twin_live.empty() || !bytes) return false;
+    // (A twin whose buffer died, or that the CPU now maps in place, is dropped first, as twin_locate_locked does.)
+    twins_drain_gone_locked();
+    twins_drop_cpu_mapped_locked();
+    const TwinAt& a = twin_live_at_locked(va);
+    if (!a.twin || va + bytes > a.memory + a.twin->bytes) return false;
+    out.buffer = a.twin->buffer;
+    out.offset = a.twin->offset + (va - a.memory);
+    out.avail = a.twin->bytes - (va - a.memory);
+    return true;
 }
 
 bool twin_candidate_straddles(std::uint64_t va, std::uint64_t bytes) {
+    if (gxvk_homes::bind_on() && homes_straddle_locked(va, bytes)) return true;
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
     if (g_twins.load(std::memory_order_relaxed) == 3 && (twin_filter_misses_locked(va, bytes) || !twin_armed_meets_locked(va, bytes)))
         return false;  // (callers hold g.mu)
@@ -10901,6 +11700,7 @@ void twin_note_copy_target_locked(std::uint64_t dst, std::uint64_t bytes) {
     if (g_twin_cpu_mapped.count(info.gen)) return;
     g_twin_cand[info.memory] = TwinCandidate{info.bytes, info.gen, false};
     g_twin_cand_n.store(g_twin_cand.size(), std::memory_order_relaxed);
+    if (g_twin_fast_miss12) g_twin_armed_ranges.assign(info.memory, info.memory + info.bytes);  // (the miss filter's: levels 1-2)
     g_twin_copy_cands.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -10943,6 +11743,7 @@ void twin_note_import_near_locked(std::uint64_t va, std::uint64_t bytes, const c
 }
 
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes) {
+    if (gxvk_homes::bind_on() && homes_holding_locked(va, bytes, nullptr)) return true;
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return false;
     if (g_twins.load(std::memory_order_relaxed) == 3 && (twin_filter_misses_locked(va, bytes) || !twin_armed_meets_locked(va, bytes)))
         return false;  // (callers hold g.mu)
@@ -10954,6 +11755,13 @@ bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes) {
 }
 
 void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why) {
+    // A home a walk or a texture reads is copied back to its memory, and stays the home; one a walk's stores reach ends
+    // (`why` 3: the stores go to guest memory) - stage 4b.3c.
+    if (gxvk_homes::bind_on()) {
+        if (why == 3) homes_end_meeting_locked(va, bytes);
+        else homes_sync_locked(va, bytes, 0);
+    }
+    if (why == 3) why = 0;
     if (!g_twins || g_twin_live.empty() || !bytes) return;
     std::uint64_t hit[8];
     int n = 0;
@@ -10964,6 +11772,7 @@ void twins_release_locked(std::uint64_t va, std::uint64_t bytes, int why) {
 }
 
 void twins_keep_in_guest_locked(std::uint64_t va, std::uint64_t bytes) {
+    if (gxvk_homes::bind_on()) homes_sync_locked(va, bytes, 2);  // (a CPU reader: the homes' bytes there first)
     if (!g_twins || !bytes || !g_twin_cand_n.load(std::memory_order_relaxed)) return;
     twins_release_locked(va, bytes, 0);
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
@@ -11062,6 +11871,10 @@ void twins_buffer_made(std::uint64_t memory, std::uint64_t bytes, std::uint8_t u
     std::lock_guard<std::mutex> lk(g_twin_cand_mu);
     g_twin_cand[memory] = TwinCandidate{bytes, gen, false, level == 1 || level == 2};
     g_twin_cand_n.store(g_twin_cand.size(), std::memory_order_relaxed);
+    if ((level == 1 || level == 2) && g_twin_fast_miss12) {  // its range for the miss filter at the next recording's start
+        g_twin_arm_q.push_back(memory);
+        g_twin_arm_q_n.store(g_twin_arm_q.size(), std::memory_order_release);
+    }
 }
 
 // BBHOST_ARENA_WATCH: the last deferred writes replayed, with where each
@@ -11334,6 +12147,11 @@ void record_copy_order_barrier(VkCommandBuffer cmd) {
 // they do not.
 VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes) {
     if (!bytes || !hle_kernel_va_mapped(va, bytes) || !rebuild_page_tables()) return 0;
+    if (gxvk_homes::bind_on()) {  // a home (stage 4b.3c): its device address; across its edge, copied back and ended
+        VkDeviceAddress at = 0;
+        if (homes_holding_locked(va, bytes, nullptr, &at)) return at;
+        if (homes_straddle_locked(va, bytes)) homes_end_meeting_locked(va, bytes);
+    }
     if (twins_on()) {
         Located t;
         VkDeviceAddress at = 0;
@@ -11385,7 +12203,7 @@ void host_gpu_set_compile_session(bool on) {
 }
 HostShaderCompileProgress host_gpu_compile_progress() {
     HostShaderCompileProgress p;
-    gpu::compile_session_progress(p.total, p.done, p.failed, p.listed, p.finished, p.reasons, p.recipes_total, p.recipes_done);
+    gpu::compile_session_progress(p.total, p.done, p.failed, p.deferred, p.listed, p.finished, p.reasons, p.recipes_total, p.recipes_done);
     return p;
 }
 void host_gpu_compile_cancel() { gpu::compile_session_cancel(); }
@@ -11567,6 +12385,7 @@ bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t b
     const ImportSite site("a label or CP write");
     if (!g.ok || bytes > 65536) return false;
     if (serial) *serial = g.flushes;  // the submission this write is recorded into
+    if (bytes <= 8) gxvk::arena_label(va, bytes, g.flushes);  // BBHOST_GXVK_COPYBACK_CHECK: a block's retire (a no-op without it)
     if (hle_gnm_arena_monitor() && hle_gx_arena_covers_marker(va, bytes)) {
         std::uint64_t v = 0;
         std::memcpy(&v, data, bytes < 8 ? bytes : 8);
@@ -11825,11 +12644,24 @@ std::uint64_t host_gpu_guest_copy_targets() { return g_guest_copy_targets.load(s
 constexpr std::size_t kStagedCopyMax = 4u << 20;
 std::atomic<std::uint64_t> g_copy_src_staged{0}, g_copy_src_staged_bytes{0};
 
-bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen, std::uint64_t dst_gen) {
+namespace {
+// Stage 4b.3a(i): the copy-back captures' ring (host/cb_capture.h), made at the first copy token with the captures on.
+gpu::DevBuffer g_capture_ring;  // under g.mu
+bool g_capture_ring_tried = false;
+}  // namespace
+
+bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen, std::uint64_t dst_gen,
+                         std::uint32_t cap_at, std::uint32_t cap_piece) {
     std::lock_guard<GpuMutex> lock(g.mu);
     if (!g.ok) return false;
     if (!bytes) return true;
     if (dst < src + bytes && src < dst + bytes) return false;
+    // BBHOST_GXVK_HOMES=compare (stage 4b.3c): a home this copy writes takes its bytes too (=1 finds the home by
+    // locate below, and the copy lands there on the GPU).
+    if (gxvk_homes::env_mode() == gxvk_homes::Mode::kCompare && gxvk_homes::made_on() && hle_kernel_va_mapped(src, bytes)) {
+        const bool captured = cap_at != cb_capture::kNone && g_capture_ring.buffer && cb_capture::piece_live(cap_piece);
+        homes_copy_in_staged_locked(dst, bytes, captured ? cb_capture::bytes_at(cap_at) : reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src)));
+    }
     note_gpu_write_over_marker("guest copy", dst, src, bytes);
     bool skip_target = false, by_resource = src_gen && copy_by_resource_on();
     if (by_resource) {
@@ -11907,8 +12739,14 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
     // its bytes as this point in the stream has them, the pending versions
     // laid over guest memory's - and needs no import.
     Located staged;
-    if (!imports_whole() && bytes <= kStagedCopyMax && !twin_covers_locked(src, bytes) && !gpu_writes_pending_locked(src, bytes) &&
-        !find_render_target(src) && !surfaces_may_cover_locked(src, bytes)) {
+    // A copy-back captured at the GX resolve (stage 4b.3a(i)): its capture is the source - never the rename, which GX may
+    // have taken back by the time this copy runs.
+    if (cap_at != cb_capture::kNone && g_capture_ring.buffer && cb_capture::piece_live(cap_piece)) {
+        staged = {g_capture_ring.buffer, cb_capture::offset(cap_at), bytes};
+        cb_capture::bound(cap_piece, g.flushes);
+        cb_capture::count(cb_capture::kUseGuestCopy);
+    } else if (!imports_whole() && bytes <= kStagedCopyMax && !twin_covers_locked(src, bytes) && !gpu_writes_pending_locked(src, bytes) &&
+               !find_render_target(src) && !surfaces_may_cover_locked(src, bytes)) {
         DevBuffer sb;
         VkDeviceSize so = 0;
         if (acquire_staging_locked(sb, bytes, so)) {
@@ -11968,8 +12806,47 @@ struct CopyVersion {
     DevBuffer copy;  // its map is the bytes
     VkDeviceSize offset = 0;
     Located canon;   // where they belong
+    // Stage 1d.2a (BBHOST_GXVK_HEAP_COPY): the source in GX's upload heap. With
+    // `heap` the version is that range itself - `copy` its import, its map the
+    // guest bytes - held by the arena's release proof until this submission has
+    // completed; with =compare (`check`) the copy is today's and is compared
+    // with the source at the batch.
+    std::uint64_t src = 0;
+    bool heap = false, check = false;
+    bool ring = false;  // stage 4b.3a(i): `copy` is the copy-back's capture in the captures' ring (no CPU copy)
 };
 std::vector<CopyVersion> g_copy_versions;  // under g.mu: the pending ones, oldest first
+// ---- Stage 4b.3a(i): a copy-back into a twin home as a GPU copy from its capture (BBHOST_GXVK_HOMES=1) ----
+// The captures' ring (host/cb_capture.h: the GX threads write it at the resolve, the GPU reads it), made at the first
+// copy token with the captures on. A copy-back whose home is a live device-local twin (BBHOST_GX_TWINS=2) is copied
+// ring -> twin in stream order: at the token when no pass is open (into the open transfer batch), else when the pass
+// ends - a binding of the home before that, in the same pass, binds the capture as it would a copy version. From the
+// next pass on a binding of the home is the twin, by handle: no version, no GPU write to ask about.
+struct HomeCopy {
+    std::uint64_t dst = 0, bytes = 0;
+    VkDeviceSize ring_off = 0;
+    Located twin;
+};
+std::vector<HomeCopy> g_home_copies;  // under g.mu: pending until the next pass starts, oldest first
+std::uint64_t g_hc_lo = ~0ull, g_hc_hi = 0;
+// The same by destination (index into g_home_copies), and the longest: a binding's lookup is a binary search.
+std::vector<std::pair<std::uint64_t, std::uint32_t>> g_hc_sorted;
+std::uint64_t g_hc_maxlen = 0;
+void home_copies_index_rebuild() {
+    g_hc_sorted.clear();
+    g_hc_maxlen = 0;
+    g_hc_lo = ~0ull;
+    g_hc_hi = 0;
+    for (std::uint32_t i = 0; i < g_home_copies.size(); ++i) {
+        const HomeCopy& h = g_home_copies[i];
+        g_hc_sorted.emplace_back(h.dst, i);
+        g_hc_maxlen = std::max(g_hc_maxlen, h.bytes);
+        g_hc_lo = std::min(g_hc_lo, h.dst);
+        g_hc_hi = std::max(g_hc_hi, h.dst + h.bytes);
+    }
+    std::sort(g_hc_sorted.begin(), g_hc_sorted.end());
+}
+std::atomic<std::uint64_t> g_hc_bound{0}, g_hc_straddled{0}, g_hc_batches{0}, g_hc_copies{0}, g_hc_overwritten{0}, g_hc_now{0}, g_hc_pending{0};
 // The same by destination, for lookups at every binding: a scan of the list
 // was a tenth of the command processor (BBHOST_COPY_VERSIONS=2, ~80 pending).
 struct CopyVersionKey {
@@ -12019,7 +12896,106 @@ void copy_version_add(const CopyVersion& v) {
 }
 }  // namespace
 
-bool copy_versions_pending_locked() { return !g_copy_versions.empty(); }
+bool copy_versions_pending_locked() { return !g_copy_versions.empty() || !g_home_copies.empty() || homes_pending_locked(); }
+
+namespace {
+// Whether a pending twin-home copy writes [off, off + bytes) of `buffer` (a transfer about to write it waits for them).
+bool home_copies_write_locked(VkBuffer buffer, VkDeviceSize off, VkDeviceSize bytes) {
+    for (const HomeCopy& h : g_home_copies) {
+        if (h.twin.buffer == buffer && h.twin.offset < off + bytes && off < h.twin.offset + h.bytes) return true;
+    }
+    return false;
+}
+}  // namespace
+
+// The pending twin-home copies into their twins: a batch of their own, as the versions' (no pass is open; the callers
+// see to it). Newest first, each byte from the newest copy that has it: copies in one batch run in any order.
+void home_copies_flush_locked() {
+    homes_flush_locked();  // stage 4b.3c's copies into homes: a batch of their own, at the same points
+    if (g_home_copies.empty()) return;
+    begin_recording_locked();  // made between recordings, their copies go in the next
+    std::vector<HomeCopy> pending;
+    pending.swap(g_home_copies);
+    g_hc_lo = ~0ull;
+    g_hc_hi = 0;
+    g_hc_sorted.clear();
+    g_hc_maxlen = 0;
+    std::optional<DrawCmds> own;
+    if (!DrawCmds::open() && !stream_on()) own.emplace(!g.profile && !g.has_checkpoints);  // with the stream, ops of their own
+    if (DrawCmds* c = DrawCmds::open(); !c || !c->transfer_begin()) rec().transfer_barrier(true);
+    static std::map<std::uint64_t, std::uint64_t> covered;  // start -> end, disjoint, of the newer copies
+    covered.clear();
+    std::size_t copies = 0;
+    for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+        const HomeCopy& h = *it;
+        const std::uint64_t end = h.dst + h.bytes;
+        auto copy_piece = [&](std::uint64_t lo, std::uint64_t hi) {
+            const VkBufferCopy region{h.ring_off + (lo - h.dst), h.twin.offset + (lo - h.dst), hi - lo};
+            DrawCmds* c = DrawCmds::open();
+            if (!c || !c->copy_buffer(g_capture_ring.buffer, h.twin.buffer, region))
+                rec().copy_buffer(g_capture_ring.buffer, h.twin.buffer, 1, &region);
+            transfer_end_locked();
+            ++copies;
+        };
+        auto c = covered.upper_bound(h.dst);
+        if (c != covered.begin() && std::prev(c)->second > h.dst) --c;
+        for (std::uint64_t at = h.dst; at < end;) {
+            if (c == covered.end() || c->first >= end) {
+                copy_piece(at, end);
+                break;
+            }
+            if (c->first > at) copy_piece(at, c->first);
+            at = std::max(at, c->second);
+            ++c;
+        }
+        std::uint64_t lo = h.dst, hi = end;
+        auto m = covered.upper_bound(lo);
+        if (m != covered.begin() && std::prev(m)->second >= lo) --m;
+        while (m != covered.end() && m->first <= hi) {
+            lo = std::min(lo, m->first);
+            hi = std::max(hi, m->second);
+            m = covered.erase(m);
+        }
+        covered.emplace(lo, hi);
+    }
+    if (DrawCmds* c = DrawCmds::open(); !c || !c->transfer_end()) rec().transfer_barrier(false);
+    g_hc_overwritten.fetch_add(pending.size() > copies ? pending.size() - copies : 0, std::memory_order_relaxed);
+    g_hc_batches.fetch_add(1, std::memory_order_relaxed);
+    g_hc_copies.fetch_add(copies, std::memory_order_relaxed);
+}
+
+bool home_copies_before_transfer_locked(VkBuffer dst, VkDeviceSize off, VkDeviceSize bytes) {
+    if (g_home_copies.empty() || !home_copies_write_locked(dst, off, bytes)) return false;
+    home_copies_flush_locked();
+    return true;
+}
+
+namespace {
+int home_copy_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out) {
+    if (g_home_copies.empty() || !bytes || base + bytes <= g_hc_lo || base >= g_hc_hi) return kCopyVersionNone;
+    // The newest pending copy sharing bytes with the binding: those starting within the longest's reach below it.
+    const std::uint64_t from = base > g_hc_maxlen ? base - g_hc_maxlen + 1 : 0;
+    auto it = std::lower_bound(g_hc_sorted.begin(), g_hc_sorted.end(), std::make_pair(from, std::uint32_t{0}));
+    const HomeCopy* best = nullptr;
+    std::uint32_t best_i = 0;
+    for (; it != g_hc_sorted.end() && it->first < base + bytes; ++it) {
+        const HomeCopy& h = g_home_copies[it->second];
+        if (h.dst + h.bytes <= base) continue;
+        if (!best || it->second > best_i) {
+            best = &h;
+            best_i = it->second;
+        }
+    }
+    if (!best) return kCopyVersionNone;
+    if (base < best->dst || base + bytes > best->dst + best->bytes) {
+        g_hc_straddled.fetch_add(1, std::memory_order_relaxed);
+        return kCopyVersionStraddles;
+    }
+    if (out) *out = {g_capture_ring.buffer, best->ring_off + (base - best->dst), best->bytes - (base - best->dst)};
+    g_hc_bound.fetch_add(1, std::memory_order_relaxed);
+    return kCopyVersionInside;
+}
+}  // namespace
 
 void copy_versions_pass_end_locked() {
     if (g_copy_versions_mode == 1) copy_versions_flush_locked();
@@ -12027,13 +13003,19 @@ void copy_versions_pass_end_locked() {
 
 std::atomic<std::uint64_t> g_cv_put[kCvPutReasons] = {};
 void copy_versions_put_in_place_locked(int why) {
-    if (g_copy_versions.empty()) return;
+    if (g_copy_versions.empty() && g_home_copies.empty() && !homes_pending_locked()) return;
     g_cv_put[why].fetch_add(1, std::memory_order_relaxed);
     render_end_pass_locked();
+    home_copies_flush_locked();
     copy_versions_flush_locked();
 }
 
 bool copy_versions_overlap_locked(std::uint64_t lo, std::uint64_t hi) {
+    if (!g_home_copies.empty() && hi > g_hc_lo && lo < g_hc_hi) {
+        for (const HomeCopy& h : g_home_copies) {
+            if (h.dst < hi && h.dst + h.bytes > lo) return true;
+        }
+    }
     if (g_copy_versions.empty() || hi <= g_cv_lo || lo >= g_cv_hi) return false;
     for (const CopyVersion& v : g_copy_versions) {
         if (v.dst < hi && v.dst + v.bytes > lo) return true;
@@ -12042,6 +13024,9 @@ bool copy_versions_overlap_locked(std::uint64_t lo, std::uint64_t hi) {
 }
 
 bool copy_versions_into_locked(VkBuffer buffer, VkDeviceSize lo, VkDeviceSize hi) {
+    for (const HomeCopy& h : g_home_copies) {
+        if (h.twin.buffer == buffer && h.twin.offset < hi && h.twin.offset + h.bytes > lo) return true;
+    }
     for (const CopyVersion& v : g_copy_versions) {
         if (v.canon.buffer == buffer && v.canon.offset < hi && v.canon.offset + v.bytes > lo) return true;
     }
@@ -12050,12 +13035,21 @@ bool copy_versions_into_locked(VkBuffer buffer, VkDeviceSize lo, VkDeviceSize hi
 
 bool copy_versions_name_buffer_locked(VkBuffer buffer) {
     for (const CopyVersion& v : g_copy_versions) {
-        if (v.canon.buffer == buffer) return true;
+        if (v.canon.buffer == buffer || (v.heap && v.copy.buffer == buffer)) return true;  // (a heap version reads its import, 1d.2a)
     }
     return false;
 }
 
-int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out) {
+int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out, std::uint64_t* heap_src) {
+    if (heap_src) *heap_src = 0;
+    // A copy into a home still to land in this pass (stage 4b.3c): no version is made over a home. (Asked only while
+    // the homes bind: with them off this lookup is what it was before them.)
+    if (gxvk_homes::bind_on()) {
+        if (const int h = homes_pending_lookup_locked(base, bytes, out); h != kCopyVersionNone) return h;
+    }
+    // A twin home's copy pending in this pass (stage 4b.3a(i)) is newer than any version over it: versions are made only
+    // for homes that are not live twins, and a twin made since takes no version's copy.
+    if (const int h = home_copy_lookup_locked(base, bytes, out); h != kCopyVersionNone) return h;
     if (g_copy_versions.empty() || !bytes) return kCopyVersionNone;
     const CopyVersion* v = copy_version_over(base, bytes);
     if (!v) return kCopyVersionNone;
@@ -12067,7 +13061,14 @@ int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located*
         *out = {v->copy.buffer, v->offset + (base - v->dst), v->bytes - (base - v->dst)};
         g_cv_bound.fetch_add(1, std::memory_order_relaxed);
     }
+    if (heap_src && (v->heap || v->check)) *heap_src = v->src + (base - v->dst);
     return kCopyVersionInside;
+}
+
+const void* copy_version_bytes_locked(std::uint64_t base, std::uint64_t bytes) {
+    const CopyVersion* v = copy_version_over(base, bytes);
+    if (!v || base < v->dst || base + bytes > v->dst + v->bytes || !v->copy.map) return nullptr;
+    return static_cast<const std::uint8_t*>(v->copy.map) + (base - v->dst);
 }
 
 void copy_versions_overlay_locked(std::uint64_t base, std::uint64_t bytes, std::uint8_t* to) {
@@ -12078,7 +13079,7 @@ void copy_versions_overlay_locked(std::uint64_t base, std::uint64_t bytes, std::
     }
 }
 
-bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_t bytes) {
+bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_t bytes, const CopyCapture* cap) {
     // Outside a pass the copy ends nothing; inside an open transfer batch it
     // costs nothing more, and a later transfer of the batch could read it.
     if (!g_copy_versions_mode || (g_copy_versions_mode == 1 && !render_pass_open_locked()) || g.in_transfer) return false;
@@ -12095,8 +13096,43 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     if ((dst < src + bytes && src < dst + bytes) || g_copy_versions.size() >= kCopyVersionsPending) return refuse(kCvOther);
     if (!hle_kernel_va_mapped(dst, bytes) || !hle_kernel_va_mapped(src, bytes) || !rebuild_page_tables()) return refuse(kCvOther);
     if (surfaces_may_cover_locked(dst, bytes)) return refuse(kCvSurfaces);
+    // A twin home's copy still pending in this pass (stage 4b.3a(i)) under the new version: the version is newer and its
+    // batch writes the same twin later, so it takes the pending copy's place (bindings from now on take the version); one
+    // it covers in part sends this copy-back to the GPU as it stands (the pass ended first).
+    if (!g_home_copies.empty() && dst < g_hc_hi && dst + bytes > g_hc_lo) {
+        for (const HomeCopy& h : g_home_copies) {
+            if (h.dst < dst + bytes && dst < h.dst + h.bytes && (h.dst < dst || h.dst + h.bytes > dst + bytes)) return refuse(kCvOther);
+        }
+        g_home_copies.erase(std::remove_if(g_home_copies.begin(), g_home_copies.end(),
+                                           [&](const HomeCopy& h) { return h.dst < dst + bytes && dst < h.dst + h.bytes; }),
+                            g_home_copies.end());
+        home_copies_index_rebuild();
+    }
     const ImportSite site("a copy version's destination");
     if (find_render_target(src) || find_render_target(dst)) return refuse(kCvTarget);
+    // Into a constant buffer's home (stage 4b.3c, BBHOST_GXVK_HOMES=1): the source's bytes as this point in the stream
+    // has them (an earlier version's, else guest memory) staged, and copied into the home with the copy-backs' copies;
+    // no version. A source in a home (its bytes on the GPU) goes to the GPU as it stands.
+    if (gxvk_homes::bind_on()) {
+        if (homes_meet_locked(src, bytes)) {
+            if (homes_meet_locked(dst, bytes)) return refuse(kCvOther);
+        } else if (homes_meet_locked(dst, bytes)) {
+            const CopyVersion* under = copy_version_over(src, bytes);
+            if (cap && cap->map) {
+                const int r = homes_copy_in_locked(dst, bytes, cap->buffer, cap->offset, cap->map);
+                if (r == kHomeCopyTaken) return true;
+                if (r == kHomeCopyRefused) return refuse(kCvOther);
+            } else if (!under || (src >= under->dst && src + bytes <= under->dst + under->bytes)) {
+                const auto* bytes_from = under ? static_cast<const std::uint8_t*>(under->copy.map) + (src - under->dst)
+                                               : reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(src));
+                const int r = homes_copy_in_staged_locked(dst, bytes, bytes_from);
+                if (r == kHomeCopyTaken) return true;
+                if (r == kHomeCopyRefused) return refuse(kCvOther);
+            } else {
+                return refuse(kCvSource);
+            }
+        }
+    }
     twin_note_copy_target_locked(dst, bytes);
     const Located canon = locate(dst, bytes);
     if (!canon.buffer || canon.avail < bytes) return refuse(kCvImport);
@@ -12105,19 +13141,62 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
     // holding all of it, else guest memory. Part of one: the GPU copy, after
     // the pass's own copies.
     const auto* from = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(src));
-    if (const CopyVersion* v = copy_version_over(src, bytes)) {
-        if (src < v->dst || src + bytes > v->dst + v->bytes) return refuse(kCvSource);
-        from = static_cast<const std::uint8_t*>(v->copy.map) + (src - v->dst);
+    const CopyVersion* earlier = copy_version_over(src, bytes);
+    if (earlier) {
+        // (A capture holds GX's bytes at the resolve, not a pending version's: never expected over a rename.)
+        if (cap || src < earlier->dst || src + bytes > earlier->dst + earlier->bytes) return refuse(kCvSource);
+        from = static_cast<const std::uint8_t*>(earlier->copy.map) + (src - earlier->dst);
         bump(g_cv_from_version);
     }
     CopyVersion v;
     v.dst = dst;
     v.bytes = bytes;
     v.canon = canon;
-    if (!acquire_staging_locked(v.copy, bytes, v.offset)) return refuse(kCvOther);
-    std::memcpy(v.copy.map, from, bytes);
+    // A source in GX's upload heap (stage 1d.2a, BBHOST_GXVK_HEAP_COPY=1): the
+    // version is the source range itself, in the heap's import - no staging, no
+    // copy - once the arena holds it: GX hands it out again only after this
+    // submission, which the batch's copy and the home's draws are recorded in,
+    // has completed (proven per run). With =compare the copy is made as today
+    // and checked against the source at the batch. Anything else, or a source
+    // the arena does not hold: today's copy (heap_copy_decide counts why).
+    if (cap) {
+        v.ring = true;
+        v.copy = DevBuffer{};
+        v.copy.buffer = cap->buffer;
+        v.copy.map = const_cast<void*>(cap->map);
+        v.copy.size = bytes;
+        v.offset = cap->offset;
+    } else if (gxvk::heap_copy_wanted()) {
+        Located s;
+        // (Whole spans only: with window imports locate would import a window
+        // of the heap for it.)
+        if (!earlier && imports_whole()) s = locate(src, bytes);
+        const int why = gxvk::heap_copy_decide(src, bytes, gxvk::heap_copy_ring(), earlier != nullptr, s.buffer && s.avail >= bytes);
+        if (why == gxvk::kHeapCopyFast) {
+            const bool held = gxvk::arena_hold(src, bytes, g.flushes);
+            gxvk::heap_copy_held(held, bytes);
+            v.src = src;
+            if (held && gxvk::heap_copy_mode() == gxvk::HeapCopy::kOn) {
+                v.heap = true;
+                v.copy = DevBuffer{};
+                v.copy.buffer = s.buffer;
+                v.copy.map = const_cast<std::uint8_t*>(from);
+                v.copy.size = bytes;
+                v.offset = s.offset;
+            } else if (held) {
+                v.check = true;
+            }
+        }
+    }
+    if (!v.heap && !v.ring) {
+        if (!acquire_staging_locked(v.copy, bytes, v.offset)) return refuse(kCvOther);
+        std::memcpy(v.copy.map, from, bytes);
+    }
     note_gpu_write_over_marker("guest copy", dst, src, bytes);
     gxvk::heap_written(gxvk::kHeapGuardCopyVersion, dst, bytes);  // a copy-back's destination is never GX's upload heap (stage 1d.1)
+    // BBHOST_GXVK_HOMES=compare: the home takes the version's bytes too, on the GPU and in its mirror (stage 4b.3c).
+    if (gxvk_homes::env_mode() == gxvk_homes::Mode::kCompare && gxvk_homes::made_on())
+        homes_copy_in_locked(dst, bytes, v.copy.buffer, v.offset, v.copy.map);
     copy_version_add(v);
     bump(g_cv_made);  // not a locked add: that waits for the copy to leave the write-combining buffers
     return true;
@@ -12126,10 +13205,17 @@ bool copy_version_make_locked(std::uint64_t dst, std::uint64_t src, std::uint64_
 // A batch of its own, closed here: the callers that end a pass go on to
 // record other work without looking for an open transfer batch.
 void copy_versions_flush_locked() {
+    home_copies_flush_locked();  // (stage 4b.3a(i): none pending outside a pass; a batch of their own if one is)
     if (g_copy_versions.empty()) return;
     begin_recording_locked();  // made between recordings, their copies go in the next
     std::vector<CopyVersion> pending;
     pending.swap(g_copy_versions);
+    // BBHOST_GXVK_HEAP_COPY=compare: a version from the heap, copied as today,
+    // must still hold its source's bytes now - the batch is where =1 reads them.
+    for (const CopyVersion& v : pending) {
+        if (v.check && std::memcmp(v.copy.map, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(v.src)), v.bytes) != 0)
+            gxvk::heap_copy_changed(v.src, v.bytes);
+    }
     g_cv_sorted.clear();
     g_cv_lo = ~0ull;
     g_cv_hi = 0;
@@ -12191,7 +13277,8 @@ std::string copy_versions_report() {
                   "copy versions: %llu made (%llu read an earlier one), %llu bindings took one, %llu bindings across one's edge, "
                   "%llu copies refused (size %llu, surfaces %llu, targets %llu, not imported %llu, source %llu, other %llu); "
                   "%llu copies into place in %llu batches (%llu versions all overwritten by newer ones), of them early for a binding "
-                  "across an edge %llu, a page-table read %llu, a page-table pipeline %llu, a retired import %llu, a twin let go %llu; "
+                  "across an edge %llu, a page-table read %llu, a page-table pipeline %llu, a retired import %llu, a twin let go %llu, "
+                  "a binding over 1 MiB of a version from the upload heap %llu; "
                   "%llu transfers waited for an earlier one in their batch",
                   static_cast<ull>(g_cv_made.load()), static_cast<ull>(g_cv_from_version.load()), static_cast<ull>(g_cv_bound.load()),
                   static_cast<ull>(g_cv_straddled.load()), static_cast<ull>(g_cv_refused.load()), static_cast<ull>(g_cv_refused_why[kCvSize].load()),
@@ -12201,7 +13288,7 @@ std::string copy_versions_report() {
                   static_cast<ull>(g_cv_batches.load()), static_cast<ull>(g_cv_overwritten.load()), static_cast<ull>(g_cv_put[kCvStraddle].load()),
                   static_cast<ull>(g_cv_put[kCvPageTable].load()), static_cast<ull>(g_cv_put[kCvWalks].load()),
                   static_cast<ull>(g_cv_put[kCvRetired].load()), static_cast<ull>(g_cv_put[kCvPutTwin].load()),
-                  static_cast<ull>(g_batch_orders.load()));
+                  static_cast<ull>(g_cv_put[kCvHeapWide].load()), static_cast<ull>(g_batch_orders.load()));
     return b;
 }
 
@@ -12225,6 +13312,92 @@ std::size_t host_gpu_copy_backs(const std::uint64_t* dst, const std::uint64_t* s
         if (bytes[i] && !copy_version_make_locked(dst[i], src[i], bytes[i])) break;
     }
     return i;
+}
+
+std::size_t host_gpu_copy_backs_captured(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, const std::uint32_t* at,
+                                         std::uint32_t piece, std::size_t n) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok) return 0;
+    if (!g_capture_ring.buffer && !g_capture_ring_tried) {
+        g_capture_ring_tried = true;
+        if (create_upload_buffer(g_capture_ring, cb_capture::kRingBytes, "the copy-back captures (BBHOST_GXVK_HOMES)") && g_capture_ring.map) {
+            cb_capture::set_ring(g_capture_ring.map);
+            host_log("gxvk homes: the copy-back captures' ring made (%llu MiB)", static_cast<unsigned long long>(cb_capture::kRingBytes >> 20));
+        } else {
+            host_log("gxvk homes: the copy-back captures' ring could not be made: copy-backs as today");
+        }
+    }
+    const bool live = g_capture_ring.buffer && cb_capture::piece_live(piece);
+    const bool compare = cb_capture::mode() == cb_capture::Mode::kCompare;
+    std::size_t i = 0;
+    for (; i < n; ++i) {
+        if (!bytes[i]) continue;
+        if (at[i] == cb_capture::kNone || !live) {
+            cb_capture::count(at[i] == cb_capture::kNone ? cb_capture::kUseNotCaptured : cb_capture::kUseStale);
+            if (!copy_version_make_locked(dst[i], src[i], bytes[i])) break;
+            continue;
+        }
+        if (compare) {  // today's path, and the capture against the bytes it takes
+            cb_capture::compared(std::memcmp(cb_capture::bytes_at(at[i]), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src[i])),
+                                             bytes[i]) == 0,
+                                 dst[i], src[i], bytes[i]);
+            if (!copy_version_make_locked(dst[i], src[i], bytes[i])) break;
+            continue;
+        }
+        const VkDeviceSize ring_off = cb_capture::offset(at[i]);
+        // A constant buffer's home made at its creation (stage 4b.3c, BBHOST_GXVK_HOMES=1): the copy goes ring -> home,
+        // pending until the next pass starts (or a dispatch, transfer or submission comes first). One across a home's
+        // edge ended that home: a version, as below.
+        if (gxvk_homes::bind_on()) {
+            const int r = homes_copy_in_locked(dst[i], bytes[i], g_capture_ring.buffer, ring_off, cb_capture::bytes_at(at[i]));
+            if (r == kHomeCopyTaken) {
+                cb_capture::bound(piece, g.flushes);
+                cb_capture::count(cb_capture::kUseHomeNow);
+                continue;
+            }
+        }
+        // A home kept as a live device-local twin, with no version of an older copy-back still to go into its guest
+        // memory: the copy goes ring -> twin, now or at the pass's end.
+        Located twin;
+        if (!copy_version_over(dst[i], bytes[i]) && twin_live_holding_locked(dst[i], bytes[i], twin)) {
+            // Pending until the next pass starts (or a dispatch, transfer or submission comes first): one batch for
+            // every copy-back between two passes, and the next pass binds the twin.
+            cb_capture::bound(piece, g.flushes);
+            const bool in_pass = render_pass_open_locked();
+            g_home_copies.push_back(HomeCopy{dst[i], bytes[i], ring_off, twin});
+            g_hc_lo = std::min(g_hc_lo, dst[i]);
+            g_hc_hi = std::max(g_hc_hi, dst[i] + bytes[i]);
+            const std::pair<std::uint64_t, std::uint32_t> key{dst[i], static_cast<std::uint32_t>(g_home_copies.size() - 1)};
+            g_hc_sorted.insert(std::upper_bound(g_hc_sorted.begin(), g_hc_sorted.end(), key), key);
+            g_hc_maxlen = std::max(g_hc_maxlen, bytes[i]);
+            (in_pass ? g_hc_pending : g_hc_now).fetch_add(1, std::memory_order_relaxed);
+            cb_capture::count(in_pass ? cb_capture::kUseHomePending : cb_capture::kUseHomeNow);
+            continue;
+        }
+        // Any other home: a copy version whose bytes are the capture.
+        const CopyCapture cap{g_capture_ring.buffer, ring_off, cb_capture::bytes_at(at[i])};
+        if (!copy_version_make_locked(dst[i], src[i], bytes[i], &cap)) {
+            cb_capture::count(cb_capture::kUseRefused);
+            break;
+        }
+        cb_capture::bound(piece, g.flushes);
+        cb_capture::count(cb_capture::kUseVersion);
+    }
+    return i;
+}
+
+std::string gpu::home_copies_report() {
+    if (!cb_capture::on()) return "";
+    using ull = unsigned long long;
+    char b[400];
+    std::snprintf(b, sizeof(b),
+                  "gxvk homes: twin homes' copies made outside a pass %llu, inside one %llu; put in place at the next pass's start or "
+                  "before a dispatch, transfer or submission: %llu copies in %llu batches (%llu all overwritten by newer ones); "
+                  "bindings that took a pending one's capture %llu, across one's edge %llu",
+                  static_cast<ull>(g_hc_now.load()), static_cast<ull>(g_hc_pending.load()), static_cast<ull>(g_hc_copies.load()),
+                  static_cast<ull>(g_hc_batches.load()), static_cast<ull>(g_hc_overwritten.load()), static_cast<ull>(g_hc_bound.load()),
+                  static_cast<ull>(g_hc_straddled.load()));
+    return b;
 }
 
 std::uint64_t host_gpu_work_needs() {
@@ -12315,6 +13488,31 @@ void host_gpu_report() {
                  static_cast<ull>(g_import_who_n[kIwSpan].load()), mib(g_import_who_bytes[kIwSpan]), static_cast<ull>(g_imports_merged.load()),
                  static_cast<ull>(g_imports_retired.load()), mib(g_import_retired_bytes), static_cast<ull>(live >> 20), nlive,
                  static_cast<ull>(flex >> 20));
+        if (g_retire_mode.load(std::memory_order_relaxed) && !imports_whole()) {
+            std::lock_guard<GpuMutex> lock(g.mu);
+            if (g_retire_mode.load(std::memory_order_relaxed) == 1)
+                host_log("gpu: idle window imports let go (BBHOST_IMPORT_RETIRE=1, after %.0f s without a use): %llu (%llu MiB) in %llu checks, "
+                         "%llu put off while a copy version named them; windows wanted again and imported again by the paths that asked %llu "
+                         "(%llu MiB) in %.1f ms of the driver's time, the longest %.1f ms; by the import thread %llu",
+                         g_retire.after_ms / 1e3, static_cast<ull>(g_retire_n), static_cast<ull>(g_retire_bytes >> 20),
+                         static_cast<ull>(g_retire_checks), static_cast<ull>(g_retire_skipped), static_cast<ull>(g_again_n),
+                         static_cast<ull>(g_again_bytes >> 20), g_again_us / 1e3, g_again_max_us / 1e3, static_cast<ull>(g_again_prefetch));
+            else
+                host_log("gpu: idle window imports counted (BBHOST_IMPORT_RETIRE=2, after %.0f s without a use; none let go): would have let go "
+                         "%llu (%llu MiB) in %llu checks, at most %llu MiB idle at once, %llu put off while a copy version named them; would have "
+                         "imported again %llu windows (%llu MiB)",
+                         g_retire.after_ms / 1e3, static_cast<ull>(g_would_n), static_cast<ull>(g_would_bytes >> 20),
+                         static_cast<ull>(g_retire_checks), static_cast<ull>(g_would_idle_most >> 20), static_cast<ull>(g_retire_skipped),
+                         static_cast<ull>(g_would_again_n), static_cast<ull>(g_would_again_bytes >> 20));
+        }
+        if (const std::uint64_t freed = g_import_freed.load())
+            host_log("gpu: window imports freed once their work had run (replaced by a merge, or let go while idle): %llu (%llu MiB) in %.1f ms of the "
+                     "driver's time %s, the longest %.1f ms; the command processor's part %.1f ms, the longest %.3f ms%s",
+                     static_cast<ull>(freed), mib(g_import_freed_bytes), g_import_free_us.load() / 1e3,
+                     g_free_thread_on ? ("on their own thread (bb-import-free, in the background, " + std::to_string(g_free_gap_ms) + " ms apart)").c_str()
+                                      : "on the command processor (BBHOST_IMPORT_FREE_THREAD=0)",
+                     g_import_free_max_us.load() / 1e3, g_import_free_cp_us.load() / 1e3, g_import_free_cp_max_us.load() / 1e3,
+                     g_free_thread_on ? (", handing them over; at most " + std::to_string(g_free_queue_most.load()) + " waiting").c_str() : "");
         if (!imports_whole()) {
             std::lock_guard<GpuMutex> lock(g.mu);
             host_log("gpu: the page table's view of the window imports (host/import_table.h, BBHOST_IMPORT_TABLE_DEFER%s): windows whose "
@@ -12425,6 +13623,12 @@ void host_gpu_report() {
                      static_cast<ull>(g_copy_src_staged.load()), static_cast<ull>(g_copy_src_staged_bytes.load() >> 20));
         }
         if (const std::string tw = twins_report(); !tw.empty()) host_log("%s", tw.c_str());
+        // Stage 4b.3c's homes (host/gxvk_homes.h): one line each.
+        for (std::string hs = homes_report(); !hs.empty();) {
+            const std::size_t nl = hs.find('\n');
+            host_log("%s", hs.substr(0, nl).c_str());
+            hs = nl == std::string::npos ? std::string() : hs.substr(nl + 1);
+        }
         // GX buffers by handle (host/gxvk.h): one line each.
         for (std::string gx = gxvk_report(); !gx.empty();) {
             const std::size_t nl = gx.find('\n');

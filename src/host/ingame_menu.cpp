@@ -1,6 +1,7 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "host/ingame_menu.h"
 #include "host/trophy_ui.h"
+#include "host/play_history_ui.h"
 #include "core/config.h"
 
 #if defined(BBHOST_HAVE_SDL3)
@@ -59,6 +60,7 @@ VkFormat g_format = VK_FORMAT_UNDEFINED;
 std::uint32_t g_images = 0;
 PluginUi g_ui;
 TrophyUi g_trophy_ui;
+PlayHistoryUi g_history_ui;
 std::chrono::steady_clock::time_point g_last;
 
 ImGuiKey key_of(SDL_Keycode k) {
@@ -554,12 +556,15 @@ bool draw_mods() {
          "ゲームコードを変更します。多くの項目は即時反映し、一部は次回起動時に反映します。"},
         {"プラグイン", ui::Icon::Plugins, "プラグインの設定と操作です。即時反映と表示された項目以外は次回起動時に反映します。"},
         {"トロフィー", ui::Icon::Enhance, "本編と追加コンテンツの獲得状況を確認します。"},
+        {"プレイ記録", ui::Icon::Game, "周回ごとのプレイ時間とボス戦の挑戦・撃破回数を確認します。"},
     };
-    return shell("##mods", "パッチ・プラグイン・トロフィー", kPages, 3, &g_mods_page, &g_mods_page_at, g_mods_page == 0, [] {
+    return shell("##mods", "パッチ・プラグイン・記録", kPages, 4, &g_mods_page, &g_mods_page_at, g_mods_page == 0, [] {
         if (g_mods_page == 0) {
             patches_page(g_patches);
         } else if (g_mods_page == 2) {
             trophy_ui_draw(g_trophy_ui, config().data, 0.0f);
+        } else if (g_mods_page == 3) {
+            play_history_ui_draw(g_history_ui, config().data, true);
         } else {
             ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(14, 12, 34, 190));
             plugin_ui_draw(g_ui, ui::scale(), 0.0f);  // the list and the details fill what is left, each scrolling

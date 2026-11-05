@@ -143,10 +143,11 @@ int shader_compile_session() {
         std::string reasons;
         gpu::hlsl_counts(taken, compiled, kept, reasons);
         char b[240];
-        std::snprintf(b, sizeof(b), "progress %llu %llu %llu %llu %llu %.1f %llu %llu", static_cast<unsigned long long>(p.done),
+        std::snprintf(b, sizeof(b), "progress %llu %llu %llu %llu %llu %.1f %llu %llu %llu", static_cast<unsigned long long>(p.done),
                       static_cast<unsigned long long>(p.total), static_cast<unsigned long long>(p.failed),
                       static_cast<unsigned long long>(taken), static_cast<unsigned long long>(kept), seconds(),
-                      static_cast<unsigned long long>(p.recipes_done), static_cast<unsigned long long>(p.recipes_total));
+                      static_cast<unsigned long long>(p.recipes_done), static_cast<unsigned long long>(p.recipes_total),
+                      static_cast<unsigned long long>(p.deferred));
         say(b);
         if (p.finished && (p.listed || cancelled.load())) break;
     }
@@ -169,6 +170,8 @@ int shader_compile_session() {
             << "device " << device << "\n"
             << "shaders " << (hlsl ? "HLSL" : "変換済み SPIR-V") << "\n"
             << "stages " << p.done << " / " << p.total << "、失敗 " << p.failed << "\n"
+            << "failed_count " << p.failed << "\n"
+            << "deferred_count " << p.deferred << "\n"
             << "hlsl DXC 採用 " << taken << "（今回 " << compiled << "）、変換済み SPIR-V 維持 " << kept << "\n"
             << "pipelines " << p.recipes_done << " / " << p.recipes_total << "（前回の記録と同梱リスト）\n"
             << "seconds " << static_cast<long long>(seconds()) << "\n";
@@ -182,10 +185,11 @@ int shader_compile_session() {
         for (std::string l; std::getline(r2, l);) say("reason the lift kept: " + l);
     }
     char b[240];
-    std::snprintf(b, sizeof(b), "%s %llu %llu %llu %llu %llu %.1f %llu %llu", cancelled.load() ? "cancelled" : "done",
+    std::snprintf(b, sizeof(b), "%s %llu %llu %llu %llu %llu %.1f %llu %llu %llu", cancelled.load() ? "cancelled" : "done",
                   static_cast<unsigned long long>(p.done), static_cast<unsigned long long>(p.total), static_cast<unsigned long long>(p.failed),
                   static_cast<unsigned long long>(taken), static_cast<unsigned long long>(kept), seconds(),
-                  static_cast<unsigned long long>(p.recipes_done), static_cast<unsigned long long>(p.recipes_total));
+                  static_cast<unsigned long long>(p.recipes_done), static_cast<unsigned long long>(p.recipes_total),
+                  static_cast<unsigned long long>(p.deferred));
     say(b);
     host_log("compile-shaders: %s", b);
     // Not fflush(nullptr): the stdin reader holds stdin's lock in getline.
@@ -337,16 +341,17 @@ void ShaderCompileJob::reader() {
         if (line.rfind(pre, 0) != 0) return;
         const std::string rest = line.substr(pre.size());
         std::lock_guard<std::mutex> lk(mu_);
-        unsigned long long d = 0, t = 0, f = 0, h = 0, l = 0, rd = 0, rt = 0;
+        unsigned long long d = 0, t = 0, f = 0, h = 0, l = 0, rd = 0, rt = 0, deferred = 0;
         double secs = 0;
-        if (std::sscanf(rest.c_str(), "progress %llu %llu %llu %llu %llu %lf %llu %llu", &d, &t, &f, &h, &l, &secs, &rd, &rt) >= 6 ||
-            std::sscanf(rest.c_str(), "done %llu %llu %llu %llu %llu %lf %llu %llu", &d, &t, &f, &h, &l, &secs, &rd, &rt) >= 6 ||
-            std::sscanf(rest.c_str(), "cancelled %llu %llu %llu %llu %llu %lf %llu %llu", &d, &t, &f, &h, &l, &secs, &rd, &rt) >= 6) {
+        if (std::sscanf(rest.c_str(), "progress %llu %llu %llu %llu %llu %lf %llu %llu %llu", &d, &t, &f, &h, &l, &secs, &rd, &rt, &deferred) >= 6 ||
+            std::sscanf(rest.c_str(), "done %llu %llu %llu %llu %llu %lf %llu %llu %llu", &d, &t, &f, &h, &l, &secs, &rd, &rt, &deferred) >= 6 ||
+            std::sscanf(rest.c_str(), "cancelled %llu %llu %llu %llu %llu %lf %llu %llu %llu", &d, &t, &f, &h, &l, &secs, &rd, &rt, &deferred) >= 6) {
             v_.recipes_done = rd;
             v_.recipes_total = rt;
             v_.done = d;
             v_.total = t;
             v_.failed = f;
+            v_.deferred = deferred;
             v_.hlsl = h;
             v_.lift = l;
             v_.seconds = secs;

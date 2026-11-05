@@ -25,6 +25,7 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -65,6 +66,7 @@ enum SettingId {
     kVsync,
     kFrameCap,
     kFrameClock,
+    kEffectTiming,
     kFpsCounter,
     kMemoryCounter,
     kPerfOverlay,
@@ -108,6 +110,18 @@ enum SettingId {
     kSettingCount,
 };
 
+// Effect timing's choices as the frame rate reads them (core/config.h's
+// config_effect_timing), in the setting's order: Smooth, Original (30), 60 a
+// second (auto: 60 above 30) and Your frame rate.
+constexpr const char* kEffectTimingValues[] = {"smooth", "30", "auto", "fps"};
+constexpr int effect_timing_index(std::string_view v) {
+    for (int i = 0; i < 4; ++i) {
+        if (v == kEffectTimingValues[i]) return i;
+    }
+    return -1;
+}
+static_assert(effect_timing_index(kEffectTimingDefault) >= 0, "the default effect timing is one of the setting's choices");
+
 // A row on screen: a section header, a setting, or the close button.
 struct Row {
     // Text: a field the player types (field 0 the account name, 1 a recovery
@@ -133,9 +147,10 @@ Setting g_set[kSettingCount] = {
     // Frame cap's, so a file keeps its 30 or 60; a file older than version 3
     // holds a cap on presentation, whose 90, 120, 144 and Off ran the game at
     // 60, and reads as 60 (host_options_load).
+    // Read once at startup, including the draw preparation policy.
     {"frame_cap", "フレームレート", {"30", "60", "90", "120", "150", "180", "240", "360", "480", "960", "Display-Limited"}, 0,
-     "30 は原作の速度です。選んだ FPS に合わせてゲームを動かします。「画面に合わせる」は起動時の画面更新頻度が上限です。次回起動時に反映します。",
-     false},
+     "再起動が必要です。30 は原作の速度です。選んだ FPS に合わせてゲームを動かします。「画面に合わせる」は起動時の画面更新頻度が上限です。",
+     true},
     // The frame clock (engine/frame_clock.h), experimental and off by default:
     // what the frame rate otherwise sets once for the rate chosen at start
     // follows each frame's own length. Read once as the game starts
@@ -144,6 +159,13 @@ Setting g_set[kSettingCount] = {
     {"frame_clock", "実フレーム時間で動作（試験的）", {"Off", "On"}, 0,
      "再起動が必要です。設定したフレームレートを維持できない場合も、実際のフレーム時間に合わせてゲームを動かします。",
      true},
+    // How the effects keep time above 30 fps (engine/frame_rate.cpp), read
+    // once as the game starts: BBHOST_SFX_STEP, else this once chosen, else
+    // bbhost.toml's [video] effect_steps, else kEffectTimingDefault, Smooth
+    // (config_effect_timing). Written to the file only once chosen (save).
+    {"effect_timing", "エフェクトの時間処理",
+     {kHostEffectTimingLabels[0], kHostEffectTimingLabels[1], kHostEffectTimingLabels[2], kHostEffectTimingLabels[3]},
+     effect_timing_index(kEffectTimingDefault), kHostEffectTimingNote, true},
     // The game's frames a second, counted as they start (host/window.cpp,
     // host_fps_frame_start), with how busy the GPU is beside it.
     {"fps_counter", "FPS 表示", {"Off", "On"}, 0,
@@ -323,6 +345,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kVsync},
     {Row::Option, nullptr, kFrameCap},
     {Row::Option, nullptr, kFrameClock},
+    {Row::Option, nullptr, kEffectTiming},
     {Row::Option, nullptr, kFpsCounter},
     {Row::Option, nullptr, kMemoryCounter},
     {Row::Option, nullptr, kPerfOverlay},
@@ -400,8 +423,10 @@ std::array<int, kSettingCount> g_pending = [] {
     return a;
 }();
 bool g_dirty = false;  // something changed since the last save
-// Which settings the options file held a value for when it was read (the rest
-// keep their defaults: the table's, or bbhost.toml's), for host_opt_saved.
+// Which settings are the player's own: the options file held a value for it
+// when it was read, or it was set since (set_index); the rest keep their
+// defaults, the table's or bbhost.toml's. For host_opt_saved, and save's
+// Effect timing.
 std::array<bool, kSettingCount> g_saved{};
 
 // What every setting starts with: the table's own indices, taken before
@@ -743,6 +768,12 @@ void save() {
     std::fprintf(f, "[options]\n");
     std::fprintf(f, "version = \"%d\"\n", kOptionsVersion);
     for (const Setting& s : g_set) {
+        // Effect timing only once it is the player's own (g_saved): written at
+        // every save like the rest, it would hold every player at the default
+        // of the day they first saved - a new kEffectTimingDefault would reach
+        // nobody - and take over from a [video] effect_steps the four choices
+        // cannot show (a number of steps, frame) at the first save.
+        if (&s == &g_set[kEffectTiming] && !g_saved[kEffectTiming]) continue;
         // A resolution still waiting for its keep-or-revert answer is not
         // saved: the file keeps the one it would go back to.
         const int index = &s == &g_set[kResolution] && g_res_prev >= 0 ? g_res_prev : s.index;
@@ -779,6 +810,7 @@ void rebuild_settings() {
     h.vsync = index_of(kVsync) == 0;
     h.frame_cap = fps_from_label(g_set[kFrameCap].values[static_cast<std::size_t>(index_of(kFrameCap))]);
     h.frame_clock = on_of(kFrameClock);
+    h.effect_timing = kEffectTimingValues[std::clamp(index_of(kEffectTiming), 0, 3)];
     h.fps_counter = on_of(kFpsCounter);
     h.memory_counter = on_of(kMemoryCounter);
     h.perf_overlay = on_of(kPerfOverlay);
@@ -860,6 +892,7 @@ void set_index(int id, int index, bool from_file) {
     rebuild_settings();
     if (!from_file) {
         g_dirty = true;
+        g_saved[static_cast<std::size_t>(id)] = true;
     }
     apply(id);
 }
@@ -926,6 +959,14 @@ void host_options_load() {
     }
     // video.frame_clock is the Native frame clock's default (off).
     g_set[kFrameClock].index = config().frame_clock ? 1 : 0;
+    // video.effect_steps is Effect timing's when it is one of its choices ("60"
+    // reads as 60 a second, auto's 60 above 30); another value (a number of
+    // steps, frame) leaves the row at the default and still runs until a
+    // choice is made (config_effect_timing).
+    {
+        const std::string v = config_value("video.effect_steps");
+        if (const int i = effect_timing_index(v == "60" ? "auto" : v); i >= 0) g_set[kEffectTiming].index = i;
+    }
     // A package's own (video.resolution, video.window_mode: the Steam Deck
     // kit's 1280x800, fullscreen; video.model_detail), by the entry's name.
     const auto seed = [](int id, const std::string& value) {
@@ -938,7 +979,7 @@ void host_options_load() {
     seed(kShaders, config().shaders);
     if (config().setup_text_size > 0) seed(kMenuTextSize, std::to_string(config().setup_text_size) + "%");
     for (const int id : {static_cast<int>(kSkipLogos), static_cast<int>(kFrameCap), static_cast<int>(kFrameClock),
-                         static_cast<int>(kResolution), static_cast<int>(kWindowMode),
+                         static_cast<int>(kEffectTiming), static_cast<int>(kResolution), static_cast<int>(kWindowMode),
                          static_cast<int>(kModelDetail), static_cast<int>(kShaders), static_cast<int>(kChangeAppearance),
                          static_cast<int>(kRebirth), static_cast<int>(kFivePlayers), static_cast<int>(kSkillIssue)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
@@ -1272,7 +1313,21 @@ void setting_row(int id) {
     ImGui::SameLine();
     ImGui::SetCursorScreenPos(ImVec2(p.x + w - cw, p.y));
     int want = cur;
-    if (id == kFrameCap || id == kResolution) {
+    if (id == kEffectTiming) {
+        // What will run (host_effect_timing_row): one of the four, or a fifth
+        // entry for what bbhost.toml or BBHOST_SFX_STEP asks that none of them
+        // is. A pick is one of the four, the player's own even when the
+        // setting held it already (set_index).
+        const HostEffectTimingRow et = host_effect_timing_row();
+        const char* labels[5] = {s.values[0], s.values[1], s.values[2], s.values[3], et.custom.c_str()};
+        const char* tips[5] = {kHostEffectTimingTips[0], kHostEffectTimingTips[1], kHostEffectTimingTips[2],
+                               kHostEffectTimingTips[3], et.tip.c_str()};
+        const int shown = g_pending[static_cast<std::size_t>(id)] >= 0 ? cur : et.index;
+        int pick = shown;
+        ImGui::SetNextItemWidth(cw);
+        ui::combo("##v", &pick, labels, et.index == 4 ? 5 : 4, tips);
+        if (pick != shown && pick < 4) change(id, pick);
+    } else if (id == kFrameCap || id == kResolution) {
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &want, s.values.data(), n);
     } else if (n <= 4) {
@@ -1444,6 +1499,16 @@ const char* const kHostShaderModeTips[2] = {
     "bbhost の直接変換のみを使用し、プレイ中の追加コンパイルを行いません。HLSL で問題が出る場合に試してください。画質は同じです。",
 };
 
+const char* const kHostEffectTimingLabels[4] = {"Smooth", "Original (30)", "60 a second", "Your frame rate"};
+const char* const kHostEffectTimingNote =
+    "再起動が必要です。30 fps を超えたときの炎・血・魔法の動きや、ランプ・ろうそくの揺らぎの時間処理を選びます。";
+const char* const kHostEffectTimingTips[4] = {
+    "エフェクトの動きはフレームレートに合わせ、揺らぎなどゲームが回数で進める処理は原作と同じ毎秒30回を維持します。",
+    "フレームレートにかかわらず、原作の 30 fps と同じ毎秒30回で更新します。30 fps を超えると、動きのなめらかさが下がります。",
+    "エフェクトを毎秒60回更新します。揺らぎなど回数で進める処理も、原作の２倍の速さになります。",
+    "エフェクトを１フレームに１回更新します。揺らぎなど回数で進める処理は、60 fps で原作の２倍、120 fps で４倍の速さになります。",
+};
+
 HostSettings host_settings() { return settings_store().now(); }
 const HostSettings& host_settings_ref() { return settings_store().now(); }
 void host_settings_listen(HostSettingsListener fn) {
@@ -1496,6 +1561,28 @@ bool host_opt_get(const char* key) {
 bool host_opt_saved(const char* key) {
     const int id = setting_id(key);
     return id >= 0 && g_saved[static_cast<std::size_t>(id)];
+}
+
+HostEffectTimingRow host_effect_timing_row() {
+    HostEffectTimingRow r;
+    const int chosen = std::clamp(g_set[kEffectTiming].index, 0, 3);
+    const EffectTiming t = config_effect_timing(60, kEffectTimingValues[chosen], g_saved[kEffectTiming]);
+    const std::string v = t.readable ? t.value : std::string(kEffectTimingDefault);  // one it cannot read runs the default
+    r.index = effect_timing_index(v == "60" ? "auto" : v);
+    if (r.index >= 0) return r;
+    const bool env = std::strcmp(t.from, "BBHOST_SFX_STEP") == 0;
+    r.index = 4;
+    r.custom = "カスタム: " + v + (env ? " (BBHOST_SFX_STEP)" : " (bbhost.toml)");
+    r.tip = (v == "frame" ? std::string("エフェクトを各フレームの実際の時間に合わせます。") : "エフェクトを毎秒 " + v + " 回更新します。") +
+            (env ? "BBHOST_SFX_STEP の指定が、この設定より優先されます。"
+                 : "bbhost.toml の effect_steps に従います。ほかの項目を選ぶと、その選択を優先します。");
+    return r;
+}
+
+void host_opt_choose_effect_timing(int index) {
+    if (index < 0 || index > 3) return;
+    set_index(kEffectTiming, index, false);  // the player's own (g_saved) and written, even when it held it already
+    save();
 }
 
 bool host_opt_resolution(int* w, int* h) {

@@ -70,9 +70,8 @@ using ReclaimFn = GUEST_ABI u64 (*)(u64, u64);
 
 eboot_kit::Rng g_rng(0x51ab);
 int g_failed = 0;
-bool g_quiet = false;
 void fail(long step, const char* why) {
-    if (++g_failed <= 30 && !g_quiet) std::printf("FAIL: step %ld: %s\n", step, why);
+    if (++g_failed <= 30) std::printf("FAIL: step %ld: %s\n", step, why);
 }
 
 // The label writer's calls: where to write and what.
@@ -128,9 +127,22 @@ void range_of(u64 node, u64& start, u64& end) {
     end = load<u64>(load<u64>(node + 0x18) + 8);
 }
 
-// control: a label lands that the model is not told of (a reuse before the
-// GPU is done, as the model sees it), once, which the checks must catch.
-long run_sequence(u64 region, u64 region_bytes, long steps, bool in_order, bool control = false, bool ours = false) {
+bool check_model(Pool& pool, u64 capacity, const std::map<u64, Out>& out, long step, bool quiet = false) {
+    u64 out_bytes = 0;
+    for (const auto& [node, o] : out) out_bytes += o.end - o.start;
+    bool matches = true;
+    if (ranges_out(pool) != out.size()) {
+        if (!quiet) fail(step, "the reclaim's count of ranges out is not the model's");
+        matches = false;
+    }
+    if (free_bytes(pool) != capacity - out_bytes) {
+        if (!quiet) fail(step, "the reclaim's free bytes are not the model's");
+        matches = false;
+    }
+    return matches;
+}
+
+long run_sequence(u64 region, u64 region_bytes, long steps, bool in_order, bool ours = false) {
     Pool pool;
     store<u64>(pool.at() + 0xd8, reinterpret_cast<u64>(g_lock_vtable));
     alignas(16) static u64 cb[2] = {0x7700, 0};
@@ -150,11 +162,6 @@ long run_sequence(u64 region, u64 region_bytes, long steps, bool in_order, bool 
     std::map<u64, u64> by_start;     // start -> node: what is out, for the overlap check
     std::deque<u64> pending;         // released, label not landed, in release order
     long handed = 0, refused = 0, reclaims = 0;
-    const auto out_bytes = [&]() {
-        u64 n = 0;
-        for (const auto& [node, o] : out) n += o.end - o.start;
-        return n;
-    };
     for (long step = 0; step < steps; ++step) {
         const double r = g_rng.next() / 18446744073709551616.0;
         if (r < 0.42 && out.size() < 4000) {
@@ -213,10 +220,6 @@ long run_sequence(u64 region, u64 region_bytes, long steps, bool in_order, bool 
                 store<u32>(node, 4);  // the label's write
                 out[node].landed = true;
             }
-            if (control && !pending.empty()) {
-                store<u32>(pending.front(), 4);  // landed behind the model's back
-                control = false;
-            }
         } else {
             // The reclaim: exactly the landed releases come back.
             eboot_kit::fn<ReclaimFn>(kReclaim)(pool.at(), ctx_holder);
@@ -229,8 +232,7 @@ long run_sequence(u64 region, u64 region_bytes, long steps, bool in_order, bool 
                     ++it;
                 }
             }
-            if (ranges_out(pool) != out.size()) fail(step, "the reclaim's count of ranges out is not the model's");
-            if (free_bytes(pool) != (limit - base) - out_bytes()) fail(step, "the reclaim's free bytes are not the model's");
+            check_model(pool, limit - base, out, step);
         }
     }
     // Everything released, landed and reclaimed: the region is whole again.
@@ -247,12 +249,52 @@ long run_sequence(u64 region, u64 region_bytes, long steps, bool in_order, bool 
     u64 s = 0, e = 0;
     if (all) range_of(all, s, e);
     if (!all || s != base || e != limit) fail(steps, "one hand-out of the whole region did not get it (its ranges not merged back)");
-    if (!g_quiet)
-        std::printf("  %s landings, %llu-byte region%s: %ld steps, %ld hand-outs (%ld refused: no room), %ld reclaims, %zu labels\n",
-                    in_order ? "in-order" : "out-of-order", static_cast<ull>(region_bytes), ours ? ", ours of the init" : "", steps, handed,
-                    refused, reclaims, g_labels.size());
+    std::printf("  %s landings, %llu-byte region%s: %ld steps, %ld hand-outs (%ld refused: no room), %ld reclaims, %zu labels\n",
+                in_order ? "in-order" : "out-of-order", static_cast<ull>(region_bytes), ours ? ", ours of the init" : "", steps, handed,
+                refused, reclaims, g_labels.size());
     g_labels.clear();
     return handed;
+}
+
+// A hidden landing must be checked before an ordinary landing can tell the
+// model about it. In a generated sequence that next landing could otherwise
+// erase the deliberate discrepancy before any reclaim checks it.
+bool check_landing_control() {
+    Pool pool;
+    store<u64>(pool.at() + 0xd8, reinterpret_cast<u64>(g_lock_vtable));
+    alignas(16) u64 cb[2] = {0x7700, 0};
+    alignas(64) u8 ctx[0xb500] = {};
+    const u64 ctx_holder_value = reinterpret_cast<u64>(ctx);
+    const u64 cb_holder = reinterpret_cast<u64>(cb), ctx_holder = reinterpret_cast<u64>(&ctx_holder_value);
+    if (!eboot_kit::fn<InitFn>(kPoolInit)(pool.at(), reinterpret_cast<u64>(g_allocator), 0x143400040ull, 0xa000000ull)) {
+        fail(-1, "the control pool's init failed");
+        return false;
+    }
+    const u64 capacity = load<u64>(pool.at() + 0xc0) - load<u64>(pool.at() + 0xb8);
+    const u64 node = eboot_kit::fn<HandOutFn>(kHandOut)(pool.at(), 32);
+    if (!node) {
+        fail(-1, "the control's hand-out failed");
+        return false;
+    }
+    u64 start, end;
+    range_of(node, start, end);
+    const std::map<u64, Out> out = {{node, {start, end, true, false}}};
+    const std::size_t labels = g_labels.size();
+    eboot_kit::fn<ReleaseFn>(kRelease)(pool.at(), cb_holder, node);
+    if (g_labels.size() != labels + 1 || g_labels.back().at != node || g_labels.back().value != 4) {
+        fail(-1, "the control's release without its label (4 at the node)");
+        g_labels.clear();
+        return false;
+    }
+    if (!check_model(pool, capacity, out, -1)) {
+        g_labels.clear();
+        return false;
+    }
+    store<u32>(node, 4);  // landed behind the model's back; out still says it has not
+    eboot_kit::fn<ReclaimFn>(kReclaim)(pool.at(), ctx_holder);
+    const bool caught = !check_model(pool, capacity, out, 0, true);
+    g_labels.clear();
+    return caught;
 }
 
 // ---- ours of the init against the game's ---------------------------------
@@ -435,17 +477,11 @@ int main(int argc, char** argv) {
     total += run_sequence(0x143400040ull, 0xa000000ull, steps, true);
     total += run_sequence(0x143400040ull, 0xa000000ull, steps, false);
     total += run_sequence(0x200000007ull, 0x1000009ull, steps / 2, false);  // 16 MiB, its start and size not 16-byte multiples
-    const int before = g_failed;
-    g_quiet = true;
-    run_sequence(0x143400040ull, 0xa000000ull, 20000, true, true);
-    g_quiet = false;
-    const bool caught = g_failed > before;
-    g_failed = before;
-    if (!caught) {
+    if (!check_landing_control()) {
         ++g_failed;
         std::printf("FAIL: a label landed behind the model's back was not caught\n");
     }
-    total += run_sequence(0x143400040ull, 0xa000000ull, steps / 2, false, false, true);  // over a pool ours made
+    total += run_sequence(0x143400040ull, 0xa000000ull, steps / 2, false, true);  // over a pool ours made
     if (g_failed) {
         std::printf("gx_upload_heap_test: %d failures\n", g_failed);
         return 1;

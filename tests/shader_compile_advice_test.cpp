@@ -52,6 +52,21 @@ int main() {
     CHECK(shader_compile_minutes(30) == "約１分");
     CHECK(shader_compile_minutes(91) == "約 1-2 分");
     CHECK(shader_compile_minutes(200) == "約 3-4 分");
+    // Context-dependent stages stay separate from genuine failures. Old
+    // records still expose every error, including LDS errors from plain VS.
+    ShaderCompileResultCounts counts = shader_compile_result_counts({
+        "result done", "failed_count 0", "deferred_count 167"});
+    CHECK(counts.failed == 0 && counts.deferred == 167);
+    counts = shader_compile_result_counts({"failed_count 3", "deferred_count 167", "failed VS translation: unsupported x3"});
+    CHECK(counts.failed == 3 && counts.deferred == 167);
+    counts = shader_compile_result_counts({"failed VS translation: LDS use outside a compute shader x167", "failed PS decode x2"});
+    CHECK(counts.failed == 169 && counts.deferred == 0);
+    counts = shader_compile_result_counts({"failed_count 5", "deferred_count 167",
+        "failed graphics pipeline recipe build failed x2", "failed compute pipeline recipe build failed x1",
+        "failed recorded shader stage build failed x1", "failed tessellation LS pipeline recipe build failed x1"});
+    CHECK(counts.failed == 5 && counts.deferred == 167);  // numeric total must not count reasons a second time
+    counts = shader_compile_result_counts({"result done", "seconds 62"});
+    CHECK(counts.failed == 0 && counts.deferred == 0);
     if (g_failures) {
         std::fprintf(stderr, "%d failures\n", g_failures);
         return 1;

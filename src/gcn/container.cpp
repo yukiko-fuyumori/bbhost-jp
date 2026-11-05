@@ -231,6 +231,7 @@ bool bnd4_entries(const std::vector<std::uint8_t>& b, std::vector<BundleEntry>& 
 }
 
 bool shader_code(const std::vector<std::uint8_t>& container, ShaderCode& out) {
+    out.hardware_stage = ShaderHardwareStage::Unknown;
     // ShaderFileHeader: 'Shdr', u16 major, u16 minor, u8 type, u8 headerSizeInDW,
     // then the gnmx stage header of headerSizeInDW dwords (registers, input
     // semantic tables), then the code. The ShaderBinaryInfo footer ('OrbShdr',
@@ -255,7 +256,24 @@ bool shader_code(const std::vector<std::uint8_t>& container, ShaderCode& out) {
     std::memcpy(out.words.data(), container.data() + start, length);
     out.footer = j;
     out.type = container[i + 8];
+    // Only a complete, known-version info block can change how a program is
+    // scheduled. Truncated, unknown or contradictory metadata keeps the
+    // ordinary translation path, whose errors must still be reported.
+    if (container.size() - j >= 28 && container[j + 7] == 7 && header_dw >= 10) {
+        const std::uint8_t stage = (container[j + 8] >> 2) & 0xf;
+        // The Shdr slot corresponding to each binary subtype. A domain
+        // program occupies the VS or ES slot; it has no separate Shdr type.
+        constexpr std::uint8_t types[] = {2, 1, 5, 6, 4, 3, 1, 7, 1, 5};
+        if (stage < sizeof(types) && out.type == types[stage]) {
+            out.hardware_stage = static_cast<ShaderHardwareStage>(stage);
+        }
+    }
     return true;
+}
+
+bool shader_needs_tessellation_context(const ShaderCode& code) {
+    return (code.type == 1 && code.hardware_stage == ShaderHardwareStage::DomainVertex) ||
+           (code.type == 5 && code.hardware_stage == ShaderHardwareStage::DomainExport);
 }
 
 }  // namespace gcn

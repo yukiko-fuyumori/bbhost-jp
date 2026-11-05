@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 14.
+/* bbhost plugin API, version 17.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 16
+#define BB_PLUGIN_API_VERSION 17
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -487,6 +487,12 @@ typedef struct BbHostApi {
      * white lines are drawn as black ones over white faces, then the faces
      * again subtracting. No plugin uses it today. */
     void (*draw_style)(int style);
+
+    /* Version 17: main thread only. Pause local campaign timing and boss
+     * records while a practice mode rewrites world state. A pause belongs
+     * to the named plugin; pass 0 to release it. Multiple plugins can pause
+     * independently. Does not change the game's save or play clock. */
+    int (*campaign_tracking_pause)(const char* plugin, int paused);
 } BbHostApi;
 
 #define BB_DRAW_AS_IS 0

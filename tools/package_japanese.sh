@@ -22,4 +22,9 @@ guide=docs/japanese-release.md
 cp "$guide" "$dest/導入手順_日本語.md"
 
 cp docs/trophies.md "$dest/トロフィー.md"
+cp docs/play-history.md "$dest/プレイ記録.md"
 cp docs/online-diagnostics.md "$dest/オンライン診断.md"
+release_version=$(sed -nE 's/^project\(bbhost VERSION ([0-9]+\.[0-9]+\.[0-9]+).*$/\1/p' CMakeLists.txt)
+notes=docs/releases/$release_version.md
+[ -n "$release_version" ] && [ -f "$notes" ] || { echo "missing Japanese release notes: $notes" >&2; exit 1; }
+cp "$notes" "$dest/リリースノート.md"

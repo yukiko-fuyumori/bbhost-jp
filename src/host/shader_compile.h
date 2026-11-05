@@ -43,6 +43,31 @@ struct ShaderCacheState {
     // shader-compile.txt: the last compile session's result.
     std::vector<std::string> last;  // its lines
 };
+struct ShaderCompileResultCounts {
+    std::uint64_t failed = 0, deferred = 0;
+};
+// Numeric fields are independent of translated display text. Older records
+// only have a "failed reason xN" line for each failure kind.
+inline ShaderCompileResultCounts shader_compile_result_counts(const std::vector<std::string>& lines) {
+    ShaderCompileResultCounts counts;
+    bool have_failed_count = false;
+    for (const std::string& line : lines) {
+        if (line.rfind("failed_count ", 0) == 0) {
+            counts.failed = std::strtoull(line.c_str() + 13, nullptr, 10);
+            have_failed_count = true;
+        } else if (line.rfind("deferred_count ", 0) == 0) {
+            counts.deferred = std::strtoull(line.c_str() + 15, nullptr, 10);
+        }
+    }
+    if (!have_failed_count) {
+        for (const std::string& line : lines) {
+            if (line.rfind("failed ", 0) != 0) continue;
+            const std::size_t at = line.rfind(" x");
+            counts.failed += at == std::string::npos ? 1 : std::strtoull(line.c_str() + at + 2, nullptr, 10);
+        }
+    }
+    return counts;
+}
 // `data` is the data folder the game will use ("" = the default). The device
 // check enumerates this machine's Vulkan devices: done on a thread of its own
 // by ShaderCompileJob::refresh.
@@ -98,7 +123,7 @@ public:
     // Under the job's own lock, what the child said last.
     struct View {
         bool running = false, finished = false, cancelled = false, failed_to_run = false;
-        std::uint64_t done = 0, total = 0, failed = 0, hlsl = 0, lift = 0;
+        std::uint64_t done = 0, total = 0, failed = 0, deferred = 0, hlsl = 0, lift = 0;
         std::uint64_t recipes_done = 0, recipes_total = 0;  // pipelines from the manifest and the shipped list
         double seconds = 0, eta = -1;
         std::string phase, error;
