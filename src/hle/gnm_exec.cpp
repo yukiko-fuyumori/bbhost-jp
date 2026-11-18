@@ -17,6 +17,7 @@
 #include "hle/wait_reg_mem.h"
 #include "engine/gx_resources.h"
 #include "host/gpu.h"
+#include "host/slow_calls.h"
 
 #include <atomic>
 #include <chrono>
@@ -1930,12 +1931,23 @@ bool segment_follows_next(const std::uint32_t* p) {
         if (op == kNop && cnt >= 3 && body[0] == kGxNativeMagic) {
             std::uint32_t count = 0;
             std::uint64_t word = 0;
-            return host_gpu_segment_ids(body[1] | (static_cast<std::uint64_t>(body[2]) << 32), &count, &word) != nullptr;
+            const std::uint64_t next = body[1] | (static_cast<std::uint64_t>(body[2]) << 32);
+            return hle_gx_native_fed(next) && host_gpu_segment_ids(next, &count, &word) != nullptr;  // (a draw the pool never saw: no segment)
         }
         if (list_split_of(op, body, cnt) >= 0) return false;
         p += 1 + cnt;
     }
     return false;
+}
+
+// Draw tokens the pool was never given (stored while it rested), counted
+// on this thread and handed to the splice's report in batches.
+void unfed_token() {
+    static thread_local std::uint32_t n = 0;
+    if (++n == 64) {
+        host_gpu_splice_unfed(n);
+        n = 0;
+    }
 }
 
 // The walk at GX-native draw token b (its n dwords): true when it is a spliced
@@ -2681,8 +2693,13 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             // BBHOST_GX_NATIVE: a GX draw's host-draw token.
             if (n >= 3 && b[0] == kGxNativeMagic) {
                 g_token_nops.fetch_add(1, std::memory_order_relaxed);
+                if (gxvk_lists::times() && gxvk_lists::splice()) host_gpu_lists_arrival(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
+                // A draw stored while the pool rested was never the pool's - no segment, no commit, no pool thread
+                // on its slot - so none of the pool's checks (a spliced segment's members were all fed).
+                const bool fed = !gxvk_lists::pool() || t_seg_left || hle_gx_native_fed(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
+                if (!fed) unfed_token();
                 // Stage 4b.2: a spliced segment's member, or the first member of a segment spliced here.
-                if (gxvk_lists::segments() && segment_token(b, n)) break;
+                if (gxvk_lists::segments() && fed && segment_token(b, n)) break;
                 lookahead_tokens(b + n);
                 const GpuDrawInputs* in = hle_gx_native_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32), t_regs.sh, t_regs.ctx);
                 if (in && list_resolve::census()) {
@@ -2706,7 +2723,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 // Stage 4b.1b (BBHOST_GXVK_LISTS=splice): the pool's commit of the
                 // draw spliced in, where it falls in the run open here.
                 const std::uint64_t token_id = b[1] | (static_cast<std::uint64_t>(b[2]) << 32);
-                if (in && !committed && gxvk_lists::splice() && !list_resolve::commit_draws() && host_gpu_splice(token_id)) {
+                if (in && !committed && fed && gxvk_lists::splice() && !list_resolve::commit_draws() && host_gpu_splice(token_id)) {
                     committed = true;
                     g_draws.fetch_add(1);
                 }
@@ -2720,12 +2737,17 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     if (look) gxvk_lists::cp_look_begin(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
                     const bool flags_needed = host_gpu_segment_flags_needed();
                     if (flags_needed) host_gpu_segment_follows(segment_follows_next(b + n));
+                    if (gxvk_lists::splice_compare()) host_gpu_splice_compare_begin(token_id);
                     native_draw(in, "native");
                     if (flags_needed) host_gpu_segment_follows(false);
                     if (gxvk_lists::splice_compare()) host_gpu_splice_compare(token_id);
                     if (look) gxvk_lists::cp_look_end();
                     if (lists_census) gxvk_lists::cp_draw_end();
-                    if (list_resolve::commit_draws() && !list_resolve::run_held()) run_commit_after(b + n, *in);
+                    // The run commit resting (list_resolve::run_resting, its duty): no fork - the run's draws are
+                    // drawn in order as the walk reaches them. Only a new run waits on it: one forked before the
+                    // rest began is taken above, a held run's count drains as before.
+                    if (list_resolve::commit_draws() && !list_resolve::run_held() && !list_resolve::run_resting())
+                        run_commit_after(b + n, *in);
                 }
                 hle_gx_native_release();
             }
@@ -3200,11 +3222,18 @@ void cp_thread(Queue* q, int id) {
         char name[16];
         std::snprintf(name, sizeof(name), "bb-cp%d", id);
         host_thread_set_name(name);
+        if (id == 0) gxvk_lists::cp_thread_note(host_thread_cpu_clock());  // its CPU time, for the recorder's rest
         // Above the guest's threads on Windows: the game's frame waits on
         // this one, and a GX worker that took its core delayed every draw
         // behind it (core/host_clock.h, BBHOST_THREAD_PRIO=0).
         host_thread_set_class(HostThreadClass::GpuFeed, name);
     }
+    // The thread's timed driver calls (host/slow_calls.h) are its "driver"
+    // phase: those in a command buffer's packets, inside exec, and those
+    // after each job, outside it - the job's submission and the slot it
+    // retires, a wait for the fence or for the submission thread no other
+    // phase holds.
+    const slow_calls::CpPhase driver_phase;
     CpuProfile profile = id == 0 ? cpu_profile_config() : CpuProfile{};
     // BBHOST_CP_IDLE_LOG=1: every 10 s for queue 0, how many jobs it took,
     // how often it found its queue empty and how long it slept on the
@@ -3237,6 +3266,8 @@ void cp_thread(Queue* q, int id) {
             q->jobs.pop_front();
         }
         ++taken;
+        // (the duty's command-processor share: the draw pool's rest, host/gxvk_lists.h, or the run commit's, list_resolve::duty_on)
+        const std::uint64_t job_t0 = id == 0 && (gxvk_lists::pool() || list_resolve::duty_on()) ? host_clock_monotonic_ns() : 0;
         if (idle_log && id == 0) {
             const std::uint64_t now = host_clock_monotonic_ns();
             if (now - idle_since >= 10'000'000'000ull) {
@@ -3356,6 +3387,7 @@ void cp_thread(Queue* q, int id) {
         }
         q->cv.notify_all();
         q->drained.notify_all();
+        if (job_t0) gxvk_lists::cp_busy(host_clock_monotonic_ns() - job_t0);
     }
 }
 
@@ -3577,7 +3609,9 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
     // (the bottleneck meter's back-pressure, host/perf_meter.h).
     const std::uint64_t t0 = host_clock_monotonic_ns();
     q->drained.wait(lk, room);
-    perf_meter_backlog_wait(host_clock_monotonic_ns() - t0);
+    const std::uint64_t held = host_clock_monotonic_ns() - t0;
+    perf_meter_backlog_wait(held);
+    gxvk_lists::cp_held(held);  // the draw pool's duty: whether the command processor in order holds the game back
 }
 
 void hle_gnm_cp_drain() {
@@ -4089,6 +4123,7 @@ void hle_gnm_exec_histogram() {
                  static_cast<unsigned long long>(n > slow ? (g_cp_dispatch_ns[k].load() - slow_ns) / (n - slow) : 0));
     }
     host_gpu_report();
+    slow_calls::final_report();
     list_resolve::report(true);
     gxvk_lists::report(true);
     for (int op = 0; op < 256; ++op) {

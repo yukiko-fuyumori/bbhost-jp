@@ -25,6 +25,7 @@
 #include <timeapi.h>
 #else
 #include <dirent.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -94,6 +95,33 @@ std::uint64_t host_thread_cpu_ns() {
 #else
     timespec ts{};
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(ts.tv_nsec);
+#endif
+}
+
+std::uintptr_t host_thread_cpu_clock() {
+#if defined(_WIN32)
+    // A handle of its own, kept for the process's life (a thread watched so lives as long).
+    return reinterpret_cast<std::uintptr_t>(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId()));
+#else
+    clockid_t id{};
+    if (pthread_getcpuclockid(pthread_self(), &id) != 0) return 0;
+    return static_cast<std::uintptr_t>(static_cast<std::uint32_t>(id)) | (std::uintptr_t{1} << 40);  // never 0
+#endif
+}
+
+std::uint64_t host_thread_cpu_ns_of(std::uintptr_t clock) {
+    if (!clock) return 0;
+#if defined(_WIN32)
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(reinterpret_cast<HANDLE>(clock), &c, &e, &k, &u)) return 0;
+    const auto to64 = [](const FILETIME& f) {
+        return (static_cast<std::uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime;
+    };
+    return (to64(k) + to64(u)) * 100;  // 100 ns units
+#else
+    timespec ts{};
+    if (clock_gettime(static_cast<clockid_t>(static_cast<std::uint32_t>(clock)), &ts) != 0) return 0;
     return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(ts.tv_nsec);
 #endif
 }
@@ -272,8 +300,13 @@ unsigned host_cpu_threads() {
     return std::max(1u, std::thread::hardware_concurrency());
 }
 
+namespace {
+thread_local char t_thread_name[32];  // host_thread_name's
+}  // namespace
+
 void host_thread_set_name(const char* name) {
     if (!name || !name[0]) return;
+    std::snprintf(t_thread_name, sizeof(t_thread_name), "%s", name);
 #if defined(_WIN32)
     pthread_setname_np(pthread_self(), name);
 #else
@@ -302,6 +335,20 @@ void host_thread_set_name(const char* name) {
     for (; i < 63 && name[i]; ++i) w[i] = static_cast<wchar_t>(static_cast<unsigned char>(name[i]));
     w[i] = 0;
     set_desc(GetCurrentThread(), w);
+#endif
+}
+
+bool host_thread_name(char* out, std::size_t n) {
+    if (!out || !n) return false;
+    if (t_thread_name[0]) {
+        std::snprintf(out, n, "%s", t_thread_name);
+        return true;
+    }
+    out[0] = 0;
+#if defined(_WIN32)
+    return false;
+#else
+    return pthread_getname_np(pthread_self(), out, n) == 0 && out[0];
 #endif
 }
 
@@ -366,7 +413,58 @@ bool host_desktop_max_size(int* w, int* h) {
 #endif
 }
 
+bool host_desktop_primary_size(int* w, int* h) {
+#if defined(_WIN32)
+    // The primary display's mode in physical pixels (EnumDisplaySettings with
+    // no device name: the primary one, whatever the DPI awareness).
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (g_headless.load() || !EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) || dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0)
+        return false;
+    *w = static_cast<int>(dm.dmPelsWidth);
+    *h = static_cast<int>(dm.dmPelsHeight);
+    return true;
+#elif defined(BBHOST_HAVE_SDL3)
+    // As host_desktop_max_size, the primary display alone.
+    if (g_headless.load()) return false;
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) return false;
+    int bw = 0, bh = 0;
+    if (const SDL_DisplayID id = SDL_GetPrimaryDisplay()) {
+        if (const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(id)) {
+            const float d = m->pixel_density > 0.0f ? m->pixel_density : 1.0f;
+            bw = static_cast<int>(static_cast<float>(m->w) * d + 0.5f);
+            bh = static_cast<int>(static_cast<float>(m->h) * d + 0.5f);
+        }
+    }
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    if (bw <= 0 || bh <= 0) return false;
+    *w = bw;
+    *h = bh;
+    return true;
+#else
+    (void)w;
+    (void)h;
+    return false;
+#endif
+}
+
+float host_test_refresh_hz() {
+    static const float hz = [] {
+        const char* e = std::getenv("BBHOST_TEST_REFRESH_HZ");
+        if (!e || !*e) return 0.0f;
+        const float v = static_cast<float>(std::atof(e));
+        if (!(v >= 20.0f && v <= 1000.0f)) {
+            host_log("display: BBHOST_TEST_REFRESH_HZ=%s is not a rate from 20 to 1000 Hz; ignored", e);
+            return 0.0f;
+        }
+        host_log("display: every refresh rate asked reads %.3f Hz (BBHOST_TEST_REFRESH_HZ, a test switch)", static_cast<double>(v));
+        return v;
+    }();
+    return hz;
+}
+
 float host_desktop_refresh_hz() {
+    if (const float t = host_test_refresh_hz(); t > 0.0f) return t;
 #if defined(BBHOST_HAVE_SDL3)
     // The primary display, where SDL makes a window it is given no position
     // for (host_window_start), and its desktop mode's rate, which SDL keeps as
@@ -511,6 +609,33 @@ void host_page_guard(void* p, std::size_t size) {
     VirtualProtect(p, size, PAGE_NOACCESS, &old);
 #else
     mprotect(p, size, PROT_NONE);
+#endif
+}
+
+const void* host_map_file(const char* path, std::size_t* size) {
+#if defined(_WIN32)
+    // The sharing fopen's "rb" gives, so a file another program has open still maps.
+    const HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return nullptr;
+    LARGE_INTEGER n{};
+    const HANDLE m = GetFileSizeEx(f, &n) && n.QuadPart > 0 ? CreateFileMappingA(f, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
+    CloseHandle(f);
+    if (!m) return nullptr;
+    const void* p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(m);  // the view keeps the mapping
+    if (p) *size = static_cast<std::size_t>(n.QuadPart);
+    return p;
+#else
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return nullptr;
+    struct stat st{};
+    void* p = MAP_FAILED;
+    if (fstat(fd, &st) == 0 && st.st_size > 0) p = mmap(nullptr, static_cast<std::size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return nullptr;
+    *size = static_cast<std::size_t>(st.st_size);
+    return p;
 #endif
 }
 

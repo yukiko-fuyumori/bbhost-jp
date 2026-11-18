@@ -30,12 +30,17 @@ cp -r patches "$dir/patches"
 mkdir -p "$dir/plugins"
 cp include/bbhost_plugin.h "$dir/plugins/"
 cp LICENSE "$dir/LICENSE.txt"
+cp LICENSE-EXCEPTION "$dir/LICENSE-EXCEPTION.txt"
 tools/package_plugins.sh "$(dirname "$exe")/plugins" "$dir/plugins"
 llvm-objcopy --strip-debug "$exe" "$dir/bbhost.exe"
 cp "$exe" "$out/$name.debug.exe"
 # The HLSL path's compiler beside the exe, where bbhost looks first.
 tools/fetch_dxc.sh windows "$dir"
 dxc_tag=$(cat third_party/dxc/VERSION)
+# The upscalers' and frame generation's runtime beside the exe: AMD's
+# FidelityFX, NVIDIA's DLSS and the upscaler bridge, each under its own
+# licence (tools/fetch_upscalers.sh).
+tools/fetch_upscalers.sh "$dir"
 # The pipeline list beside the binary, where bbhost reads it at each start and
 # builds every pipeline it names (render.cpp pipeline_manifest_load): the
 # pinned release asset (tools/fetch_pipeline_list.sh), or the local list

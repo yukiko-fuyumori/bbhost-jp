@@ -3,6 +3,8 @@
 #include "host/japanese_font.h"
 #include "core/utf8.h"
 #include "host/japanese_labels.h"
+#include "host/game_font.h"
+#include "core/portable.h"
 
 #include "log.h"
 
@@ -20,6 +22,8 @@
 #include <filesystem>
 #include <initializer_list>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <random>
 #include <vector>
 
@@ -54,6 +58,7 @@ SDL_Renderer* g_ren = nullptr;
 ImFont* g_body = nullptr;
 ImFont* g_strong = nullptr;
 ImFont* g_title = nullptr;
+ImFont* g_game = nullptr;  // the serif nearest the game's own menus' letters
 
 struct Art {
     SDL_Texture* sharp = nullptr;  // the painting in the palette
@@ -428,6 +433,9 @@ void init_ingame(float scale) {
     g_art = Art{};
     g_scale = scale;
     load_fonts();
+    // A plugin's panel in the game's own menu letters, read from the dump
+    // (host/game_font.h); the system's serif where it has none.
+    if (ImFont* f = game_font_add_to_imgui()) g_game = f;
     apply_style(scale);
 }
 
@@ -443,13 +451,14 @@ void shutdown() {
     if (g_art.mild) SDL_DestroyTexture(g_art.mild);
     g_art = Art{};
     g_motes.clear();
-    g_body = g_strong = g_title = nullptr;
+    g_body = g_strong = g_title = g_game = nullptr;
     g_ren = nullptr;
 }
 
 float scale() { return g_scale; }
 ImFont* font_strong() { return g_strong ? g_strong : ImGui::GetFont(); }
 ImFont* font_title() { return g_title ? g_title : font_strong(); }
+ImFont* font_game() { return g_game ? g_game : font_title(); }
 
 static bool g_animations = true;
 void set_animations(bool on) { g_animations = on; }
@@ -684,6 +693,27 @@ void draw_icon(ImDrawList* dl, Icon icon, ImVec2 at, float size, ImU32 col) {
         dl->AddCircleFilled(P(0.44f, -0.36f), 0.15f * h, col);
         break;
     }
+    case Icon::Keyboard: {
+        dl->AddRect(P(-0.95f, -0.56f), P(0.95f, 0.56f), col, 0.14f * h, th);
+        for (int row = 0; row < 2; ++row) {
+            for (int k = 0; k < 4; ++k)
+                dl->AddCircleFilled(P(-0.54f + 0.36f * static_cast<float>(k), -0.22f + 0.3f * static_cast<float>(row)), 0.08f * h, col);
+        }
+        dl->AddLine(P(-0.42f, 0.32f), P(0.42f, 0.32f), col, th);  // the space bar
+        break;
+    }
+    case Icon::Problem:
+        dl->AddCircleFilled(at, 0.92f * h, col);
+        dl->AddLine(P(-0.34f, -0.34f), P(0.34f, 0.34f), c(kInk), th * 1.25f);
+        dl->AddLine(P(-0.34f, 0.34f), P(0.34f, -0.34f), c(kInk), th * 1.25f);
+        break;
+    case Icon::Chat: {
+        dl->AddRect(P(-0.9f, -0.74f), P(0.9f, 0.44f), col, 0.34f * h, th);
+        const ImVec2 tail[] = {P(-0.46f, 0.44f), P(-0.62f, 0.9f), P(-0.08f, 0.44f)};
+        dl->AddPolyline(tail, 3, col, th);
+        for (int k = -1; k <= 1; ++k) dl->AddCircleFilled(P(0.4f * static_cast<float>(k), -0.15f), 0.11f * h, col);
+        break;
+    }
     }
 }
 
@@ -892,7 +922,7 @@ bool segmented(const char* id, int* v, const char* const* labels, int n, float w
     return changed;
 }
 
-bool combo(const char* id, int* v, const char* const* items, int n, const char* const* tips) {
+bool combo(const char* id, int* v, const char* const* items, int n, const char* const* tips, const bool* disabled) {
     // The frame's place, before the popup (when open) becomes the window.
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const float w = ImGui::CalcItemWidth(), h = ImGui::GetFrameHeight();
@@ -901,7 +931,8 @@ bool combo(const char* id, int* v, const char* const* items, int n, const char* 
     if (ImGui::BeginCombo(id, *v >= 0 && *v < n ? host_japanese_value(items[*v]) : "", ImGuiComboFlags_NoArrowButton | ImGuiComboFlags_HeightLarge)) {
         for (int i = 0; i < n; ++i) {
             const bool chosen = i == *v;
-            if (ImGui::Selectable(host_japanese_value(items[i]), chosen) && !chosen) {
+            const bool off = disabled && disabled[i];
+            if (ImGui::Selectable(host_japanese_value(items[i]), chosen, off ? ImGuiSelectableFlags_Disabled : 0) && !chosen && !off) {
                 *v = i;
                 changed = true;
             }
@@ -964,6 +995,18 @@ bool icon_button(const char* id, Icon icon, float size, const char* tip) {
     return pressed;
 }
 
+float reset_width() { return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x * 0.5f; }
+
+bool reset_button(const char* id, bool at_default) {
+    ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 0.5f);
+    ImGui::BeginDisabled(at_default);
+    const bool pressed = icon_button(id, Icon::Refresh, 0.0f);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
+        tooltip(nullptr, at_default ? "The default" : "Back to the default");
+    return pressed && !at_default;
+}
+
 bool ghost_button(const char* label, ImVec2 size) {
     ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(255, 255, 255, 14));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(255, 255, 255, 32));
@@ -971,6 +1014,47 @@ bool ghost_button(const char* label, ImVec2 size) {
     const bool pressed = ImGui::Button(label, size);
     ImGui::PopStyleColor(3);
     return pressed;
+}
+
+bool ghost_button(const char* label, Icon icon, ImVec2 size) {
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float s = g_scale, fh = ImGui::GetFrameHeight(), is = std::round(fh * 0.52f), gap = std::round(7 * s);
+    const char* end = ImGui::FindRenderedTextEnd(label);
+    const float tw = ImGui::CalcTextSize(label, end).x;
+    if (size.x <= 0) size.x = std::round(st.FramePadding.x * 2 + is + gap + tw);
+    if (size.y <= 0) size.y = fh;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const bool pressed = ImGui::InvisibleButton(label, size);
+    const bool hovered = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, p + size, c(held ? alpha(kViolet, 120) : IM_COL32(255, 255, 255, hovered ? 32 : 14)), st.FrameRounding);
+    // The icon and the label centred together, the label cut to what is left.
+    const std::string text = fit_text(std::string(label, end), size.x - st.FramePadding.x * 2 - is - gap);
+    const float w = is + gap + ImGui::CalcTextSize(text.c_str()).x;
+    const float x = p.x + std::max(st.FramePadding.x, (size.x - w) * 0.5f);
+    draw_icon(dl, icon, ImVec2(x + is * 0.5f, p.y + size.y * 0.5f), is, c(hovered ? kText : kIce));
+    dl->AddText(ImVec2(x + is + gap, p.y + (size.y - ImGui::GetFontSize()) * 0.5f), c(kText), text.c_str());
+    return pressed;
+}
+
+bool disclosure(const char* label, bool* open) {
+    const float s = g_scale, fs = ImGui::GetFontSize();
+    const char* end = ImGui::FindRenderedTextEnd(label);
+    const float cw = std::round(fs * 0.62f), gap = std::round(6 * s);
+    const ImVec2 size(cw + gap + ImGui::CalcTextSize(label, end).x, std::round(fs * 1.3f));
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    if (ImGui::InvisibleButton(label, size)) *open = !*open;
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 col = c(hovered ? kText : kTextDim);
+    // The chevron: pointing right while closed, down while open.
+    const ImVec2 m(p.x + cw * 0.5f, p.y + size.y * 0.5f);
+    const float k = cw * 0.28f, th = std::max(1.2f, 1.5f * s);
+    const ImVec2 v[] = {*open ? ImVec2(m.x - k * 1.3f, m.y - k * 0.6f) : ImVec2(m.x - k * 0.6f, m.y - k * 1.3f), m + (*open ? ImVec2(0, k * 0.7f) : ImVec2(k * 0.7f, 0)),
+                        *open ? ImVec2(m.x + k * 1.3f, m.y - k * 0.6f) : ImVec2(m.x - k * 0.6f, m.y + k * 1.3f)};
+    dl->AddPolyline(v, 3, col, 0, th);
+    dl->AddText(ImVec2(p.x + cw + gap, p.y + (size.y - fs) * 0.5f), col, label, end);
+    return *open;
 }
 
 void avatar(const std::string& name, float size) {

@@ -19,6 +19,11 @@ std::uint64_t host_process_cpu_ms();
 // (CLOCK_THREAD_CPUTIME_ID; on Windows GetThreadTimes, which moves in the
 // scheduler's ticks - sum it over many frames, not one).
 std::uint64_t host_thread_cpu_ns();
+// The calling thread's CPU-time clock (0: none), whose time any thread then reads
+// with host_thread_cpu_ns_of (0 on failure): a thread watched from another, once
+// a window rather than at its every step.
+std::uintptr_t host_thread_cpu_clock();
+std::uint64_t host_thread_cpu_ns_of(std::uintptr_t clock);
 // Copies len bytes from addr, failing (false) instead of faulting when the
 // page is not mapped: on Linux a plain copy whose fault the SIGSEGV handler
 // hands back (host_read_safe_recover), on Windows ReadProcessMemory. Not from
@@ -40,6 +45,12 @@ std::uint32_t host_thread_id();
 // (comm, 15 characters) on Linux; on Windows winpthreads' copy and
 // SetThreadDescription, which the sampler and debuggers read.
 void host_thread_set_name(const char* name);
+// The calling thread's name as host_thread_set_name last gave it (whole: a
+// longer one than Linux keeps too); else, on Linux, its comm - what it took
+// from the thread that made it. False when it has none. Kept here because
+// winpthreads keeps no name for a detached thread (its pthread_setname_np
+// refuses one whose handle is closed), and most of ours are.
+bool host_thread_name(char* out, std::size_t n);
 // Puts the calling thread at the lowest priority there is (idle on Windows,
 // nice 19 on Linux), for good: work that must never take a core the game wants.
 void host_thread_background();
@@ -50,11 +61,22 @@ unsigned host_cpu_threads();
 // pixels (each display's current mode). False when the platform does not say:
 // a headless run (host_set_headless), or a build without SDL off Windows.
 bool host_desktop_max_size(int* w, int* h);
+// The primary display's size in physical pixels (its current mode): where a
+// window opens when it is given no position, so the screen Borderless and
+// Fullscreen fill. False as host_desktop_max_size.
+bool host_desktop_primary_size(int* w, int* h);
 // The refresh rate of the display the window opens on (the primary one), as
 // the display gives it (59.94, 143.998), asked before the window shell starts:
 // the Uncapped frame rate's (engine/frame_rate.cpp). 0 when nothing says: a
 // headless run, or a build without SDL off Windows.
 float host_desktop_refresh_hz();
+// BBHOST_TEST_REFRESH_HZ=<hz> (a test switch, 20 to 1000; 59.94 allowed): the
+// refresh rate every question about one answers - the desktop's (above) and
+// the window's display's (host/window.h host_window_refresh_hz) - so a display
+// that says another rate or none (RDP's 32 Hz, a headless run) runs
+// Display-Limited, frame generation's half-refresh limit and the flip clock
+// as a monitor of that rate would. 0 when unset.
+float host_test_refresh_hz();
 // Whether this run opens no window (main, once the configuration is final):
 // host_desktop_max_size and host_desktop_refresh_hz then ask no display server.
 void host_set_headless(bool headless);
@@ -104,3 +126,7 @@ void* host_page_alloc(std::size_t size, bool exec);
 void host_page_free(void* p, std::size_t size);
 // Makes [p, p+size) inaccessible: a guard below a stack.
 void host_page_guard(void* p, std::size_t size);
+// A file mapped read-only for the rest of the process, its size in *size: only
+// what is read of it is resident, and the system can drop that again. nullptr
+// when it cannot be opened or mapped, or is empty.
+const void* host_map_file(const char* path, std::size_t* size);

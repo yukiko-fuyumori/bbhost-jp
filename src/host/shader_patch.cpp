@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
 
 namespace {
 
@@ -25,27 +26,51 @@ const Patch kPatches[] = {
     // The else side writes the centre sample through untouched, so an
     // always-false compare (v_cmp_f_f32, opcode 0) leaves every pixel as it was.
     {"e0305cef", &HostSettings::motion_blur, "motion blur", {0x7c061420, 0xbea0246a}, {0x7c001420, 0xbea0246a}},
-    // YEBIS depth of field's composite (d3ca03f3+111fce32):
-    //   v_mad_f32 v0, v5, s0, v0 clamp       ; t = clamp(scene.a * k + b)
-    //   rgb = scene + t * (blurred - scene)
-    // t = 0 - v_mov_b32 v0, 0 and an s_nop for the second word - leaves the
-    // scene as it was. The game's own switch (the je at 0x25d7bbc the
-    // community patch forces) stops YEBIS being fed its focus parameters,
-    // which is only "off" if it never had any: turned off later, the last
-    // ones stay. The blend is where the effect lands, so it is off here.
-    {"111fce32", &HostSettings::depth_of_field, "depth of field", {0xd2820800, 0x04000105}, {0x7e000280, 0xbf800000}},
+    // Its other build, which the camera blur (HD motion blur's) draws with -
+    // twice a frame at the output size, after a pass that packs the velocity
+    // map (7ea47480+d3c8bb21) - the same three instructions. Without it the
+    // Motion blur setting left this blur on, and rebuilt motion vectors' map
+    // (raw NDC motion, which it reads as 0.5 off centre) smeared every mesh.
+    {"157a299c", &HostSettings::motion_blur, "motion blur (camera blur)", {0x7c061420, 0xbea0246a}, {0x7c001420, 0xbea0246a}},
+    // Depth of field is not a patch: YEBIS's own enable, cleared each view
+    // (engine/graphics_patch.cpp, kDofEnable). Zeroing one composite's blend
+    // (d3ca03f3+111fce32) left the multi-level ones - lower resolutions,
+    // cutscenes, strong blur - and every pass before them running.
 };
 constexpr std::size_t kCount = sizeof(kPatches) / sizeof(kPatches[0]);
 
 std::atomic<std::uint32_t> g_mask{0};
+std::atomic<std::uint32_t> g_settings_mask{0};  // what the settings call for
+std::atomic<int> g_look_blur{-1};  // shader_patch_look
+
+// The settings' mask with a plugin's look over it (the settings' thread and
+// the look's call it, one at a time).
+void mask_update() {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    std::uint32_t m = g_settings_mask.load(std::memory_order_acquire);
+    const int blur = g_look_blur.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < kCount; ++i) {
+        const int look = kPatches[i].setting == &HostSettings::motion_blur ? blur : -1;
+        if (look == 1) m &= ~(1u << i);
+        if (look == 0) m |= 1u << i;
+    }
+    g_mask.store(m, std::memory_order_release);
+}
 
 // The settings' listener: which patches they call for, kept for every draw.
 void settings_changed(const HostSettings& hs) {
     std::uint32_t m = 0;
     for (std::size_t i = 0; i < kCount; ++i) {
-        if (!(hs.*(kPatches[i].setting))) m |= 1u << i;
+        // Performance mode takes motion blur off here too: it leaves the
+        // scene's motion blur flag on for the velocity map with an upscaler
+        // (engine/patch_manifest.cpp, performance-mode).
+        const bool off = !(hs.*(kPatches[i].setting)) || (kPatches[i].setting == &HostSettings::motion_blur &&
+                                                          (hs.performance_mode || host_opt_motion_rebuilt_bits()));
+        if (off) m |= 1u << i;
     }
-    g_mask.store(m, std::memory_order_release);
+    g_settings_mask.store(m, std::memory_order_release);
+    mask_update();
 }
 
 }  // namespace
@@ -55,6 +80,12 @@ std::uint32_t shader_patch_mask() {
     static const bool listening = (host_settings_listen(&settings_changed), true);
     (void)listening;
     return g_mask.load(std::memory_order_acquire);
+}
+
+void shader_patch_look(int motion_blur) {
+    (void)shader_patch_mask();  // the settings' listener in first
+    g_look_blur.store(motion_blur, std::memory_order_relaxed);
+    mask_update();
 }
 
 bool shader_patch_touches(const std::string& name) {

@@ -6,6 +6,9 @@
 #include <cmath>
 #include <string>
 
+// No game font is loaded in this standalone UI test.
+ImFont* game_font_add_to_imgui() { return nullptr; }
+
 int main() {
     ImGui::CreateContext();
     auto& io = ImGui::GetIO();

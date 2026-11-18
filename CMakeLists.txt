@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(bbhost VERSION 0.2.26 LANGUAGES C CXX)
+project(bbhost VERSION 0.2.35 LANGUAGES C CXX)
 
 set(BBHOST_EDITION_PROFILE "jp-only")
 configure_file(cmake/bbhost_edition.h.in gen/bbhost_edition.h)
@@ -95,14 +95,21 @@ add_executable(bbhost
   src/core/host_clock.cpp
   src/core/futex.cpp
   src/core/win_vm.cpp
+  src/core/linux_vm.cpp
   src/core/win_watch.cpp
   src/host/win_crash.cpp
   src/host/plugins.cpp
+  src/host/render_hooks.cpp
+  src/host/shader_overrides.cpp
+  src/host/scene_look.cpp
   src/core/tls_rewrite.cpp
+  src/core/legacy_cpu.cpp
+  src/core/legacy_cpu_code.cpp
   src/core/config.cpp src/core/game_edition.cpp
   src/core/trophies.cpp
   src/core/play_history.cpp
   src/core/chalice_history.cpp
+  src/core/config_move.cpp
   src/engine/image_text.cpp
   src/core/sha256.cpp
   src/core/sfo.cpp
@@ -113,6 +120,7 @@ add_executable(bbhost
   src/engine/patch_manifest.cpp
   src/engine/patch_manifest_file.cpp
   src/engine/gx_resources.cpp
+  src/engine/texture_origin.cpp
   src/engine/gx_state.cpp
   src/engine/params.cpp
   src/engine/paramdef.cpp
@@ -131,8 +139,11 @@ add_executable(bbhost
   src/engine/dream_mirror_layout.cpp
   src/engine/chara_id.cpp
   src/engine/five_players.cpp
+  src/engine/phantom_hp.cpp
+  src/engine/auto_replenish.cpp
   src/engine/maiden_events.cpp
   src/engine/option_menu.cpp
+  src/engine/plugin_dialog.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
   src/engine/menu_close.cpp
@@ -141,8 +152,11 @@ add_executable(bbhost
   src/engine/yebis.cpp
   src/engine/yebis_bind.cpp
   src/engine/graphics_patch.cpp
+  src/engine/font_handle_set.cpp
   src/engine/live_resolution.cpp
+  src/engine/render_scale.cpp
   src/engine/loading.cpp
+  src/engine/world_pause.cpp
   src/engine/camera.cpp
   src/engine/mouse_camera.cpp
   src/engine/mouse_camera_stubs.cpp
@@ -162,6 +176,8 @@ add_executable(bbhost
   src/net/http.cpp
   src/net/session.cpp
   src/net/stun.cpp
+  src/net/nat_probe.cpp
+  src/net/nat_job.cpp
   src/hle/np_matching2.cpp
   src/hle/np_signaling.cpp
   src/host/window.cpp
@@ -173,12 +189,20 @@ add_executable(bbhost
   src/host/ingame_menu.cpp
   src/host/trophy_ui.cpp
   src/host/play_history_ui.cpp
+  src/host/plugin_panel.cpp
+  src/host/plugin_menu.cpp
+  src/host/game_font.cpp
+  src/host/game_menu_art.cpp
+  src/host/controls_page.cpp
+  src/host/framegen.cpp
   src/host/options.cpp
   src/host/updater.cpp
   src/host/update_verify.cpp
   src/host/bindings.cpp
   src/host/audio.cpp
+  src/host/audio_crush.cpp
   src/host/frame_stats.cpp
+  src/host/slow_calls.cpp
   src/host/draw_digest.cpp
   src/host/perf_meter.cpp
   src/host/main_wait.cpp
@@ -192,6 +216,7 @@ add_executable(bbhost
   src/hle/sync.cpp
   src/hle/kernel.cpp
   src/hle/fs.cpp
+  src/hle/save_commit.cpp
   src/hle/fios.cpp
   src/hle/dialog.cpp
   src/hle/avplayer.cpp
@@ -220,7 +245,7 @@ add_executable(bbhost
   src/host/label_landing.cpp
 )
 
-target_include_directories(bbhost PRIVATE src include ${CMAKE_BINARY_DIR}/gen)
+target_include_directories(bbhost PRIVATE src include ${CMAKE_BINARY_DIR}/gen third_party/upscaler_bridge third_party/fidelityfx)
 # The port's menu strings, built in (engine/menu_assets.cpp makes the message
 # bundle from them at start): tools/pc_option_messages.tsv as a string literal.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tools/pc_option_messages.tsv)
@@ -251,20 +276,33 @@ add_custom_target(bbhost_translator_fingerprint
   BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/translator_fingerprint.h)
 add_dependencies(bbhost bbhost_translator_fingerprint)
 
-# The Windows exe's icon and version details.
+# The Windows exe's icon, manifest (UTF-8 as its code page) and version details.
 if(WIN32)
   enable_language(RC)
   target_sources(bbhost PRIVATE res/bbhost.rc)
   set_source_files_properties(res/bbhost.rc PROPERTIES
-    OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/res/bbhost.ico;${CMAKE_BINARY_DIR}/gen/bbhost_version.h")
+    OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/res/bbhost.ico;${CMAKE_SOURCE_DIR}/res/bbhost.manifest;${CMAKE_BINARY_DIR}/gen/bbhost_version.h")
 endif()
 
-# The example plugin (include/bbhost_plugin.h, plugins/hello): build/plugins/hello.so
-# or .dll, which the host next to it loads.
-add_library(bb_plugin_hello MODULE plugins/hello/hello.c)
+# The example plugins (examples/plugins, include/bbhost_plugin.h): built beside
+# bbhost (build/hello.so or .dll), never into build/plugins/ - where every run
+# would list and load them - and in no package (tools/package_plugins.sh names
+# the official plugins). hello is built with bbhost, so the API's first example
+# keeps compiling.
+add_library(bb_plugin_hello MODULE examples/plugins/hello/hello.c)
 target_include_directories(bb_plugin_hello PRIVATE include)
-set_target_properties(bb_plugin_hello PROPERTIES OUTPUT_NAME hello PREFIX ""
-  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins)
+set_target_properties(bb_plugin_hello PROPERTIES OUTPUT_NAME hello PREFIX "")
+# The in-game menu example (plugin API 29, docs/plugins.md's In-game menus,
+# which holds it whole - plugin_menu_docs_test checks they are the same).
+add_library(bb_plugin_menu_example MODULE examples/plugins/menu/menu.c)
+target_include_directories(bb_plugin_menu_example PRIVATE include)
+set_target_properties(bb_plugin_menu_example PROPERTIES OUTPUT_NAME menu PREFIX "")
+
+# The shader overrides' example (plugin API 27, examples/plugins/shader_tint):
+# built only when asked for (and by its test).
+add_library(shader_tint_probe MODULE EXCLUDE_FROM_ALL examples/plugins/shader_tint/shader_tint.c)
+target_include_directories(shader_tint_probe PRIVATE include)
+set_target_properties(shader_tint_probe PROPERTIES OUTPUT_NAME shader_tint PREFIX "")
 
 # Official plugins (docs/plugins.md): C++ against
 # include/bbhost (sdk.hpp), built to build/plugins next to the example. On
@@ -288,6 +326,9 @@ bb_plugin(boss_rush plugins/boss_rush/boss_rush.cpp)
 bb_plugin(mutators plugins/mutators/mutators.cpp)
 bb_plugin(quake plugins/quake/quake.cpp)
 bb_plugin(lohit plugins/lohit/lohit.cpp)
+bb_plugin(ps1 plugins/ps1/ps1.cpp)
+bb_plugin(iso plugins/iso/iso.cpp)
+bb_plugin(hunter_cam plugins/hunter_cam/hunter_cam.cpp)
 # The Debug Menu plugin carries its glyphs (plugins/debug_menu/font14.bin,
 # tools/make_debug_font.py) as bytes: build/gen/debug_font14.inc, rewritten
 # only when the file changes.
@@ -310,7 +351,7 @@ if(UNIX)
   target_link_libraries(bbhost PRIVATE pthread dl m)
 elseif(WIN32)
   # hle/net.cpp, net/session.cpp; timeBeginPeriod; WaitOnAddress (core/futex.cpp)
-  target_link_libraries(bbhost PRIVATE ws2_32 winmm synchronization)
+  target_link_libraries(bbhost PRIVATE ws2_32 winmm synchronization version)
   # The SysV convention our guest-facing functions follow lets a leaf keep
   # data in the 128 bytes below rsp, and on Windows an exception - a
   # write-watch fault in a decomp leaf's write, say - builds its frame right
@@ -353,10 +394,23 @@ if(Vulkan_FOUND)
   add_library(replay_common STATIC src/replay/json.cpp src/replay/compare.cpp)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
-  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/gxvk_homes_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/gxvk_homes_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/vertex_snap.cpp src/host/vertex_cutaway.cpp src/host/pixel_cutaway.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/upscaler.cpp src/host/upscaler_ffx.cpp src/host/upscale_pass.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/copy_census.cpp src/host/copy_compare.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
+  # The render probe (plugin API 27's frame info, render hooks and
+  # anti-aliasing claim checked on the GPU: examples/plugins/render_probe): an
+  # example and a test aid, built beside bbhost, never into plugins/ - where
+  # every run would load it - and in no package (tools/package_plugins.sh names
+  # the official ones). A test kit copies it into its own plugins folder.
+  add_library(render_probe MODULE examples/plugins/render_probe/render_probe.cpp)
+  target_include_directories(render_probe PRIVATE include examples/plugins/render_probe)
+  target_compile_features(render_probe PRIVATE cxx_std_17)
+  target_link_libraries(render_probe PRIVATE Vulkan::Headers)
+  set_target_properties(render_probe PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+  if(WIN32)
+    target_link_options(render_probe PRIVATE -static -static-libgcc -static-libstdc++)
+  endif()
   # The SPIR-V validator: the HLSL path validates the modules DXC compiled
   # without its own validator (a sample's run-time offset; host/translation_cache.cpp).
   # Without it those keep the lift.
@@ -365,11 +419,13 @@ if(Vulkan_FOUND)
     target_link_libraries(bbhost PRIVATE ${SPIRV_TOOLS_LIB})
   endif()
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
-  # optimizer; without it every table is built. Not in the Windows build yet,
-  # though its prefix has the optimizer: it has not been run there.
+  # optimizer; without it every table is built - every GX draw's user data in
+  # full, each table's pointer into GX's ring, and the draw pool's list mode
+  # stops at each constant buffer read through one. Windows too: the prefix
+  # (tools/win_deps.sh) builds the optimizer at the Linux builds' tag.
   target_sources(bbhost PRIVATE src/host/shader_liveness.cpp)
   find_library(SPIRV_TOOLS_OPT_LIB SPIRV-Tools-opt)
-  if(SPIRV_TOOLS_LIB AND SPIRV_TOOLS_OPT_LIB AND NOT WIN32)
+  if(SPIRV_TOOLS_LIB AND SPIRV_TOOLS_OPT_LIB)
     target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_SPIRV_OPT=1)
     target_link_libraries(bbhost PRIVATE ${SPIRV_TOOLS_OPT_LIB} ${SPIRV_TOOLS_LIB})
   endif()
@@ -446,6 +502,138 @@ else()
   message(STATUS "bbhost: SDL3/Vulkan not found; headless only")
 endif()
 
+# NVIDIA DLSS on Linux: bbhost's NGX bridge (src/ngx_bridge, MIT, not GPL: it
+# links NVIDIA's NGX SDK), libbbhost_ngx_bridge.so beside bbhost, which bbhost
+# loads at run time (host/upscaler.cpp) as the Windows build loads
+# Numity1504's upscaler_bridge.dll - bbhost itself never links NVIDIA's code.
+# NVIDIA's headers and static library come from its DLSS repository at a
+# pinned tag, each checked by SHA-256 (tools/fetch_ngx.sh, kept in NGX_CACHE,
+# build/ngx by default); never in the repository. BBHOST_NGX=OFF, or the files
+# not fetched (offline): no bridge, and DLSS stays off on Linux. The DLSS
+# runtime it needs at run time (libnvidia-ngx-dlss.so.<version>) the package
+# fetches; for a build here, tools/fetch_ngx.sh runtime build.
+if(UNIX AND NOT APPLE AND Vulkan_FOUND)
+  option(BBHOST_NGX "build the NGX bridge (DLSS on Linux) with NVIDIA's NGX SDK, fetched pinned by tools/fetch_ngx.sh" ON)
+  if(BBHOST_NGX)
+    set(BBHOST_NGX_SDK ${CMAKE_BINARY_DIR}/ngx-sdk)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_ngx.sh sdk ${BBHOST_NGX_SDK}
+      RESULT_VARIABLE ngx_rc OUTPUT_VARIABLE ngx_out ERROR_VARIABLE ngx_err TIMEOUT 600)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_ngx.sh --tag OUTPUT_VARIABLE ngx_tag OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(ngx_rc EQUAL 0 AND EXISTS ${BBHOST_NGX_SDK}/lib/libnvsdk_ngx.a)
+      find_package(Threads REQUIRED)
+      add_library(bbhost_ngx_bridge MODULE src/ngx_bridge/ngx_bridge.cpp src/ngx_bridge/bridge_core.cpp)
+      target_include_directories(bbhost_ngx_bridge PRIVATE third_party/upscaler_bridge ${BBHOST_NGX_SDK}/include)
+      string(REGEX REPLACE "^v" "" ngx_version "${ngx_tag}")
+      target_compile_definitions(bbhost_ngx_bridge PRIVATE NGX_BRIDGE_SDK="${ngx_version}")
+      target_compile_features(bbhost_ngx_bridge PRIVATE cxx_std_17)
+      # NVIDIA's headers' own initialisers.
+      target_compile_options(bbhost_ngx_bridge PRIVATE -Wno-missing-field-initializers -Wno-missing-braces)
+      target_link_libraries(bbhost_ngx_bridge PRIVATE Vulkan::Headers ${BBHOST_NGX_SDK}/lib/libnvsdk_ngx.a ${CMAKE_DL_LIBS} Threads::Threads m)
+      # One symbol out (ub_get_api), NVIDIA's library's kept in, and nothing left unresolved.
+      target_link_options(bbhost_ngx_bridge PRIVATE -Wl,--exclude-libs,ALL
+        -Wl,--version-script=${CMAKE_SOURCE_DIR}/src/ngx_bridge/exports.map -Wl,-z,defs)
+      set_target_properties(bbhost_ngx_bridge PROPERTIES OUTPUT_NAME bbhost_ngx_bridge PREFIX lib
+        CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+        LINK_DEPENDS ${CMAKE_SOURCE_DIR}/src/ngx_bridge/exports.map)
+      add_dependencies(bbhost bbhost_ngx_bridge)
+      message(STATUS "bbhost: NVIDIA's NGX SDK ${ngx_version}; building the NGX bridge (DLSS on Linux), ${CMAKE_BINARY_DIR}/libbbhost_ngx_bridge.so")
+    else()
+      string(STRIP "${ngx_err}" ngx_err)
+      string(REPLACE "\n" "; " ngx_err "${ngx_err}")
+      message(STATUS "bbhost: NVIDIA's NGX SDK not fetched (${ngx_err}); no NGX bridge: DLSS stays off on Linux")
+    endif()
+  else()
+    message(STATUS "bbhost: BBHOST_NGX=OFF; no NGX bridge: DLSS stays off on Linux")
+  endif()
+endif()
+
+# AMD FSR 3 on Linux: bbhost's build of AMD's FidelityFX library (src/ffx_vk,
+# MIT), libbbhost_fidelityfx_vk.so beside bbhost, which bbhost loads at run
+# time (host/upscaler_ffx.cpp) as the Windows build uses AMD's signed DLLs.
+# AMD's sources - the FidelityFX API, its Vulkan backend and FSR 3 - come from
+# its repository at a pinned tag, each file checked by SHA-256 and patched by
+# third_party/fidelityfx/patches (tools/fetch_fidelityfx.sh, kept in FFX_CACHE,
+# build/fidelityfx by default); never in the repository. Their compute shaders
+# are compiled here into the permutation headers the sources include
+# (tools/ffx_permutations.py, with the command-line DXC of tools/fetch_dxc.sh
+# linux-cli, kept in DXC_CACHE, every blob checked by spirv-val). BBHOST_FFX=OFF,
+# or anything of it missing (offline, no spirv-val): no library, and FSR stays
+# off on Linux.
+if(UNIX AND NOT APPLE AND Vulkan_FOUND)
+  option(BBHOST_FFX "build bbhost's FidelityFX library (FSR 3 on Linux) from AMD's SDK, fetched pinned by tools/fetch_fidelityfx.sh" ON)
+  if(BBHOST_FFX)
+    find_package(Python3 COMPONENTS Interpreter)
+    find_package(Threads REQUIRED)
+    find_program(BBHOST_SPIRV_VAL spirv-val)
+    set(BBHOST_FFX_SDK ${CMAKE_BINARY_DIR}/fidelityfx-sdk)
+    set(BBHOST_FFX_DXC ${CMAKE_BINARY_DIR}/dxc-cli)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_fidelityfx.sh sdk ${BBHOST_FFX_SDK}
+      RESULT_VARIABLE ffx_rc OUTPUT_VARIABLE ffx_out ERROR_VARIABLE ffx_err TIMEOUT 900)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_dxc.sh linux-cli ${BBHOST_FFX_DXC}
+      RESULT_VARIABLE dxc_rc OUTPUT_VARIABLE dxc_out ERROR_VARIABLE dxc_err TIMEOUT 900)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_fidelityfx.sh --tag OUTPUT_VARIABLE ffx_tag OUTPUT_STRIP_TRAILING_WHITESPACE)
+    set(ffx_kit ${BBHOST_FFX_SDK}/Kits/FidelityFX)
+    if(NOT ffx_rc EQUAL 0)
+      string(STRIP "${ffx_err}" ffx_why)
+    elseif(NOT dxc_rc EQUAL 0)
+      string(STRIP "DXC's command-line compiler: ${dxc_err}" ffx_why)
+    elseif(NOT Python3_FOUND OR NOT BBHOST_SPIRV_VAL)
+      set(ffx_why "python3 and spirv-val are needed to make its shaders")
+    else()
+      set(ffx_why "")
+    endif()
+    if(ffx_why STREQUAL "")
+      # The shaders: the headers the SDK's *_shaderblobs.cpp includes, made
+      # together by one run of the generator, which rewrites only what changed.
+      set(ffx_blobs_cpp ${ffx_kit}/upscalers/fsr3/internal/ffx_fsr3upscaler_shaderblobs.cpp)
+      set(ffx_gen ${CMAKE_BINARY_DIR}/ffx-permutations)
+      file(STRINGS ${ffx_blobs_cpp} ffx_includes REGEX "^#include <.*_permutations\\.h>")
+      set(ffx_headers "")
+      foreach(line ${ffx_includes})
+        string(REGEX REPLACE "^#include <(.*)>.*$" "${ffx_gen}/\\1" header "${line}")
+        list(APPEND ffx_headers ${header})
+      endforeach()
+      file(GLOB_RECURSE ffx_shader_sources ${ffx_kit}/upscalers/fsr3/internal/shaders/*.hlsl ${ffx_kit}/upscalers/fsr3/include/gpu/*.h
+        ${ffx_kit}/api/internal/gpu/*.h ${ffx_kit}/framegeneration/*.h)
+      add_custom_command(OUTPUT ${ffx_gen}/ffx_permutations.stamp ${ffx_headers}
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/ffx_permutations.py --sdk ${ffx_kit} --dxc ${BBHOST_FFX_DXC}/bin/dxc
+          --out ${ffx_gen} --spirv-val ${BBHOST_SPIRV_VAL} --compress --stamp ${ffx_gen}/ffx_permutations.stamp
+        DEPENDS ${CMAKE_SOURCE_DIR}/tools/ffx_permutations.py ${ffx_blobs_cpp} ${ffx_kit}/upscalers/fsr3/internal/ffx_fsr3upscaler.cpp
+          ${ffx_shader_sources} ${BBHOST_FFX_DXC}/bin/dxc
+        COMMENT "FidelityFX: FSR 3's shader permutations (DXC, spirv-val)" VERBATIM)
+      set(ffx_sources ${ffx_kit}/api/internal/ffx_api.cpp ${ffx_kit}/api/internal/ffx_assert.cpp ${ffx_kit}/api/internal/ffx_message.cpp
+        ${ffx_kit}/api/internal/ffx_object_management.cpp ${ffx_kit}/api/internal/ffx_query_fallback.cpp ${ffx_kit}/backend/vk/ffx_backends_vk.cpp
+        ${ffx_kit}/backend/vk/ffx_vk.cpp ${ffx_kit}/upscalers/fsr3/internal/ffx_fsr3upscaler.cpp ${ffx_blobs_cpp}
+        ${ffx_kit}/upscalers/fsr3/internal/ffx_provider_fsr3upscale.cpp)
+      add_library(bbhost_fidelityfx_vk MODULE ${ffx_sources} src/ffx_vk/ffx_providers_vk.cpp ${ffx_gen}/ffx_permutations.stamp)
+      set_source_files_properties(${ffx_blobs_cpp} PROPERTIES OBJECT_DEPENDS "${ffx_headers}")
+      target_include_directories(bbhost_fidelityfx_vk PRIVATE src/ffx_vk/include ${ffx_gen} ${ffx_kit} ${ffx_kit}/api/internal ${ffx_kit}/api/include)
+      target_compile_definitions(bbhost_fidelityfx_vk PRIVATE FFX_BACKEND_VK FFX_UPSCALER)
+      # AMD's sources as they are: MSVC's literal suffixes (ui64) take
+      # -fms-extensions, src/ffx_vk/ffx_linux.h the rest; its MSVC pragmas and
+      # deprecations are AMD's. A float handed to int abs() fails the build
+      # (ffx_linux.h says why).
+      target_compile_options(bbhost_fidelityfx_vk PRIVATE -fms-extensions -include ${CMAKE_SOURCE_DIR}/src/ffx_vk/ffx_linux.h
+        -Wno-unknown-pragmas -Wno-unknown-warning-option -Wno-deprecated-declarations -Werror=absolute-value)
+      target_link_libraries(bbhost_fidelityfx_vk PRIVATE Vulkan::Vulkan ZLIB::ZLIB Threads::Threads m)
+      # The five API functions out, libstdc++ and libgcc inside, nothing left
+      # unresolved: the library needs only the Vulkan loader, zlib and glibc.
+      target_link_options(bbhost_fidelityfx_vk PRIVATE -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL
+        -Wl,--version-script=${CMAKE_SOURCE_DIR}/src/ffx_vk/exports.map -Wl,-z,defs)
+      set_target_properties(bbhost_fidelityfx_vk PROPERTIES OUTPUT_NAME bbhost_fidelityfx_vk PREFIX lib
+        CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+        LINK_DEPENDS ${CMAKE_SOURCE_DIR}/src/ffx_vk/exports.map)
+      add_dependencies(bbhost bbhost_fidelityfx_vk)
+      message(STATUS "bbhost: AMD's FidelityFX SDK ${ffx_tag}; building the FidelityFX library (FSR 3 on Linux), ${CMAKE_BINARY_DIR}/libbbhost_fidelityfx_vk.so")
+    else()
+      string(REPLACE "\n" "; " ffx_why "${ffx_why}")
+      message(STATUS "bbhost: no FidelityFX library (${ffx_why}): FSR stays off on Linux")
+    endif()
+  else()
+    message(STATUS "bbhost: BBHOST_FFX=OFF; no FidelityFX library: FSR stays off on Linux")
+  endif()
+endif()
+
 # The game's functions as ours (src/decomp, docs/decomp.md), one folder per
 # engine area. A leaf runs on the game's thread state, where FS may be the
 # game's, so no decomp file reads the stack protector's canary through it; and
@@ -480,6 +668,7 @@ set(BBHOST_DECOMP_SOURCES
   src/decomp/gx/upload_heap.cpp
   src/decomp/gx/render_queue.cpp
   src/decomp/gx/job_barrier.cpp
+  src/decomp/gx/movie_draw.cpp
   src/decomp/gnmx/cue.cpp
   src/decomp/yebis/gnm.cpp
   src/decomp/yebis/context.cpp
@@ -540,6 +729,16 @@ add_executable(guest_console_test tests/guest_console_test.cpp src/hle/guest_con
 target_include_directories(guest_console_test PRIVATE src)
 target_compile_features(guest_console_test PRIVATE cxx_std_17)
 add_test(NAME guest_console_test COMMAND guest_console_test)
+# A save written whole or not at all: the commit at unmount, and a kill at
+# each of its steps with the recovery after it (hle/save_commit.h; a child
+# process forked on Linux, the test run again on Windows).
+add_executable(save_commit_test tests/save_commit_test.cpp src/hle/save_commit.cpp)
+target_include_directories(save_commit_test PRIVATE src)
+target_compile_features(save_commit_test PRIVATE cxx_std_17)
+if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+  set_property(TARGET save_commit_test PROPERTY CROSSCOMPILING_EMULATOR wine)
+endif()
+add_test(NAME save_commit_test COMMAND save_commit_test)
 add_executable(libc_wide_test tests/libc_wide_test.cpp src/hle/sysv_va.cpp)
 target_include_directories(libc_wide_test PRIVATE src)
 add_test(NAME libc_wide_test COMMAND libc_wide_test)
@@ -547,15 +746,24 @@ add_test(NAME libc_wide_test COMMAND libc_wide_test)
 if(UNIX)
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
+    add_test(NAME steam_wayland_input_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/steam_wayland_input_test.py)
+    set_tests_properties(steam_wayland_input_test PROPERTIES TIMEOUT 20)
     add_test(NAME world_baseline_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/world_baseline_test.py)
     add_test(NAME area_check_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/area_check_test.py)
     add_test(NAME lift_verify_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lift_verify_test.py)
     add_test(NAME pipeline_list_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/pipeline_list_test.py)
+    # tools/upscale_check.py on the reprojection check's log lines (host/upscale_pass.cpp).
+    add_test(NAME upscale_check_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/upscale_check_test.py)
     add_test(NAME full_tour_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/full_tour_test.py)
     # The Debug Menu plugin's English against the 1.09 eboot: skipped without
     # one (BBHOST_EBOOT, or eboot-109-decrypted.bin in the checkout).
     add_test(NAME debug_menu_strings_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/debug_menu_strings.py check)
     set_tests_properties(debug_menu_strings_test PROPERTIES SKIP_RETURN_CODE 77)
+    # The legacy-CPU site table (core/legacy_cpu.h) against the eboot, and
+    # every instruction of its code against the supported processors: skipped
+    # without the eboot or capstone.
+    add_test(NAME legacy_cpu_sites_table_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/legacy_cpu_sites.py check)
+    set_tests_properties(legacy_cpu_sites_table_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
   endif()
   # The map-validation probe's tour steps (tools/area_check.py's) on a pretend
   # host. Built beside the tests, never into plugins/, where bbhost would load it.
@@ -569,6 +777,12 @@ if(UNIX)
   add_dependencies(mapval_probe_test mapval_probe)
   add_test(NAME mapval_probe_test COMMAND mapval_probe_test $<TARGET_FILE:mapval_probe>)
   set_tests_properties(mapval_probe_test PROPERTIES SKIP_RETURN_CODE 77)
+  # Plugin API 29's world_pause, world_step, pad, pad_take and world_state in a
+  # running game, for a harness (tools/api29_probe.c). Built beside the tests,
+  # never into plugins/, where bbhost would load it.
+  add_library(api29_probe MODULE tools/api29_probe.c)
+  target_include_directories(api29_probe PRIVATE include)
+  set_target_properties(api29_probe PROPERTIES PREFIX "")
   # The boss rush plugin's travel and fog warp on a pretend host whose loads
   # are slow (plugins/boss_rush): nothing moves the player inside a loading
   # screen, and only a travel that truly fails stops the run.
@@ -578,6 +792,96 @@ if(UNIX)
   target_link_libraries(boss_rush_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(boss_rush_test bb_plugin_boss_rush)
   add_test(NAME boss_rush_test COMMAND boss_rush_test $<TARGET_FILE:bb_plugin_boss_rush>)
+  # The render probe (examples/plugins/render_probe) on a pretend host and a pretend
+  # Vulkan device: what it asks of the device and records, and its own checks.
+  if(TARGET render_probe)
+    add_executable(render_probe_test tests/render_probe_test.cpp)
+    target_include_directories(render_probe_test PRIVATE src include)
+    target_compile_features(render_probe_test PRIVATE cxx_std_17)
+    target_link_libraries(render_probe_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    add_dependencies(render_probe_test render_probe)
+    add_test(NAME render_probe_test COMMAND render_probe_test $<TARGET_FILE:render_probe>)
+  endif()
+  # The PS1 Look plugin on a pretend host (plugins/ps1): the look it asks the
+  # host for at the start and as its options change, and none on an older host.
+  add_executable(ps1_plugin_test tests/ps1_plugin_test.cpp)
+  target_include_directories(ps1_plugin_test PRIVATE include)
+  target_compile_features(ps1_plugin_test PRIVATE cxx_std_17)
+  target_link_libraries(ps1_plugin_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(ps1_plugin_test bb_plugin_ps1)
+  add_test(NAME ps1_plugin_test COMMAND ps1_plugin_test $<TARGET_FILE:bb_plugin_ps1>)
+  # The in-game menus' test plugin (tests/plugins/menu_demo.cpp: every part of
+  # plugin API 29's menus) on a pretend host, and its menus in the host's panel
+  # through the world's states (the game's own interruptions). Built beside the
+  # tests, never into plugins/, where bbhost would load it.
+  add_library(menu_demo MODULE tests/plugins/menu_demo.cpp)
+  target_include_directories(menu_demo PRIVATE include)
+  target_compile_features(menu_demo PRIVATE cxx_std_17)
+  set_target_properties(menu_demo PROPERTIES PREFIX "")
+  add_executable(plugin_menus_test tests/plugin_menus_test.cpp src/host/plugin_menu.cpp src/host/plugin_panel.cpp)
+  target_include_directories(plugin_menus_test PRIVATE src include)
+  target_compile_features(plugin_menus_test PRIVATE cxx_std_17)
+  target_link_libraries(plugin_menus_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(plugin_menus_test menu_demo)
+  add_test(NAME plugin_menus_test COMMAND plugin_menus_test $<TARGET_FILE:menu_demo>)
+  # The shader overrides' example on a pretend host (examples/plugins/shader_tint):
+  # its own source asked for until met, patched, on and off by turns, its
+  # strength in its shader data each frame; nothing asked of an older host.
+  add_executable(shader_tint_test tests/shader_tint_test.cpp)
+  target_include_directories(shader_tint_test PRIVATE include)
+  target_compile_features(shader_tint_test PRIVATE cxx_std_17)
+  target_link_libraries(shader_tint_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(shader_tint_test shader_tint_probe)
+  add_test(NAME shader_tint_test COMMAND shader_tint_test $<TARGET_FILE:shader_tint_probe>)
+  # The NGX bridge (src/ngx_bridge): its parts without NVIDIA's code always;
+  # with the bridge built, the library itself through bbhost's call order, and
+  # host/upscaler.cpp's Linux loader with it, under Numity1504's name, under
+  # all three names (the first found loads) and with none. A pretend Vulkan (tests/fake_vulkan.h) stands in for the loader, so no
+  # driver or GPU is touched.
+  if(Vulkan_FOUND)
+    add_executable(ngx_bridge_test tests/ngx_bridge_test.cpp src/ngx_bridge/bridge_core.cpp)
+    target_include_directories(ngx_bridge_test PRIVATE src third_party/upscaler_bridge)
+    target_link_libraries(ngx_bridge_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    add_executable(upscaler_load_test tests/upscaler_load_test.cpp src/host/upscaler.cpp src/host/upscaler_ffx.cpp)
+    target_include_directories(upscaler_load_test PRIVATE src third_party/upscaler_bridge third_party/fidelityfx ${CMAKE_BINARY_DIR}/gen)
+    target_link_libraries(upscaler_load_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    add_dependencies(upscaler_load_test bbhost_version)
+    add_test(NAME upscaler_load_none COMMAND upscaler_load_test none)
+    add_test(NAME upscaler_load_layer COMMAND upscaler_load_test none)
+    set_tests_properties(upscaler_load_layer PROPERTIES ENVIRONMENT BBHOST_UPSCALE_LAYER=1)
+    if(TARGET bbhost_ngx_bridge)
+      add_dependencies(ngx_bridge_test bbhost_ngx_bridge)
+      add_dependencies(upscaler_load_test bbhost_ngx_bridge)
+      add_test(NAME ngx_bridge_test COMMAND ngx_bridge_test $<TARGET_FILE:bbhost_ngx_bridge>)
+      add_test(NAME upscaler_load_bridge COMMAND upscaler_load_test bridge $<TARGET_FILE:bbhost_ngx_bridge>)
+      add_test(NAME upscaler_load_numity COMMAND upscaler_load_test numity $<TARGET_FILE:bbhost_ngx_bridge>)
+      add_test(NAME upscaler_load_order COMMAND upscaler_load_test order $<TARGET_FILE:bbhost_ngx_bridge>)
+    else()
+      add_test(NAME ngx_bridge_test COMMAND ngx_bridge_test)
+    endif()
+    # host/upscaler.cpp's FSR on Linux: bbhost's FidelityFX library beside
+    # bbhost, alone and with the NGX bridge, and on a device it cannot run on.
+    if(TARGET bbhost_fidelityfx_vk)
+      add_dependencies(upscaler_load_test bbhost_fidelityfx_vk)
+      add_test(NAME upscaler_load_fsr COMMAND upscaler_load_test fsr $<TARGET_FILE:bbhost_fidelityfx_vk>)
+      add_test(NAME upscaler_load_fsr_noquad COMMAND upscaler_load_test fsr-noquad $<TARGET_FILE:bbhost_fidelityfx_vk>)
+      if(TARGET bbhost_ngx_bridge)
+        add_test(NAME upscaler_load_fsr_bridge COMMAND upscaler_load_test fsr $<TARGET_FILE:bbhost_fidelityfx_vk> $<TARGET_FILE:bbhost_ngx_bridge>)
+      endif()
+    endif()
+    # bbhost's FidelityFX library (src/ffx_vk) on a real device - lavapipe in
+    # the tests: FSR 3 upscales a jittered synthetic picture, accumulated and
+    # with the jitter read as the host means it. Exit 77 without a device.
+    if(TARGET bbhost_fidelityfx_vk)
+      add_executable(ffx_fsr3_test tests/ffx_fsr3_test.cpp)
+      target_include_directories(ffx_fsr3_test PRIVATE third_party/fidelityfx)
+      target_link_libraries(ffx_fsr3_test PRIVATE Vulkan::Vulkan ${CMAKE_DL_LIBS})
+      target_compile_options(ffx_fsr3_test PRIVATE -Wno-missing-field-initializers)
+      add_dependencies(ffx_fsr3_test bbhost_fidelityfx_vk)
+      add_test(NAME ffx_fsr3_test COMMAND ffx_fsr3_test $<TARGET_FILE:bbhost_fidelityfx_vk>)
+      set_tests_properties(ffx_fsr3_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+    endif()
+  endif()
   add_executable(thunk_args tests/thunk_args.cpp src/core/thunk.cpp src/core/tls_rewrite.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   target_include_directories(thunk_args PRIVATE src)
   target_link_libraries(thunk_args PRIVATE pthread)
@@ -590,6 +894,16 @@ if(UNIX)
   target_include_directories(sdk_headers_test PRIVATE include)
   target_compile_features(sdk_headers_test PRIVATE cxx_std_17)
   add_test(NAME sdk_headers_test COMMAND sdk_headers_test)
+  # Plugin API 27 (host/render_api.h): a frame's cameras from the view block, its reset and cut test.
+  add_executable(render_api_test tests/render_api_test.cpp)
+  target_include_directories(render_api_test PRIVATE src include)
+  target_compile_features(render_api_test PRIVATE cxx_std_17)
+  add_test(NAME render_api_test COMMAND render_api_test)
+  # The plugin API's version 27 structures as C: their sizes and places, which plugins are built against.
+  add_executable(plugin_abi_test tests/plugin_abi_test.c)
+  target_include_directories(plugin_abi_test PRIVATE include)
+  set_target_properties(plugin_abi_test PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
+  add_test(NAME plugin_abi_test COMMAND plugin_abi_test)
   add_executable(libc_native_test tests/libc_native_test.cpp src/hle/sysv_va.cpp)
   target_include_directories(libc_native_test PRIVATE src)
   target_compile_features(libc_native_test PRIVATE cxx_std_17)
@@ -609,28 +923,55 @@ if(UNIX)
   add_executable(stun_test tests/stun_test.cpp src/net/stun.cpp)
   target_include_directories(stun_test PRIVATE src)
   add_test(NAME stun_test COMMAND stun_test)
-  # Datagrams between two P2P sockets through hle/net.cpp: the game's split
-  # into whole chunks, others up to the largest UDP carries; whole with
-  # BBHOST_NET_SPLIT_DATAGRAMS=0, the 2 KB limit with
-  # BBHOST_NET_LARGE_DATAGRAMS=0 (tests/net_p2p_test.cpp).
+  # Datagrams between two P2P sockets through hle/net.cpp, directly and
+  # through the relay: the game's split into pieces of whole chunks, others
+  # whole up to the largest UDP carries; whole with
+  # BBHOST_NET_SPLIT_DATAGRAMS=0 (tests/net_p2p_test.cpp).
   add_executable(net_p2p_test tests/net_p2p_test.cpp src/hle/net.cpp src/net/stun.cpp src/core/futex.cpp)
   target_include_directories(net_p2p_test PRIVATE src)
   target_link_libraries(net_p2p_test PRIVATE pthread)
   add_test(NAME net_p2p_test COMMAND net_p2p_test)
   add_test(NAME net_p2p_whole_test COMMAND net_p2p_test)
   set_tests_properties(net_p2p_whole_test PROPERTIES ENVIRONMENT BBHOST_NET_SPLIT_DATAGRAMS=0)
-  add_test(NAME net_p2p_small_test COMMAND net_p2p_test)
-  set_tests_properties(net_p2p_small_test PROPERTIES ENVIRONMENT BBHOST_NET_LARGE_DATAGRAMS=0)
-  set_tests_properties(net_p2p_test net_p2p_whole_test net_p2p_small_test PROPERTIES TIMEOUT 60)
+  set_tests_properties(net_p2p_test net_p2p_whole_test PROPERTIES TIMEOUT 60)
   # The event poller's long polls and generations (net/poll_pacing.h).
   add_executable(poll_pacing_test tests/poll_pacing_test.cpp)
   target_include_directories(poll_pacing_test PRIVATE src)
   target_link_libraries(poll_pacing_test PRIVATE pthread)
   add_test(NAME poll_pacing_test COMMAND poll_pacing_test)
   set_tests_properties(poll_pacing_test PROPERTIES TIMEOUT 60)  # a turn never handed back hangs its threads
+  # sceNpScoreSanitizeComment's answer: the character names the game shows
+  # under Player Name Display "Name" come back whole (hle/np_score.h).
+  add_executable(np_score_test tests/np_score_test.cpp)
+  target_include_directories(np_score_test PRIVATE src)
+  add_test(NAME np_score_test COMMAND np_score_test)
+  # The setup window's sign-in check and relay switch: the server's answers
+  # read (net/sign_in_check.h).
+  add_executable(sign_in_check_test tests/sign_in_check_test.cpp src/replay/json.cpp)
+  target_include_directories(sign_in_check_test PRIVATE src)
+  add_test(NAME sign_in_check_test COMMAND sign_in_check_test)
+  # The setup window's links out (host/links.h): the addresses, and no browser
+  # from a test's window.
+  add_executable(launcher_links_test tests/launcher_links_test.cpp)
+  target_include_directories(launcher_links_test PRIVATE src)
+  add_test(NAME launcher_links_test COMMAND launcher_links_test)
+  # The setup window's connection test (net/nat_check.h): the exchange from a
+  # port against a test server of its own on loopback - a router that keeps
+  # one port, one that changes it, none answering, the first seconds held,
+  # every send refused, the port check open, closed and absent, this PC's own
+  # address - the server's answers read, and the card's words for each
+  # reading, the relay switch's and the P2P port's (~25 s of waits).
+  add_executable(nat_check_test tests/nat_check_test.cpp src/net/nat_probe.cpp src/net/stun.cpp src/replay/json.cpp)
+  target_include_directories(nat_check_test PRIVATE src)
+  target_link_libraries(nat_check_test PRIVATE Threads::Threads)
+  add_test(NAME nat_check_test COMMAND nat_check_test)
+  set_tests_properties(nat_check_test PROPERTIES TIMEOUT 120)
   add_executable(uncapped_limit_test tests/uncapped_limit_test.cpp)
   target_include_directories(uncapped_limit_test PRIVATE src)
   add_test(NAME uncapped_limit_test COMMAND uncapped_limit_test)
+  add_executable(fg_pace_test tests/fg_pace_test.cpp)
+  target_include_directories(fg_pace_test PRIVATE src)
+  add_test(NAME fg_pace_test COMMAND fg_pace_test)
   add_executable(frame_clock_test tests/frame_clock_test.cpp)
   target_include_directories(frame_clock_test PRIVATE src)
   add_test(NAME frame_clock_test COMMAND frame_clock_test)
@@ -645,6 +986,13 @@ if(UNIX)
   add_executable(wait_reg_mem_test tests/wait_reg_mem_test.cpp)
   target_include_directories(wait_reg_mem_test PRIVATE src)
   add_test(NAME wait_reg_mem_test COMMAND wait_reg_mem_test)
+  # The slow-call registry without the game: the line, the counts, the test
+  # hook and its lock, the cost of a timed call (tests/slow_calls_test.cpp).
+  add_executable(slow_calls_test tests/slow_calls_test.cpp src/host/slow_calls.cpp src/core/host_clock.cpp)
+  target_include_directories(slow_calls_test PRIVATE src)
+  target_link_libraries(slow_calls_test PRIVATE Threads::Threads)
+  add_test(NAME slow_calls_test COMMAND slow_calls_test)
+  set_tests_properties(slow_calls_test PROPERTIES TIMEOUT 60)
   # FMOD's sound-group ring guard without the game (tests/fmod_ring_test.cpp).
   add_executable(fmod_ring_test tests/fmod_ring_test.cpp)
   target_include_directories(fmod_ring_test PRIVATE src)
@@ -667,20 +1015,27 @@ if(UNIX)
   target_include_directories(image_file_test PRIVATE src)
   target_link_libraries(image_file_test PRIVATE ZLIB::ZLIB)
   add_test(NAME image_file_test COMMAND image_file_test)
-  add_executable(config_test tests/config_test.cpp src/core/config.cpp src/core/game_edition.cpp src/core/sfo.cpp)
+  add_executable(config_test tests/config_test.cpp src/core/config.cpp src/core/game_edition.cpp src/core/config_move.cpp src/core/sfo.cpp)
   target_include_directories(config_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_compile_definitions(config_test PRIVATE CONFIG_MUTANTS)  # the play-log migration's mutants
   add_dependencies(config_test bbhost_version)
   add_test(NAME config_test COMMAND config_test)
+  # The per-user settings folder's move on Linux (core/config_move.h), in
+  # temporary folders: a HOME and XDG folders of its own.
+  add_executable(config_move_test tests/config_move_test.cpp src/core/config.cpp src/core/game_edition.cpp src/core/config_move.cpp src/core/sfo.cpp)
+  target_include_directories(config_move_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_compile_definitions(config_move_test PRIVATE CONFIG_MOVE_TEST)
+  add_dependencies(config_move_test bbhost_version)
+  add_test(NAME config_move_test COMMAND config_move_test)
   # The session's online rules: a gameplay patch manifest makes them say modded.
-  add_executable(ruleset_test tests/ruleset_test.cpp src/core/config.cpp src/core/game_edition.cpp src/core/sfo.cpp)
+  add_executable(ruleset_test tests/ruleset_test.cpp src/core/config.cpp src/core/game_edition.cpp src/core/config_move.cpp src/core/sfo.cpp)
   target_include_directories(ruleset_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_compile_definitions(ruleset_test PRIVATE BB_PATCHES_DIR="${CMAKE_SOURCE_DIR}/patches")
   add_dependencies(ruleset_test bbhost_version)
   add_test(NAME ruleset_test COMMAND ruleset_test)
   # The shipped manifests read as the game reads them: the ones on by default
   # are exactly the expected list (Screen Space Reflections stays off).
-  add_executable(patch_defaults_test tests/patch_defaults_test.cpp src/engine/patch_manifest_file.cpp src/core/config.cpp src/core/game_edition.cpp src/core/sfo.cpp)
+  add_executable(patch_defaults_test tests/patch_defaults_test.cpp src/engine/patch_manifest_file.cpp src/core/config.cpp src/core/game_edition.cpp src/core/config_move.cpp src/core/sfo.cpp)
   target_include_directories(patch_defaults_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_compile_definitions(patch_defaults_test PRIVATE BB_PATCHES_DIR="${CMAKE_SOURCE_DIR}/patches")
   add_dependencies(patch_defaults_test bbhost_version)
@@ -699,7 +1054,32 @@ if(UNIX)
   # Stage 4b.3c: the index of live homes by address and its page filter, against a plain list (host/gxvk_homes_index.h).
   add_executable(gxvk_homes_test tests/gxvk_homes_test.cpp)
   target_include_directories(gxvk_homes_test PRIVATE src include)
+  target_link_libraries(gxvk_homes_test PRIVATE Threads::Threads)
   add_test(NAME gxvk_homes_test COMMAND gxvk_homes_test)
+  # GX's tables ring: the command processor's serial guard and the pool's arena (host/gx_tables_ring.h).
+  add_executable(gx_tables_ring_test tests/gx_tables_ring_test.cpp)
+  target_include_directories(gx_tables_ring_test PRIVATE src include)
+  target_link_libraries(gx_tables_ring_test PRIVATE Threads::Threads)
+  add_test(NAME gx_tables_ring_test COMMAND gx_tables_ring_test)
+  add_executable(gxvk_rest_test tests/gxvk_rest_test.cpp)
+  target_include_directories(gxvk_rest_test PRIVATE src include)
+  add_test(NAME gxvk_rest_test COMMAND gxvk_rest_test)
+  add_executable(recorder_rest_test tests/recorder_rest_test.cpp)
+  target_include_directories(recorder_rest_test PRIVATE src include)
+  add_test(NAME recorder_rest_test COMMAND recorder_rest_test)
+  # Stage 4b.1b/4b.2: the list arena's memo binds a copy only while the guest's bytes are the ones it took (host/list_cb_memo.h).
+  add_executable(list_cb_memo_test tests/list_cb_memo_test.cpp)
+  target_include_directories(list_cb_memo_test PRIVATE src include)
+  add_test(NAME list_cb_memo_test COMMAND list_cb_memo_test)
+  # The markers between the draws a device-loss report reads (host/gpu_markers.h).
+  add_executable(gpu_markers_test tests/gpu_markers_test.cpp)
+  target_include_directories(gpu_markers_test PRIVATE src include)
+  add_test(NAME gpu_markers_test COMMAND gpu_markers_test)
+  # The draw pool's threads by default, counted from the process's affinity (host/gxvk_lists.h pool_threads_for).
+  add_executable(pool_threads_test tests/pool_threads_test.cpp src/core/portable.cpp)
+  target_include_directories(pool_threads_test PRIVATE src include)
+  target_link_libraries(pool_threads_test PRIVATE Threads::Threads)
+  add_test(NAME pool_threads_test COMMAND pool_threads_test)
   # Stage 4b.1a's lock: readers on eight threads beside one writer (host/cache_rw.h).
   add_executable(cache_rw_test tests/cache_rw_test.cpp src/host/cache_rw.cpp)
   target_include_directories(cache_rw_test PRIVATE src)
@@ -716,6 +1096,19 @@ if(UNIX)
   add_executable(vertex_clamp_test tests/vertex_clamp_test.cpp)
   target_include_directories(vertex_clamp_test PRIVATE src)
   add_test(NAME vertex_clamp_test COMMAND vertex_clamp_test)
+  # The run's lookups answered from the last one while what it was made of is unchanged, with their mistakes (host/run_lookups.h).
+  add_executable(run_lookups_test tests/run_lookups_test.cpp)
+  target_include_directories(run_lookups_test PRIVATE src)
+  add_test(NAME run_lookups_test COMMAND run_lookups_test)
+  # The GX layer's catch-up: the flush's outcome with the GPU's time waited for outside the renderer's lock, with its
+  # mistakes (host/gpu_catch_up.h).
+  add_executable(gpu_catch_up_test tests/gpu_catch_up_test.cpp)
+  target_include_directories(gpu_catch_up_test PRIVATE src)
+  add_test(NAME gpu_catch_up_test COMMAND gpu_catch_up_test)
+  # The render targets' sizes learned by their geometry, and the rule by the address alone failing (host/rt_extent.h).
+  add_executable(rt_extent_test tests/rt_extent_test.cpp)
+  target_include_directories(rt_extent_test PRIVATE src)
+  add_test(NAME rt_extent_test COMMAND rt_extent_test)
   # The copy watch: its granules, then its ranges searched in halves (host/gxvk_watch.h).
   add_executable(gxvk_arena_test tests/gxvk_arena_test.cpp src/host/gxvk_arena.cpp)
   target_include_directories(gxvk_arena_test PRIVATE src)
@@ -741,10 +1134,18 @@ if(UNIX)
   add_executable(memory_policy_test tests/memory_policy_test.cpp)
   target_include_directories(memory_policy_test PRIVATE src)
   add_test(NAME memory_policy_test COMMAND memory_policy_test)
+  # Where a direct mapping goes when the kernel chooses its address: the view's blocks, the offset kept, the alignment.
+  add_executable(dmem_place_test tests/dmem_place_test.cpp)
+  target_include_directories(dmem_place_test PRIVATE src)
+  add_test(NAME dmem_place_test COMMAND dmem_place_test)
   # The buffer shadow's page copies grow a run only where both ends meet.
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)
   add_test(NAME copy_runs_test COMMAND copy_runs_test)
+  # Texture quality: the levels a reduced texture's image leaves out, and its views' levels.
+  add_executable(texture_quality_test tests/texture_quality_test.cpp)
+  target_include_directories(texture_quality_test PRIVATE src)
+  add_test(NAME texture_quality_test COMMAND texture_quality_test)
   # The buffer shadow's choices for pages an integrated GPU reads in place.
   add_executable(shadow_place_test tests/shadow_place_test.cpp)
   target_include_directories(shadow_place_test PRIVATE src)
@@ -806,10 +1207,70 @@ if(UNIX)
   target_include_directories(camera_settings_test PRIVATE src)
   target_link_libraries(camera_settings_test PRIVATE Threads::Threads)
   add_test(NAME camera_settings_test COMMAND camera_settings_test)
+  # Scaleform's font-handle set removed by the handle's own pointer (engine/font_handle_set.h)
+  # against models of the game's add, lookup and removal: the stock game's tables the same, two
+  # handles of one name (a live Text scale change) without the use-after-free.
+  add_executable(font_handle_set_test tests/font_handle_set_test.cpp src/engine/font_handle_set.cpp)
+  target_include_directories(font_handle_set_test PRIVATE src)
+  add_test(NAME font_handle_set_test COMMAND font_handle_set_test)
+  set_tests_properties(font_handle_set_test PROPERTIES TIMEOUT 60)
   set_tests_properties(settings_store_test camera_settings_test PROPERTIES TIMEOUT 30)
+  # A plugin's look's arithmetic (engine/look_math.h): what apply_look writes
+  # into YEBIS's block for the motion blur's samples and the depth of field.
+  add_executable(look_math_test tests/look_math_test.cpp)
+  target_include_directories(look_math_test PRIVATE src)
+  add_test(NAME look_math_test COMMAND look_math_test)
+  # The game's menu font read from the dump and its glyphs rasterised
+  # (host/game_font.h); skipped without the dump (BBHOST_APP0).
+  add_executable(game_font_test tests/game_font_test.cpp src/host/game_font.cpp)
+  target_include_directories(game_font_test PRIVATE src)
+  target_compile_definitions(game_font_test PRIVATE BBHOST_GAME_FONT_NO_FS=1)
+  add_test(NAME game_font_test COMMAND game_font_test)
+  set_tests_properties(game_font_test PROPERTIES SKIP_RETURN_CODE 77)
+  # A plugin's in-game menus as the host keeps them (host/plugin_menu.h): the
+  # pages and menus a table declares, rows set at run time, the back stack.
+  add_executable(plugin_menu_test tests/plugin_menu_test.cpp src/host/plugin_menu.cpp)
+  target_include_directories(plugin_menu_test PRIVATE src include)
+  add_test(NAME plugin_menu_test COMMAND plugin_menu_test)
+  # docs/plugins.md's In-game menus example is examples/plugins/menu/menu.c as it is.
+  add_executable(plugin_menu_docs_test tests/plugin_menu_docs_test.cpp)
+  add_test(NAME plugin_menu_docs_test COMMAND plugin_menu_docs_test ${CMAKE_SOURCE_DIR}/docs/plugins.md
+           ${CMAKE_SOURCE_DIR}/examples/plugins/menu/menu.c)
+  # The game's menu art: its BC7 decoder against Pillow's, the tiling, the
+  # TPF, DCX, the five-part stretch and the packing (host/game_menu_art.h); with
+  # the dump (BBHOST_APP0) every piece of menu/common.tpf.dcx too.
+  add_executable(game_menu_art_test tests/game_menu_art_test.cpp src/host/game_menu_art.cpp)
+  target_include_directories(game_menu_art_test PRIVATE src)
+  target_compile_definitions(game_menu_art_test PRIVATE BBHOST_GAME_MENU_ART_NO_FS=1)
+  target_link_libraries(game_menu_art_test PRIVATE ZLIB::ZLIB)
+  add_test(NAME game_menu_art_test COMMAND game_menu_art_test)
+  # Mouse sensitivity's scale and the old scale's settings read on it
+  # (engine/mouse_camera_step.h).
+  add_executable(mouse_sensitivity_test tests/mouse_sensitivity_test.cpp)
+  target_include_directories(mouse_sensitivity_test PRIVATE src)
+  add_test(NAME mouse_sensitivity_test COMMAND mouse_sensitivity_test)
   add_executable(engine_layout tests/engine_layout.cpp)
   target_include_directories(engine_layout PRIVATE src)
   add_test(NAME engine_layout COMMAND engine_layout)
+  # The routines a processor without BMI1, LZCNT or MOVBE runs for the game's
+  # instructions (core/legacy_cpu_code.h): every family, size, operand form and
+  # register aliasing against the instruction itself and legacy_apply, and
+  # mutants of them that must fail. No game files.
+  add_executable(legacy_cpu_test tests/legacy_cpu_test.cpp src/core/legacy_cpu_code.cpp src/decomp/insn.cpp)
+  target_include_directories(legacy_cpu_test PRIVATE src tests)
+  add_test(NAME legacy_cpu_test COMMAND legacy_cpu_test)
+  # The same on processors without them, where qemu-x86_64 is installed: its
+  # Ivy Bridge (no BMI1, LZCNT or MOVBE) and Bulldozer (no BMI1 or MOVBE) -
+  # the routines must need none of the three.
+  find_program(QEMU_X86_64 qemu-x86_64)
+  if(QEMU_X86_64)
+    add_test(NAME legacy_cpu_test_ivybridge COMMAND ${QEMU_X86_64} -cpu IvyBridge $<TARGET_FILE:legacy_cpu_test>)
+    add_test(NAME legacy_cpu_test_bulldozer COMMAND ${QEMU_X86_64} -cpu Opteron_G4 $<TARGET_FILE:legacy_cpu_test>)
+    # qemu's own LZCNT is no oracle: its Bulldozer claims LZCNT in CPUID and
+    # runs it as BSR. The routines are compared with legacy_apply there.
+    set_tests_properties(legacy_cpu_test_ivybridge legacy_cpu_test_bulldozer PROPERTIES TIMEOUT 1800
+                         ENVIRONMENT LEGACY_CPU_TEST_NO_NATIVE=1)
+  endif()
   add_executable(write_watch_test tests/write_watch_test.cpp src/core/write_watch.cpp)
   target_include_directories(write_watch_test PRIVATE src)
   target_link_libraries(write_watch_test PRIVATE pthread)
@@ -817,6 +1278,11 @@ if(UNIX)
   add_executable(paced_file_test tests/paced_file_test.cpp src/core/paced_file.cpp)
   target_include_directories(paced_file_test PRIVATE src)
   add_test(NAME paced_file_test COMMAND paced_file_test)
+  # The guest windows on Linux: reserved, mapped into and given back, not replaced where asked not to (core/linux_vm.h).
+  add_executable(linux_vm_test tests/linux_vm_test.cpp src/core/linux_vm.cpp)
+  target_include_directories(linux_vm_test PRIVATE src)
+  target_link_libraries(linux_vm_test PRIVATE pthread)
+  add_test(NAME linux_vm_test COMMAND linux_vm_test)
   # The decomp's tests (tests/decomp, docs/decomp.md "How one is checked"):
   # the eboot kit loads the 1.09 eboot with bbhost's own loader, every import a
   # trap, and a test runs the game's functions beside ours. They skip (77)
@@ -835,6 +1301,20 @@ if(UNIX)
     add_test(NAME decomp_${name} COMMAND decomp_${name} ${T_ARGS})
     set_tests_properties(decomp_${name} PROPERTIES SKIP_RETURN_CODE 77)
   endfunction()
+  # Every site of the eboot rewritten in a loaded image as bbhost does it
+  # (core/legacy_cpu.h), each region run as the game's bytes and as rewritten,
+  # and the illegal-instruction path on what is left. Skips without the eboot.
+  add_executable(legacy_cpu_sites_test tests/legacy_cpu_sites_test.cpp src/core/legacy_cpu.cpp src/core/legacy_cpu_code.cpp
+                 src/decomp/insn.cpp)
+  target_link_libraries(legacy_cpu_sites_test PRIVATE eboot_kit pthread)
+  target_include_directories(legacy_cpu_sites_test PRIVATE src tests)
+  add_test(NAME legacy_cpu_sites_test COMMAND legacy_cpu_sites_test)
+  set_tests_properties(legacy_cpu_sites_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+  if(QEMU_X86_64)
+    add_test(NAME legacy_cpu_sites_test_ivybridge COMMAND ${QEMU_X86_64} -cpu IvyBridge $<TARGET_FILE:legacy_cpu_sites_test>)
+    set_tests_properties(legacy_cpu_sites_test_ivybridge PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600
+                         ENVIRONMENT LEGACY_CPU_TEST_NO_NATIVE=1)
+  endif()
   bbhost_decomp_test(insn SOURCES src/decomp/insn.cpp)
   bbhost_decomp_test(insn_eboot SOURCES src/decomp/insn.cpp)
   bbhost_decomp_test(event_interpreter SOURCES src/decomp/events/flag_store.cpp)
@@ -842,6 +1322,9 @@ if(UNIX)
   bbhost_decomp_test(item_lots SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(talk_evaluator SOURCES src/engine/esd.cpp LIBS gcn)
   bbhost_decomp_test(chalice_ritual)
+  # Scaleform's font-handle set: the removal by pointer (engine/font_handle_set.h) against the game's
+  # HashSet RemoveAlt on sets its own add builds - the same bytes with one entry a key, the right entry with two.
+  bbhost_decomp_test(font_set_removal SOURCES src/engine/font_handle_set.cpp)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
   bbhost_decomp_test(sfx_step_gate SOURCES src/decomp/sfx/node_update.cpp src/decomp/sfx/node_emit.cpp)
@@ -858,7 +1341,7 @@ if(UNIX)
   bbhost_decomp_test(gx_dma SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_constant_engine SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_draw SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
-  bbhost_decomp_test(gx_command_list SOURCES src/host/gxvk_lists_leaf.cpp)
+  bbhost_decomp_test(gx_command_list SOURCES src/host/gxvk_lists_leaf.cpp src/core/portable.cpp)
   bbhost_decomp_test(gx_present)
   bbhost_decomp_test(gx_resources SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_upload_heap)
@@ -866,6 +1349,7 @@ if(UNIX)
   bbhost_decomp_test(gx_blink)
   bbhost_decomp_test(gx_render_queue SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(gx_job_barrier)
+  bbhost_decomp_test(gx_movie_draw)
   bbhost_decomp_test(yebis_gnm SOURCES src/decomp/gx/draw.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_context SOURCES src/host/host_lists.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(yebis_ppfx)
@@ -907,6 +1391,18 @@ if(UNIX)
   add_executable(clip_control_test tests/clip_control_test.cpp)
   target_include_directories(clip_control_test PRIVATE src)
   add_test(NAME clip_control_test COMMAND clip_control_test)
+  # A texture made after the fill its resource was cleared with, which met no image (tests/fill_pending_test.cpp).
+  add_executable(fill_pending_test tests/fill_pending_test.cpp)
+  target_include_directories(fill_pending_test PRIVATE src)
+  add_test(NAME fill_pending_test COMMAND fill_pending_test)
+  # A YEBIS texture's update kept for the texture made for it (tests/tex_update_test.cpp).
+  add_executable(tex_update_test tests/tex_update_test.cpp)
+  target_include_directories(tex_update_test PRIVATE src)
+  add_test(NAME tex_update_test COMMAND tex_update_test)
+  # The engine's per-view block found at every screen shape and field of view (tests/view_block_test.cpp).
+  add_executable(view_block_test tests/view_block_test.cpp)
+  target_include_directories(view_block_test PRIVATE src)
+  add_test(NAME view_block_test COMMAND view_block_test)
   # The constant-buffer proof's copies and compares without the game (tests/cb_proof_test.cpp).
   add_executable(cb_proof_test tests/cb_proof_test.cpp)
   target_include_directories(cb_proof_test PRIVATE src include)
@@ -927,9 +1423,9 @@ if(UNIX)
     add_test(NAME vertex_plan_test COMMAND vertex_plan_test)
     # The device memory tracker's owners and heap classes, with the driver's
     # allocation calls faked (host/gpu_memtrack.h; tests/gpu_memtrack_test.cpp).
-    add_executable(gpu_memtrack_test tests/gpu_memtrack_test.cpp src/host/gpu_memtrack.cpp)
+    add_executable(gpu_memtrack_test tests/gpu_memtrack_test.cpp src/host/gpu_memtrack.cpp src/host/slow_calls.cpp src/core/host_clock.cpp)
     target_include_directories(gpu_memtrack_test PRIVATE src)
-    target_link_libraries(gpu_memtrack_test PRIVATE Vulkan::Headers)
+    target_link_libraries(gpu_memtrack_test PRIVATE Vulkan::Headers Threads::Threads)
     add_test(NAME gpu_memtrack_test COMMAND gpu_memtrack_test)
   endif()
   # The engine's classes by the names they register (tools/class_catalog.cpp).
@@ -944,6 +1440,10 @@ if(UNIX)
   target_link_libraries(at9_test PRIVATE atrac9 pthread)
   add_test(NAME at9_test COMMAND at9_test)
   set_tests_properties(at9_test PROPERTIES SKIP_RETURN_CODE 77)
+  # Old-hardware sound (host/audio_crush.h, plugin API 21) on hand-made buffers.
+  add_executable(audio_crush_test tests/audio_crush_test.cpp src/host/audio_crush.cpp)
+  target_include_directories(audio_crush_test PRIVATE src)
+  add_test(NAME audio_crush_test COMMAND audio_crush_test)
   # Labels written by the host once their submission has run, a counter for the GPU (tests/label_landing_test.cpp).
   add_executable(label_landing_test tests/label_landing_test.cpp src/core/portable.cpp)
   target_include_directories(label_landing_test PRIVATE src include)
@@ -952,7 +1452,7 @@ if(UNIX)
   set_tests_properties(label_landing_test PROPERTIES ENVIRONMENT "BBHOST_LABEL_LANDING=1")
   if(SDL3_FOUND)
     # Audio output lifetimes under concurrent writes, on SDL's dummy driver.
-    add_executable(host_audio_test tests/host_audio_test.cpp src/host/audio.cpp src/core/portable.cpp)
+    add_executable(host_audio_test tests/host_audio_test.cpp src/host/audio.cpp src/host/audio_crush.cpp src/core/portable.cpp)
     target_include_directories(host_audio_test PRIVATE src)
     target_compile_definitions(host_audio_test PRIVATE BBHOST_HAVE_SDL3=1)
     target_link_libraries(host_audio_test PRIVATE SDL3::SDL3 pthread)
@@ -1000,7 +1500,7 @@ if(UNIX)
   set_tests_properties(gcn_decode_test PROPERTIES SKIP_RETURN_CODE 77)
   # The translation cache (src/host/translation_cache.cpp, which it includes)
   # against the shipped shader bundles.
-  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp src/host/dxc.cpp)
+  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp src/host/dxc.cpp src/host/shader_overrides.cpp)
   target_include_directories(translation_cache_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(translation_cache_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
   add_dependencies(translation_cache_test bbhost_translator_fingerprint)
@@ -1009,12 +1509,25 @@ if(UNIX)
   # The HLSL default (translation_cache.cpp, which it includes): compiles
   # behind the game, their lanes, the dump and edited HLSL; synthetic shaders,
   # skipped without DXC.
-  add_executable(hlsl_default_test tests/hlsl_default_test.cpp src/core/paced_file.cpp src/host/dxc.cpp)
+  add_executable(hlsl_default_test tests/hlsl_default_test.cpp src/core/paced_file.cpp src/host/dxc.cpp src/host/shader_overrides.cpp)
   target_include_directories(hlsl_default_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(hlsl_default_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
   add_dependencies(hlsl_default_test bbhost_translator_fingerprint)
   add_test(NAME hlsl_default_test COMMAND hlsl_default_test)
   set_tests_properties(hlsl_default_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # Edited shaders as variants (host/shader_overrides.h, with translation_cache.cpp
+  # included): salts, owners, sources compiled once, names; synthetic shaders,
+  # skipped without DXC.
+  add_executable(shader_overrides_test tests/shader_overrides_test.cpp src/core/paced_file.cpp src/host/dxc.cpp src/host/shader_overrides.cpp)
+  target_include_directories(shader_overrides_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_link_libraries(shader_overrides_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
+  add_dependencies(shader_overrides_test bbhost_translator_fingerprint)
+  if(SPIRV_TOOLS_LIB)  # an edited shader's module validated as the host validates it
+    target_compile_definitions(shader_overrides_test PRIVATE BBHOST_HAVE_SPIRV_TOOLS=1)
+    target_link_libraries(shader_overrides_test PRIVATE ${SPIRV_TOOLS_LIB})
+  endif()
+  add_test(NAME shader_overrides_test COMMAND shader_overrides_test)
+  set_tests_properties(shader_overrides_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # The PC options' generated menu assets (engine/menu_assets.cpp, which it
   # includes) against the game's option movie and message bundles. The test
   # supplies its own config() stub for menu_assets_ensure's empty roots.
@@ -1028,6 +1541,23 @@ if(UNIX)
   add_executable(shader_compile_advice_test tests/shader_compile_advice_test.cpp)
   target_include_directories(shader_compile_advice_test PRIVATE src)
   add_test(NAME shader_compile_advice_test COMMAND shader_compile_advice_test)
+  # Its child's stdout read to its end, and the result from its record
+  # (host/shader_compile_read.h), on a scripted stream.
+  add_executable(shader_compile_read_test tests/shader_compile_read_test.cpp)
+  target_include_directories(shader_compile_read_test PRIVATE src)
+  add_test(NAME shader_compile_read_test COMMAND shader_compile_read_test)
+  if(SDL3_FOUND AND Vulkan_FOUND)
+    # The same end to end: bbhost started again as the setup window starts
+    # it, with children that pretend the compile (no GPU, no game).
+    add_test(NAME shader_compile_e2e COMMAND bbhost --compile-selftest ${CMAKE_BINARY_DIR}/shader-compile-e2e)
+    set_tests_properties(shader_compile_e2e PROPERTIES TIMEOUT 120)
+  endif()
+  # An older options file read and written back by bbhost itself
+  # (host/options.h host_options_selftest), in a folder of its own: Character
+  # motion's Velocity map, Off's name until 2026-11-10, reads as Off and is
+  # written back as Off.
+  add_test(NAME options_file_test COMMAND bbhost --options-selftest ${CMAKE_BINARY_DIR}/options-selftest)
+  set_tests_properties(options_file_test PROPERTIES TIMEOUT 60)
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)
@@ -1056,6 +1586,11 @@ if(UNIX)
     target_link_libraries(gcn_gs_lift_test PRIVATE gcn ${SPIRV_TOOLS_LIB} ${CMAKE_DL_LIBS})
     add_test(NAME gcn_gs_lift_test COMMAND gcn_gs_lift_test)
     set_tests_properties(gcn_gs_lift_test PROPERTIES SKIP_RETURN_CODE 77)
+    # PS1 vertex snapping (host/vertex_snap.h) on small hand-made vertex and geometry stages, validated.
+    add_executable(vertex_snap_test tests/vertex_snap_test.cpp src/host/vertex_snap.cpp src/host/vertex_cutaway.cpp src/host/pixel_cutaway.cpp)
+    target_include_directories(vertex_snap_test PRIVATE src)
+    target_link_libraries(vertex_snap_test PRIVATE ${SPIRV_TOOLS_LIB})
+    add_test(NAME vertex_snap_test COMMAND vertex_snap_test)
     add_executable(gcn_names_test tests/gcn_names_test.cpp)
     target_link_libraries(gcn_names_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
     add_test(NAME gcn_names_test COMMAND gcn_names_test)
@@ -1094,7 +1629,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     # The official plugins too: the package carries them, and a CI build makes
     # nothing it is not asked for (v0.2.0's Windows zip shipped without them).
-    DEPENDS bbhost bb_plugin_region_switch bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_debug_menu bb_plugin_quake bb_plugin_lohit
+    DEPENDS bbhost bb_plugin_region_switch bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_ps1 bb_plugin_iso bb_plugin_hunter_cam bb_plugin_debug_menu
     USES_TERMINAL)
 else()
   add_custom_target(smoke
@@ -1119,7 +1654,7 @@ add_executable(chalice_history_test tests/chalice_history_test.cpp src/core/chal
 target_include_directories(chalice_history_test PRIVATE src include)
 target_link_libraries(chalice_history_test PRIVATE Threads::Threads)
 add_test(NAME chalice_history_test COMMAND chalice_history_test)
-add_executable(game_edition_test tests/game_edition_test.cpp src/core/game_edition.cpp src/core/config.cpp src/core/sfo.cpp)
+add_executable(game_edition_test tests/game_edition_test.cpp src/core/game_edition.cpp src/core/config.cpp src/core/config_move.cpp src/core/sfo.cpp)
 target_include_directories(game_edition_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
 add_dependencies(game_edition_test bbhost_version)
 add_test(NAME game_edition_test COMMAND game_edition_test)

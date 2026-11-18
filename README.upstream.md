@@ -53,8 +53,10 @@ to run on a PC - it needs a place to live. bbhost provides that place:
 - **PC enhancements** that can be switched off for the game as it shipped: the
   Hunter's Dream mirror opens the character appearance editor (a feature cut
   from the release), "Rebirth in the Nightmare" at the Altar of
-  Despair lets you redistribute your levels, and the late areas allow two
-  invaders, as the chalice dungeons do.
+  Despair lets you redistribute your levels, the late areas allow two
+  invaders, as the chalice dungeons do, a hunter summoned into another's
+  world keeps their full HP, and Molotovs, knives, pebbles and more refill
+  from storage as Blood Vials do.
 - **Online play** through a private server: co-op, invasions, messages,
   bloodstains and summon signs between bbhost players.
 - **Mods** without touching the game files: replacement files, param tables
@@ -117,7 +119,9 @@ See [docs/rendering.md](docs/rendering.md) for the graphics in detail and
    it (or kept beside it as `CUSA00900-UPDATE`, the way shadPS4 keeps it), and
    the 1.09 `eboot.bin` decrypted to an ELF (SHA-256
    `941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7`).
-2. Download a release for Windows or Linux, or build bbhost yourself.
+2. Download a release for Windows or Linux, or build bbhost yourself. The
+   processor needs AVX, SSE4.2 and POPCNT: an Intel Core of the 2nd
+   generation (Sandy Bridge) or newer, or an AMD FX or newer.
 3. Start `bbhost`. The setup window asks for the two paths, checks them and
    saves them; press Play.
 
@@ -190,10 +194,13 @@ third_party/     LibAtrac9, Dear ImGui, Monocypher, and the licences of the DXC 
 ## License
 
 bbhost is free software, licensed under the GNU General Public License,
-version 3 or later (see [LICENSE](LICENSE)). The third-party code in
-`third_party/` and `src/host/shaders/fsr1/` keeps its own licenses. The debug
-menu's glyphs (`plugins/debug_menu/font14.bin`) come from the X11 fonts k14
-and 7x14, which are in the public domain.
+version 3 or later (see [LICENSE](LICENSE)). It carries an additional
+permission under the license's section 7 to combine it with GPU vendors'
+upscaling and frame generation runtimes, such as NVIDIA DLSS, AMD FidelityFX
+and Intel XeSS (see [LICENSE-EXCEPTION](LICENSE-EXCEPTION)). The third-party
+code in `third_party/` and `src/host/shaders/fsr1/` keeps its own licenses.
+The debug menu's glyphs (`plugins/debug_menu/font14.bin`) come from the X11
+fonts k14 and 7x14, which are in the public domain.
 
 Bloodborne is a trademark of Sony Interactive Entertainment. bbhost is not
 affiliated with or endorsed by Sony or FromSoftware, and contains none of the
@@ -205,12 +212,15 @@ game's code or data.
   company logos); the shadPS4 patch list's patches - Kyo's graphics, physics
   and gameplay patches and his The Old Hunters patch, johnnycoax's Auto-Refill,
   Imedved's camera auto-rotation and Lance McDonald's region unlock (shipped as
-  patch files); and Kyo's 60 FPS++ timing list and yogesh1239's high-FPS fixes
-  (built into the frame-rate code).
+  patch files); Kyo's 60 FPS++ timing list and yogesh1239's high-FPS fixes
+  (built into the frame-rate code); and Nox-'s
+  [bbphoto](https://github.com/Noxde/bbhost-photo-mode-plugin), for which the
+  plugin API's camera, world, input and picture calls were made.
 - [shadPS4](https://github.com/shadps4-emu/shadPS4), a reference for the PS4's
   system behaviour and a working run to compare against.
 - SDL3, Vulkan, FFmpeg, SPIRV-Tools, the DirectX Shader Compiler (DXC),
-  LibAtrac9, Dear ImGui, Monocypher and AMD FidelityFX Super Resolution 1.
+  LibAtrac9, Dear ImGui, Monocypher, AMD FidelityFX Super Resolution 1 and, for
+  FSR 3 on Linux, AMD's FidelityFX SDK.
 - Thanks to the many contributors and testers, incomplete and in no
   particular order: Metr1k, Kyo, Schorched Knight, ancat, Nox-, Astrelle,
   BlitzWOLF, CrunchyCheese, foxyhooligans, gkberk, sen, Ultra, droogie

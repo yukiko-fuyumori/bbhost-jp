@@ -51,6 +51,8 @@ enum class Op : std::uint16_t {
     kListDraw,           // a draw packet a pool thread committed ahead (stage 4b.1b), replayed here
     kExecuteCommands,    // vkCmdExecuteCommands of a segment a pool thread recorded (stage 4b.2)
     kListRun,            // a segment's list packets replayed here one after another (stage 4b.2, inline)
+    kUpdateBuffer,       // vkCmdUpdateBuffer, its data copied (at most 64 KiB)
+    kMarkerWindow,       // the markers' window begins or ends here: a loading screen's (host/gpu_markers.h; a Marker)
     kCount
 };
 
@@ -197,6 +199,11 @@ struct PushConstants {
     std::uint32_t offset, size, pad;
     // + size bytes
 };
+struct UpdateBuffer {
+    VkBuffer buffer;
+    VkDeviceSize offset, size;
+    // + size bytes
+};
 struct UpdateSets {
     std::uint32_t n, nbuffers, nimages, pad;
     // + VkWriteDescriptorSet[n] (pBufferInfo / pImageInfo null), then
@@ -224,7 +231,7 @@ struct DispatchIndirect {
     VkDeviceSize offset;
 };
 struct Marker {
-    std::uint32_t value, pad;  // gpu_marker_value
+    std::uint32_t value, pad;  // gpu_marker_value; kMarkerWindow: gpu_markers::window_value
 };
 struct PushBuffers {
     VkPipelineLayout layout;
@@ -240,7 +247,8 @@ static_assert(kRecordable<Begin> && kRecordable<EndSubmit> && kRecordable<Foreig
                   kRecordable<CopyBufferToImage> && kRecordable<CopyImageToBuffer> && kRecordable<ClearColor> && kRecordable<Queries> &&
                   kRecordable<CopyQueryResults> && kRecordable<Timestamp> && kRecordable<BindPipeline> && kRecordable<BindSets> &&
                   kRecordable<PushConstants> && kRecordable<UpdateSets> && kRecordable<Dispatch> && kRecordable<ClearDepth> &&
-                  kRecordable<CopyImage> && kRecordable<DispatchIndirect> && kRecordable<Marker> && kRecordable<PushBuffers>,
+                  kRecordable<CopyImage> && kRecordable<DispatchIndirect> && kRecordable<Marker> && kRecordable<PushBuffers> &&
+                  kRecordable<UpdateBuffer>,
               "op records are plain values");
 static_assert(kRecordable<VkMemoryBarrier> && kRecordable<VkBufferMemoryBarrier> && kRecordable<VkImageMemoryBarrier> &&
                   kRecordable<VkBufferCopy> && kRecordable<VkBufferImageCopy> && kRecordable<VkImageSubresourceRange> &&

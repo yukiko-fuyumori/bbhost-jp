@@ -3,7 +3,10 @@
 # counterpart of tools/win_package.sh: the binary without its DWARF, the patch
 # manifests it applies (patches/, looked for next to the binary), the plugin
 # header, the example config, DXC's release library for the HLSL shader path
-# with its licences (tools/fetch_dxc.sh), a README with what the machine must
+# with its licences (tools/fetch_dxc.sh), FSR 3 - bbhost's FidelityFX library
+# built beside the binary, with AMD's licence - and DLSS - the NGX bridge built
+# beside the binary and NVIDIA's DLSS runtime (tools/fetch_ngx.sh), each with
+# its licence - a README with what the machine must
 # have, a launcher that keeps a log file, and the empty data/, logs/ and
 # build/ (frame dumps) the run writes into: the release's Linux bundle. Nothing in it picks
 # a server: bbhost's defaults are the live server's (https://thehuntersdream.com).
@@ -35,6 +38,7 @@ mkdir -p "$dir/data" "$dir/logs" "$dir/plugins" "$dir/build"
 cp -r patches "$dir/patches"
 cp include/bbhost_plugin.h "$dir/plugins/"
 cp LICENSE "$dir/LICENSE"
+cp LICENSE-EXCEPTION "$dir/LICENSE-EXCEPTION"
 tools/package_plugins.sh "$(dirname "$bin")/plugins" "$dir/plugins"
 objcopy --strip-debug "$bin" "$dir/bbhost" 2>/dev/null || llvm-objcopy --strip-debug "$bin" "$dir/bbhost"
 chmod +x "$dir/bbhost"
@@ -43,6 +47,42 @@ cp bbhost.example.toml "$dir/bbhost.example.toml"
 # The HLSL path's compiler beside the binary, where bbhost looks first.
 tools/fetch_dxc.sh linux "$dir"
 dxc_tag=$(cat third_party/dxc/VERSION)
+# DLSS on an NVIDIA RTX card: bbhost's NGX bridge (MIT; it holds NVIDIA's NGX
+# SDK library), which bbhost loads from beside itself (host/upscaler.cpp), and
+# NVIDIA's DLSS runtime, pinned and unmodified (tools/fetch_ngx.sh), each with
+# its licence - never bbhost's GPL. A build without the bridge (BBHOST_NGX=OFF,
+# or NVIDIA's SDK not fetched) packs neither; BBHOST_PACKAGE_DLSS=0 leaves them
+# out of one that has it. tools/check_release_bundle.sh fails a release without
+# them, and tools/package_steamdeck.sh takes them out of the Steam Deck's kit
+# (an AMD GPU).
+# FSR 3 on any GPU: bbhost's build of AMD's FidelityFX library (src/ffx_vk:
+# AMD's MIT source, tools/fetch_fidelityfx.sh), which bbhost loads from beside
+# itself (host/upscaler_ffx.cpp), without its DWARF, with AMD's licence and
+# bbhost's for its own files (MIT) - never bbhost's GPL. A build without it
+# (BBHOST_FFX=OFF, or AMD's source not fetched) packs none; BBHOST_PACKAGE_FSR=0
+# leaves it out of one that has it. tools/check_release_bundle.sh fails a
+# release without it; the Steam Deck kit keeps it.
+ffx=$(dirname "$bin")/libbbhost_fidelityfx_vk.so
+fsr=0
+if [ "${BBHOST_PACKAGE_FSR:-1}" != 0 ] && [ -f "$ffx" ]; then
+    objcopy --strip-debug "$ffx" "$dir/libbbhost_fidelityfx_vk.so" 2>/dev/null || llvm-objcopy --strip-debug "$ffx" "$dir/libbbhost_fidelityfx_vk.so"
+    mkdir -p "$dir/licenses/fidelityfx"
+    cp third_party/fidelityfx/LICENSE-signedbin.md "$dir/licenses/fidelityfx/LICENSE.md"
+    cp src/ffx_vk/LICENSE "$dir/licenses/fidelityfx/LICENSE-bbhost.txt"
+    fsr=1
+fi
+ffx_tag=$(tools/fetch_fidelityfx.sh --tag)
+bridge=$(dirname "$bin")/libbbhost_ngx_bridge.so
+dlss=0
+if [ "${BBHOST_PACKAGE_DLSS:-1}" != 0 ] && [ -f "$bridge" ]; then
+    cp "$bridge" "$dir/libbbhost_ngx_bridge.so"
+    mkdir -p "$dir/licenses/ngx_bridge" "$dir/licenses/upscaler_bridge"
+    cp src/ngx_bridge/LICENSE "$dir/licenses/ngx_bridge/LICENSE"
+    cp third_party/upscaler_bridge/LICENSE.txt "$dir/licenses/upscaler_bridge/LICENSE.txt"
+    tools/fetch_ngx.sh runtime "$dir"
+    dlss=1
+fi
+dlss_runtime=$(tools/fetch_ngx.sh --files)
 # The pipeline list beside the binary, where bbhost reads it at each start and
 # builds every pipeline it names (render.cpp pipeline_manifest_load): the
 # pinned release asset (tools/fetch_pipeline_list.sh), or the local list
@@ -65,7 +105,7 @@ glibcxx=$(objdump -T "$bin" | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -1)
 cat > "$dir/run-bbhost.sh" <<'EOF'
 #!/bin/bash
 # Starts bbhost and keeps its log in logs/ (the newest ten are kept).
-#   ./run-bbhost.sh                       the per-user config (~/.config/bbhost/bbhost.toml)
+#   ./run-bbhost.sh                       the per-user config (~/.local/share/bbhost/bbhost.toml)
 #   BBHOST_CONFIG=other.toml ./run-bbhost.sh   that file on top of it
 cd "$(dirname "$0")" || exit 1
 cfg=${BBHOST_CONFIG:-bbhost.toml}
@@ -85,6 +125,12 @@ tools/package_japanese.sh "$dir" "$(dirname "$bin")"
 cp "$dir/導入手順_日本語.md" "$dir/README-linux.txt"
 cat >> "$dir/README-linux.txt" <<EOF
 
+拡大描画:
+  FSR 3: libbbhost_fidelityfx_vk.so（AMD FidelityFX、対応する GPU で利用可能）。
+
+  DLSS, on an NVIDIA RTX card: libbbhost_ngx_bridge.so と NVIDIA の libnvidia-ngx-dlss.so を同梱します。
+  NVIDIA の対応ドライバーが必要です。各ライセンスは licenses にあります。
+
 この Linux ビルドの実行時依存関係:
   $needed
 必要なバージョンの下限: $glibc $glibcxx
@@ -97,6 +143,8 @@ stage=$(mktemp -d); trap 'rm -rf "$stage"' EXIT
 cp -r "$dir" "$stage/"
 find "$stage" -type d -exec chmod 755 {} + && find "$stage" -type f -exec chmod 644 {} +
 chmod 755 "$stage/$name/bbhost" "$stage/$name/run-bbhost.sh"
+[ "$dlss" = 0 ] || chmod 755 "$stage/$name/libbbhost_ngx_bridge.so" "$stage/$name/$dlss_runtime"
+[ "$fsr" = 0 ] || chmod 755 "$stage/$name/libbbhost_fidelityfx_vk.so"
 rm -f "$out/$name.tar.gz"
 tar czf "$out/$name.tar.gz" -C "$stage" --owner=0 --group=0 "$name"
 echo "package: $out/$name.tar.gz ($(( $(stat -c %s "$out/$name.tar.gz") / 1048576 )) MB); symbols: $out/$name.debug"

@@ -859,6 +859,7 @@ struct alignas(16) GxRec {
     std::int32_t sc[4] = {};
     std::uint64_t raster = 0;
     std::uint32_t blend_id = 0, ds_id = 0, raster_id = 0;  // engine/gx_state.h, at the call
+    bool gbuffer = false;  // restyled kGxDrawGbuffer at the call
     // The vertex-stage program's object (the domain shader's in a
     // tessellated draw), the pixel shader's and the input layout's, as
     // engine/gx_resources.h ids.
@@ -1153,6 +1154,7 @@ void snapshot(GxRec& r, std::uint64_t s) {
     r.blend_id = gx_blend_id(r.blend);
     r.ds_id = gx_depth_stencil_id(r.ds);
     r.raster_id = gx_raster_id(r.raster);
+    r.gbuffer = gx_draw_gbuffer();
     const auto slots = [](std::uint64_t base, int n, GxRec::Slot* out, std::uint8_t& count, int cap) {
         count = 0;
         for (int i = 0; i < n && count < cap; ++i) {
@@ -1811,6 +1813,31 @@ GxRecordsPtr snapshot_records(const GxRec& r, bool scratch = false) {
     // A draw that binds a geometry shader has its GS's in slot 3
     // (kGxRecordGs; it has no hull), slot 2 unused.
     const bool gs = !tess && r.st[3].shader;
+    // BBHOST_ONEPASS_TRACE=1 (a test): at a GS draw's call, constant-buffer
+    // slot 0 of every stage's group in the pending state.
+    static const bool op_trace = [] {
+        const char* e = std::getenv("BBHOST_ONEPASS_TRACE");
+        return e && e[0] == '1';
+    }();
+    if (op_trace && gs) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::uint64_t cb0[6] = {}, cbs[6] = {};
+            for (int stg = 0; stg < 6; ++stg) {
+                const std::uint64_t at = r.state + 0x598 + 0x4f8ull * static_cast<std::uint64_t>(stg) + 0x480;
+                cb0[stg] = rd64(at);
+                for (int k = 0; k < 14; ++k) cbs[stg] |= rd64(at + 8ull * static_cast<std::uint64_t>(k)) ? 1ull << k : 0;
+            }
+            host_log("onepass trace: GS call: shaders VS %llx GS %llx PS %llx; CB slot 0 by stage %llx %llx %llx %llx %llx %llx; "
+                     "CB slots set by stage %llx %llx %llx %llx %llx %llx",
+                     static_cast<unsigned long long>(r.st[0].shader), static_cast<unsigned long long>(r.st[3].shader),
+                     static_cast<unsigned long long>(r.st[4].shader), static_cast<unsigned long long>(cb0[0]),
+                     static_cast<unsigned long long>(cb0[1]), static_cast<unsigned long long>(cb0[2]), static_cast<unsigned long long>(cb0[3]),
+                     static_cast<unsigned long long>(cb0[4]), static_cast<unsigned long long>(cb0[5]), static_cast<unsigned long long>(cbs[0]),
+                     static_cast<unsigned long long>(cbs[1]), static_cast<unsigned long long>(cbs[2]), static_cast<unsigned long long>(cbs[3]),
+                     static_cast<unsigned long long>(cbs[4]), static_cast<unsigned long long>(cbs[5]));
+        }
+    }
     const int stage_of[kGxRecords] = {set0_stage, 4, 0, gs ? 3 : 1};
     const std::uint64_t shaders[kGxRecords] = {r.st[set0_stage].shader, r.st[4].shader, tess ? r.st[0].shader : 0,
                                                tess ? r.st[1].shader : gs ? r.st[3].shader : 0};
@@ -2357,8 +2384,21 @@ struct NativeSlot {
     // (the pool reads it no more).
     std::atomic<int> state{0};
     std::uint64_t id = 0;
+    // Given to the pool (gxvk_lists::draw_stored): only then can a pool thread
+    // pin it or a commit of it exist. Written before the state reads ready.
+    bool fed = false;
     alignas(64) NativeDraw draw;  // the inputs start a line of their own
 };
+// A draw stored while the pool rested (NativeSlot::fed) skips the pool's
+// slot protocol and checks at the command processor. BBHOST_GXVK_LISTS_SKIP_UNFED=0:
+// every slot as a pooled one, as before.
+bool skip_unfed() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_GXVK_LISTS_SKIP_UNFED");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 // A slot a pool thread is reading (3): the command processor waits for it to
 // be given back (counted), as briefly as one draw's lookups.
 std::atomic<std::uint64_t> g_native_pinned_waits{0};
@@ -2391,6 +2431,7 @@ void build_objects(const GxRec& r, GxDrawObjects& o) {
     o.blend_id = r.blend_id;
     o.depth_stencil_id = r.ds_id;
     o.raster_id = r.raster_id;
+    o.gbuffer = r.gbuffer;
     o.vs_prog_id = r.vs_prog_id;
     o.ps_prog_id = r.ps_prog_id;
     o.il_id = r.il_id;
@@ -2700,6 +2741,10 @@ bool native_draw_call(GxRec& r) {
         // slot reads ready. Streamed past the caches, they waited on an sfence
         // for the memory writes (~5% of the GX threads' host time).
         slot.id = id;
+        // The pool is given it unless it rests (decided once, here: the slot
+        // says so before it reads ready).
+        const bool feed = gxvk_lists::pool() && !gxvk_lists::resting();
+        slot.fed = feed;
         slot.draw.in = r.in;
         slot.draw.objects = objects;
         slot.draw.records = std::move(records);
@@ -2707,7 +2752,7 @@ bool native_draw_call(GxRec& r) {
         slot.draw.packed = std::move(packed);
         slot.state.store(2, std::memory_order_release);
         g_native_slot_pending.add();
-        if (gxvk_lists::pool()) gxvk_lists::draw_stored(id, r.ctx, token_va);  // stage 4b.1a's pool looks ahead at it
+        if (gxvk_lists::pool()) gxvk_lists::draw_stored(id, r.ctx, token_va, feed);  // stage 4b.1a's pool looks ahead at it
         prefetch_next_slot();
     } else {
         g_native_overflow.fetch_add(1, std::memory_order_relaxed);
@@ -7748,13 +7793,16 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
         NativeDraw* draw = nullptr;
         // With stage 4b.1a's pool on, the slot is taken (4) once a pool thread
         // reading it has given it back: the pool reads it no more.
-        int expect = gxvk_lists::pool() ? native_unpinned(slot->state) : slot->state.load(std::memory_order_acquire);
+        // A slot the pool was never given is read by none of its threads: taken
+        // as with the pool off.
+        const bool pooled = gxvk_lists::pool() && (!skip_unfed() || slot->fed || slot->id != id);
+        int expect = pooled ? native_unpinned(slot->state) : slot->state.load(std::memory_order_acquire);
         // Stage 4b.1b: a draw the pool has committed is read by no pool thread
         // again (each token is fed once, and its commit is published after the
         // slot was given back): taken with the load above, no CAS.
-        if (expect == 2 && gxvk_lists::splice() && slot->id == id && host_gpu_list_committed(id)) {
+        if (expect == 2 && pooled && gxvk_lists::splice() && slot->id == id && host_gpu_list_committed(id)) {
             g_native_plain_takes.fetch_add(1, std::memory_order_relaxed);
-        } else if (expect == 2 && gxvk_lists::pool() && slot->id == id) {
+        } else if (expect == 2 && pooled && slot->id == id) {
             while (expect == 2 && !slot->state.compare_exchange_weak(expect, 4, std::memory_order_acquire, std::memory_order_acquire)) {
                 if (expect == 3) expect = native_unpinned(slot->state);
             }
@@ -8351,6 +8399,13 @@ const GxDrawObjects* hle_gx_trace_objects() {
 // command processor's lookahead, gnm_exec.cpp). `next`: the very next draw,
 // whose slot the previous lookahead asked for - its records now; otherwise
 // the one after it - its slot. The lines then arrive while this draw is drawn.
+
+bool hle_gx_native_fed(std::uint64_t id) {
+    if (!skip_unfed()) return true;
+    NativeSlot& slot = native_slot(id);
+    const int st = slot.state.load(std::memory_order_acquire);
+    return st >= 2 && slot.id == id && slot.fed;
+}
 
 void hle_gx_native_prefetch(std::uint64_t id, bool next) {
     NativeSlot& slot = native_slot(id);

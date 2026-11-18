@@ -9,9 +9,12 @@
 #include "host/heap_compact.h"
 #include "host/heap_place.h"
 #include "host/list_resolve.h"
+#include "host/tex_update.h"
 #include "host/foreign_hooks.h"
 #include "host/draw_capture.h"
+#include "host/gpu_catch_up.h"
 #include "host/gpu_internal.h"
+#include "host/gpu_markers.h"
 #include "host/gxvk.h"
 #include "host/gxvk_table.h"
 #include "host/import_mode.h"
@@ -25,12 +28,15 @@
 #include "host/shader_patch.h"
 #include "host/shaders/gpu_stall.spv.h"
 #include "host/shader_bundles.h"
+#include "host/shader_overrides.h"
 #include "host/translation_cache.h"
 #include "host/twin_filter.h"
 #include "host/cb_capture.h"
 #include "host/gxvk_homes.h"
 #include "host/gxvk_lists.h"
 #include "host/options.h"
+#include "host/render_hooks.h"
+#include "host/upscaler.h"
 
 #include "gcn/container.h"
 #include "gcn/half.h"
@@ -78,6 +84,7 @@ thread_local constinit int t_import_fall = -1;                  // gpu_internal.
 
 void device_lost_locked(const char* where, bool declared = false);  // below, with the reports it makes
 bool take_marked_start(std::string& why);    // the same: a start after a lost device runs with markers
+void markers_window_locked();                // the same: the markers' window, where a recording begins
 
 namespace {
 
@@ -220,6 +227,28 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
 // environment wins over the config. imports_whole() (gpu_internal.h) reads it.
 std::atomic<std::uint64_t> g_imports_made{0}, g_imports_merged{0}, g_import_bytes{0}, g_import_us{0};
 
+// The queue's calls, for the slow-call registry (host/slow_calls.h).
+constexpr slow_calls::Site kSubmitLockSite{slow_calls::kQueueLock, "a submission"};
+constexpr slow_calls::Site kSubmitSite{slow_calls::kQueueSubmit, "one job"};
+constexpr slow_calls::Site kSubmitMergedSite{slow_calls::kQueueSubmit, "merged jobs"};
+constexpr slow_calls::Site kSubmitInPlaceSite{slow_calls::kQueueSubmit, "in place"};
+constexpr slow_calls::Site kQueueGuardSite{slow_calls::kQueueLock, "a one-off use of the queue"};
+constexpr slow_calls::Site kHostQueueLockSite{slow_calls::kQueueLock, "the window's use of the queue"};
+constexpr slow_calls::Site kSlotFenceSite{slow_calls::kWaitFences, "a submission's fence"};
+constexpr slow_calls::Site kFailedIdleSite{slow_calls::kDeviceIdle, "a failed submission"};
+constexpr slow_calls::Site kLandingValueSite{slow_calls::kSemaphoreValue, "the label landing"};
+constexpr slow_calls::Site kLandingWaitSite{slow_calls::kWaitSemaphores, "the label landing"};
+constexpr slow_calls::Site kPresentReadsSite{slow_calls::kSemaphoreValue, "the presenter's copy"};
+constexpr slow_calls::Site kTimelineValueSite{slow_calls::kSemaphoreValue, "the timeline"};
+constexpr slow_calls::Site kTimelineWaitSite{slow_calls::kWaitSemaphores, "the timeline"};
+constexpr slow_calls::Site kPresenterTicketSite{slow_calls::kSubmitted, "the presenter's copy"};
+constexpr slow_calls::Site kFrameSubmittedSite{slow_calls::kSubmitted, "the frame's submissions"};
+constexpr slow_calls::Site kEndInPlaceSite{slow_calls::kEndCommands, "the command processor's"};
+constexpr slow_calls::Site kBeginInPlaceSite{slow_calls::kBeginCommands, "the command processor's"};
+// A wait bounded by a timeout this short is a poll step: its time past it is what counts.
+constexpr std::uint64_t kPollStepNs = 100'000'000ull;
+std::uint64_t poll_slack(std::uint64_t timeout_ns) { return timeout_ns <= kPollStepNs ? timeout_ns : 0; }
+
 // ---- The submission thread (BBHOST_SUBMIT_THREAD, on unless 0) ----
 // vkQueueSubmit off the command processor. The kernel's half of a submission
 // grows with the buffers it has to make resident - all of them, since shaders
@@ -313,7 +342,9 @@ void submit_job_now(const SubmitJob& job) {
     tl.add(si, job.serial);
     VkResult r;
     {
+        slow_calls::Scope timed(kSubmitLockSite);
         std::lock_guard<std::mutex> q(g.queue_mu);
+        timed.next(kSubmitSite);
         r = vkQueueSubmit(g.queue, 1, &si, job.fence);
     }
     if (r != VK_SUCCESS) {
@@ -395,7 +426,9 @@ void submit_jobs_merged(const SubmitJob* jobs, std::uint32_t n) {
     VkResult r;
     std::uint32_t fences = 0;
     {
+        slow_calls::Scope timed(kSubmitLockSite);
         std::lock_guard<std::mutex> q(g.queue_mu);
+        timed.next(kSubmitMergedSite);
         r = vkQueueSubmit(g.queue, 1, &si, last.fence);
         for (std::uint32_t i = 0; i + 1 < n && r == VK_SUCCESS; ++i) {
             if (!jobs[i].fence) continue;
@@ -635,6 +668,11 @@ VkDeviceMemory dmabuf_memory(std::uint64_t offset, std::uint64_t size, std::uint
     return m;
 }
 
+// A dma-buf import's sparse binds, for the slow-call registry (host/slow_calls.h).
+constexpr slow_calls::Site kDmabufLockSite{slow_calls::kQueueLock, "a dma-buf import's binds"};
+constexpr slow_calls::Site kDmabufBindSite{slow_calls::kBindSparse, "a dma-buf import"};
+constexpr slow_calls::Site kDmabufFenceSite{slow_calls::kWaitFences, "a dma-buf import's binds"};
+
 // [offset, offset + size) of direct memory into c as dma-buf imports: a
 // buffer bound to one, or a sparse buffer over several. Under the GPU lock,
 // as every use of the renderer's queue is: the sparse binds go on it.
@@ -687,10 +725,14 @@ VkResult dmabuf_span(Chunk& c, std::uint64_t offset, std::uint64_t size) {
     if (const VkResult r = vkCreateFence(g.device, &fci, nullptr, &fence); r != VK_SUCCESS) return r;
     VkResult r;
     {
-        QueueGuard queue;
+        QueueGuard queue(kDmabufLockSite);
+        slow_calls::Scope timed(kDmabufBindSite);
         r = vkQueueBindSparse(g.queue, 1, &bsi, fence);
     }
-    if (r == VK_SUCCESS) r = vkWaitForFences(g.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (r == VK_SUCCESS) {
+        slow_calls::Scope timed(kDmabufFenceSite);
+        r = vkWaitForFences(g.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    }
     vkDestroyFence(g.device, fence, nullptr);
     return r;
 }
@@ -1358,7 +1400,9 @@ void stream_submit_job(const VkCommandBuffer* cmds, std::uint32_t ncmds, VkSemap
 
 std::uint64_t stream_submitted_serial() { return g_stream_submitted.load(std::memory_order_acquire); }
 
-QueueGuard::QueueGuard() {
+QueueGuard::QueueGuard() : QueueGuard(kQueueGuardSite) {}
+QueueGuard::QueueGuard(const slow_calls::Site& site) {
+    slow_calls::Scope timed(site);
     queue_drain();
     g.queue_mu.lock();
 }
@@ -3103,6 +3147,7 @@ bool create_upload_buffer(DevBuffer& b, std::uint64_t size, const char* what) {
 
 std::atomic<std::size_t> g_pipeline_cache_bytes{0};  // the cache's size when last loaded or saved
 std::atomic<bool> g_cache_divert{false};             // PipelineCacheUse (gpu_internal.h)
+thread_local bool t_run_only_cache = false;          // RunOnlyCache (gpu_internal.h)
 std::atomic<int> g_cache_users{0};
 std::atomic<std::uint64_t> g_cache_diverted{0};
 
@@ -3685,6 +3730,17 @@ void start_memory_reserve();  // below, beside the image heap
 void vram_reserve_init();     // the same
 
 bool g_use_buffer_marker = false;  // VK_AMD_buffer_marker checkpoints (gpu_checkpoint)
+bool g_dry_buffer_marker = false;  // BBHOST_GPU_CHECKPOINTS=amd-dry or loading-dry on a device without them: recorded, not written
+// When they are written (host/gpu_markers.h): while a loading screen is up by
+// default; the window as the command processor records it (markers_live), and
+// where it stands, under g.mu.
+gpu_markers::Mode g_marker_mode = gpu_markers::Mode::kOff;
+std::atomic<bool> g_markers_live{false};
+gpu_markers::Window g_marker_window;
+bool g_marker_after_loss = false;  // BBHOST_GPU_CHECKPOINTS=after-loss: the starts after a loss mark everything
+std::atomic<std::uint32_t> g_marker_windows{0};  // windows begun (the exit line's, read without g.mu)
+// The dry run's marker write: nothing.
+VKAPI_ATTR void VKAPI_CALL dry_buffer_marker(VkCommandBuffer, VkPipelineStageFlagBits, VkBuffer, VkDeviceSize, std::uint32_t) {}
 
 // Every device that can run the host, scored: a discrete GPU before an
 // integrated one (a laptop lists its on-board GPU first, and the first
@@ -3946,6 +4002,24 @@ bool init_locked() {
                  app.pApplicationName, app.pEngineName ? app.pEngineName : "");
     std::vector<const char*> iext;
     for (const std::string& e : g_instance_exts) iext.push_back(e.c_str());
+#if defined(_WIN32)
+    // VK_KHR_get_surface_capabilities2, for a window, where the loader has it:
+    // the device's VK_EXT_full_screen_exclusive (below) needs it, and with that
+    // Stay borderless has Borderless's swapchain tell the driver it may not
+    // make the window exclusive fullscreen (window.cpp, exclusive_policy).
+    bool surface_caps2 = false;
+    if (g_want_present) {
+        std::uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> ie(n);
+        if (n) vkEnumerateInstanceExtensionProperties(nullptr, &n, ie.data());
+        for (std::uint32_t i = 0; i < n && i < ie.size(); ++i)
+            surface_caps2 |= std::strcmp(ie[i].extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0;
+        bool asked = false;  // SDL's list may hold it already
+        for (const char* e : iext) asked |= std::strcmp(e, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0;
+        if (surface_caps2 && !asked) iext.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+    }
+#endif
     std::vector<const char*> layers;
     if (g_validate) {
         layers.push_back("VK_LAYER_KHRONOS_validation");
@@ -3968,7 +4042,14 @@ bool init_locked() {
     ici.ppEnabledExtensionNames = iext.data();
     ici.enabledLayerCount = static_cast<std::uint32_t>(layers.size());
     ici.ppEnabledLayerNames = layers.data();
-    if (vkCreateInstance(&ici, nullptr, &g.instance) != VK_SUCCESS) {
+    // The upscaler bridge (host/upscaler.h) adds what DLSS needs to the
+    // instance and the device; without it, or when that fails, ours as asked.
+    upscaler_open();
+    const VkInstanceCreateInfo* ici_use = upscaler_prepare_instance(&ici);
+    VkResult ir = vkCreateInstance(ici_use, nullptr, &g.instance);
+    upscaler_instance_done(ir);
+    if (ir != VK_SUCCESS && upscaler_instance_retry(&ici, ici_use)) ir = vkCreateInstance(&ici, nullptr, &g.instance);
+    if (ir != VK_SUCCESS) {
         host_log("gpu: no Vulkan 1.3 instance%s", g_validate ? " (validation layer requested)" : "");
         return false;
     }
@@ -4058,7 +4139,8 @@ bool init_locked() {
             g_imports_whole.compare_exchange_strong(undecided, mp.windows ? 0 : 1, std::memory_order_relaxed);
         }
         twins_decide(c.type_rank == 4);
-        homes_decide(g.integrated, host_gpu_memory_policy().device == memory_policy::Device::kSmallVram, g.tight);
+        homes_decide(g.integrated, host_gpu_memory_policy().device == memory_policy::Device::kSmallVram, g.tight,
+                     host_gpu_memory_policy().free_at_start);
         {
             // Stage 4b.2's switch follows the homes when it is unset (host/gxvk_lists.h settle). Off by their default,
             // the homes' own line said why (null: no second line).
@@ -4071,7 +4153,7 @@ bool init_locked() {
                               : hm == gxvk_homes::Mode::kTwins   ? "the constant buffers' homes are twins (BBHOST_GXVK_HOMES=twins)"
                               : g.integrated                     ? "the homes are off on an integrated GPU"
                               : g.tight                          ? "the homes are off with tight memory"
-                                                                 : "the homes are off with small video memory";
+                                                                 : "the homes are off with small video memory, under 5,000 MiB free";
             gxvk_lists::settle(hb, why);
         }
 #if !defined(_WIN32)
@@ -4100,35 +4182,37 @@ bool init_locked() {
         // Other programs' hooks, loaded with the instance (most come in as an
         // implicit Vulkan layer): said now, and again if the device is lost.
         if (const std::string hooks = host_foreign_hooks(); !hooks.empty()) host_log("gpu: hooked into this process: %s", hooks.c_str());
-        // BBHOST_GPU_CHECKPOINTS=1: a checkpoint before every draw and
-        // dispatch, so a device-lost report says how far the GPU got. Off by
-        // default: vkCmdSetCheckpointNV was ~160 ns of each draw's ~11 us on
-        // the command processor.
+        // The GPU's progress markers, which name the draw or dispatch the GPU
+        // was in when the device is lost (host/gpu_markers.h; AMD's driver has
+        // said nothing through VK_EXT_device_fault): AMD's buffer markers
+        // (NVIDIA's drivers have them too) while a loading screen is up -
+        // where the losses come - and nothing of them in the world, where they
+        // cost frames: two marker writes a draw. BBHOST_GPU_CHECKPOINTS=amd
+        // writes them everywhere and =0 never; =1 puts NVIDIA's checkpoints
+        // before every draw and dispatch instead (vkCmdSetCheckpointNV was
+        // ~160 ns of each draw's ~11 us on the command processor, and they are
+        // recorded in place); =after-loss marks everything for the three
+        // starts after a lost device (its note beside the pipeline cache),
+        // with whichever this driver has - buffer markers first: they land in
+        // host memory, readable after the loss, and NVIDIA's Linux driver
+        // returned no checkpoints at all at three losses (an RTX 2060,
+        // 615.71); =amd-dry and =loading-dry record them where the device has
+        // none (lavapipe; with BBHOST_MARKER_TRACE), the writes left out.
         const char* e = std::getenv("BBHOST_GPU_CHECKPOINTS");
-        bool want_nv = c.checkpoints && e && e[0] == '1';
-        // AMD's buffer markers name the draw or dispatch the GPU was in when
-        // the device is lost (the first AMD run lost it at the title, and the
-        // driver's VK_EXT_device_fault said nothing). On while AMD runs were
-        // new; off by default since they cost the Steam Deck ~2% - two marker
-        // writes a draw, and a draw recorded with checkpoints cannot go to
-        // the recorder thread, so the command processor recorded every one.
-        // BBHOST_GPU_CHECKPOINTS=amd turns them on.
-        bool want_amd = c.buffer_marker && e && std::strcmp(e, "amd") == 0;
-        // Unset, and the last run lost the device (its note beside the
-        // pipeline cache): these starts run with whichever this driver has -
-        // buffer markers first where there are any (NVIDIA's drivers have
-        // them too): they land in host memory, readable after the loss, and
-        // NVIDIA's Linux driver returned no checkpoints at all at three
-        // losses (an RTX 2060, 615.71). BBHOST_GPU_CHECKPOINTS=0 keeps them off.
+        gpu_markers::Arming arm = gpu_markers::arming(e, c.buffer_marker, c.checkpoints);
+        if (arm.unknown) host_log("gpu: BBHOST_GPU_CHECKPOINTS=%s is not understood: as unset (amd, 0, 1, after-loss)", e);
         std::string why;
-        if (!e && (c.checkpoints || c.buffer_marker) && take_marked_start(why)) {
-            (c.buffer_marker ? want_amd : want_nv) = true;
-            host_log("gpu: the last run lost the device (%s): this start runs with the GPU's progress markers (%s), so another loss "
-                     "names the draw the GPU was in; BBHOST_GPU_CHECKPOINTS=0 turns them off",
+        if (arm.after_loss && take_marked_start(why)) {
+            gpu_markers::after_loss_start(arm, c.buffer_marker);
+            host_log("gpu: the last run lost the device (%s): this start runs with the GPU's progress markers everywhere (%s), so another "
+                     "loss names the draw the GPU was in (BBHOST_GPU_CHECKPOINTS=after-loss)",
                      why.c_str(), c.buffer_marker ? "buffer markers" : "NVIDIA's checkpoints");
         }
-        g.has_checkpoints = want_nv || want_amd;
-        g_use_buffer_marker = want_amd;
+        g_marker_mode = arm.mode;
+        g_marker_after_loss = arm.after_loss;
+        g_dry_buffer_marker = arm.dry;
+        g_use_buffer_marker = arm.mode != gpu_markers::Mode::kOff;
+        g.has_checkpoints = arm.nv || g_use_buffer_marker;
     }
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(g.phys, &props);
@@ -4254,6 +4338,37 @@ bool init_locked() {
             const char* e = std::getenv("BBHOST_DYNAMIC_DEPTH_CLAMP");
             g.dynamic_depth_clamp = q3.extendedDynamicState3DepthClampEnable && !(e && e[0] == '0');
         }
+        // GL's clip space (PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF clear: z clipped at
+        // -w, not 0 - the point lights' cube shadows' casters): VK_EXT_depth_clip_control's
+        // [-1, 1]. Without it those draws lost everything in the near part of
+        // the light's range (render.cpp gl_clip_space_draw).
+        if (has("VK_EXT_depth_clip_control")) {
+            VkPhysicalDeviceDepthClipControlFeaturesEXT qc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            qf.pNext = &qc;
+            vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+            const char* e = std::getenv("BBHOST_GL_CLIP_SPACE");
+            g.has_depth_clip_control = qc.depthClipControl && !(e && e[0] == '0');
+        }
+        host_log("gpu: GL's clip space %s", g.has_depth_clip_control ? "clipped at -w (VK_EXT_depth_clip_control)"
+                                                                      : "clipped at 0 as D3D's (no VK_EXT_depth_clip_control, or BBHOST_GL_CLIP_SPACE=0)");
+        // FSR 3's two pyramid shaders (bbhost's FidelityFX library on Linux,
+        // host/upscaler_ffx.h) declare compute shaders' derivative groups -
+        // DXC's form of their QuadReadAcross* - which the device must turn on
+        // for them to be valid (AMD's own Windows shaders declare the same).
+        if (upscaler_wants_compute_derivatives()) {
+            if (has(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+                VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR qd{};
+                qd.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
+                VkPhysicalDeviceFeatures2 qf{};
+                qf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                qf.pNext = &qd;
+                vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+                g.compute_derivatives = qd.computeDerivativeGroupLinear;
+            }
+            host_log("gpu: compute shaders' derivative groups for FSR 3 %s", g.compute_derivatives ? "on (VK_KHR_compute_shader_derivatives)"
+                                                                                                  : "not offered by this device: FSR 3 runs without them, as on Windows");
+        }
         // VK_EXT_memory_budget: what the driver says this process holds per
         // heap - the number to compare with nvidia-smi when instances starve.
         g.has_memory_budget = has("VK_EXT_memory_budget");
@@ -4305,6 +4420,24 @@ bool init_locked() {
             }
         }
 #endif
+#if defined(_WIN32)
+        // VK_EXT_full_screen_exclusive, with the instance's
+        // VK_KHR_get_surface_capabilities2 (above): the swapchain can say
+        // whether the driver may make the window exclusive fullscreen, and
+        // Stay borderless says it may not (window.cpp, exclusive_policy).
+        // Without it the driver decides, as it always did.
+        if (g_want_present && has_swapchain) {
+            const bool listed = has("VK_EXT_full_screen_exclusive");
+            g.full_screen_exclusive = listed && surface_caps2;
+            host_log("gpu: %s",
+                     g.full_screen_exclusive ? "VK_EXT_full_screen_exclusive on (and the instance's VK_KHR_get_surface_capabilities2): "
+                                               "Stay borderless keeps the driver from making Borderless exclusive fullscreen"
+                     : listed ? "VK_EXT_full_screen_exclusive left off - the instance has no VK_KHR_get_surface_capabilities2: "
+                                "the driver decides on exclusive fullscreen, Stay borderless or not"
+                              : "no VK_EXT_full_screen_exclusive on this device: the driver decides on exclusive fullscreen, "
+                                "Stay borderless or not");
+        }
+#endif
     }
 
     // A second queue, when the family has one, is the presenter's: a present
@@ -4314,15 +4447,21 @@ bool init_locked() {
     // queue under its lock - as shadPS4 and vkcube make their devices. An A/B
     // for what Windows' per-process GPU counters see of a program that
     // presents from a queue of its own; it costs the command processor the present's blocking.
-    const float prio[2] = {1.0f, 1.0f};
+    // Frame generation (host/framegen.h) takes three more of the family's
+    // queues when it has five: AMD's frame generation swapchain presents,
+    // acquires and runs its async work on queues of its own (2, 3, 4).
+    const float prio[5] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = g.family;
     const char* one_queue = std::getenv("BBHOST_VK_QUEUES");
     if (one_queue && one_queue[0] == '1') g.family_queues = 1;
-    qci.queueCount = g.family_queues >= 2 ? 2 : 1;
+    qci.queueCount = g.family_queues >= 5 ? 5 : g.family_queues >= 2 ? 2 : 1;
     qci.pQueuePriorities = prio;
     host_log("gpu: queue family %u (%u queues): %u queue%s, priority 1.0%s", g.family, usable[static_cast<std::size_t>(chosen)].queues,
-             qci.queueCount, qci.queueCount == 2 ? "s - the second the presenter's" : ", the presents on it too",
+             qci.queueCount,
+             qci.queueCount == 5   ? "s - the second the presenter's, three for frame generation"
+             : qci.queueCount == 2 ? "s - the second the presenter's"
+                                   : ", the presents on it too",
              one_queue && one_queue[0] == '1' ? " (BBHOST_VK_QUEUES=1)" : "");
     std::vector<const char*> dext = {"VK_EXT_external_memory_host"};
     if (g.has_maint8) dext.push_back("VK_KHR_maintenance8");
@@ -4342,18 +4481,22 @@ bool init_locked() {
     if (g.has_memory_budget) dext.push_back("VK_EXT_memory_budget");
     if (g.pipeline_stats) dext.push_back("VK_KHR_pipeline_executable_properties");
     if (g.has_checkpoints && !g_use_buffer_marker) dext.push_back("VK_NV_device_diagnostic_checkpoints");
-    if (g_use_buffer_marker) dext.push_back("VK_AMD_buffer_marker");
+    if (g_use_buffer_marker && !g_dry_buffer_marker) dext.push_back("VK_AMD_buffer_marker");
     if (g.has_gpl) {
         dext.push_back("VK_KHR_pipeline_library");
         dext.push_back("VK_EXT_graphics_pipeline_library");
     }
     if (g.dynamic_depth_clamp) dext.push_back("VK_EXT_extended_dynamic_state3");
+    if (g.has_depth_clip_control) dext.push_back("VK_EXT_depth_clip_control");
+    if (g.compute_derivatives) dext.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     if (g_want_present && has_swapchain) {
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         g.present_capable = true;
         if (g.fifo_latest_ready_ext) dext.push_back(g.fifo_latest_ready_ext);
+        if (g.full_screen_exclusive) dext.push_back("VK_EXT_full_screen_exclusive");
     } else {
         g.fifo_latest_ready_ext = nullptr;
+        g.full_screen_exclusive = false;
     }
     VkPhysicalDeviceFaultFeaturesEXT ffault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     ffault.deviceFault = VK_TRUE;
@@ -4417,6 +4560,19 @@ bool init_locked() {
     if (g.dynamic_depth_clamp) {
         feds3.pNext = f13.pNext;
         f13.pNext = &feds3;
+    }
+    VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+    fdcc.depthClipControl = VK_TRUE;
+    if (g.has_depth_clip_control) {
+        fdcc.pNext = f13.pNext;
+        f13.pNext = &fdcc;
+    }
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR fderiv{};
+    fderiv.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
+    fderiv.computeDerivativeGroupLinear = VK_TRUE;
+    if (g.compute_derivatives) {
+        fderiv.pNext = f13.pNext;
+        f13.pNext = &fderiv;
     }
     // Pixel shaders at wave32 (gcn/wave.h).
     // The translated stages use subgroup operations in SPIR-V 1.5 without
@@ -4729,7 +4885,12 @@ bool init_locked() {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = static_cast<std::uint32_t>(dext.size());
     dci.ppEnabledExtensionNames = dext.data();
-    if (vkCreateDevice(g.phys, &dci, nullptr, &g.device) == VK_SUCCESS && g.has_push_descriptor) {
+    const VkDeviceCreateInfo* dci_use = upscaler_prepare_device(g.instance, g.phys, &dci);
+    VkResult dr = vkCreateDevice(g.phys, dci_use, nullptr, &g.device);
+    upscaler_device_done(dr);
+    if (dr != VK_SUCCESS && dci_use != &dci) dr = vkCreateDevice(g.phys, &dci, nullptr, &g.device);
+    if (dr == VK_SUCCESS) upscaler_attach(g.instance, g.phys, g.device, kSlots + 2);
+    if (dr == VK_SUCCESS && g.has_push_descriptor) {
         g.cmd_push_descriptor_set =
             reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(g.device, "vkCmdPushDescriptorSetKHR"));
         if (!g.cmd_push_descriptor_set) g.has_push_descriptor = false;
@@ -4759,13 +4920,20 @@ bool init_locked() {
         shadow_budget_locked();
     }
     if (g.device && g_use_buffer_marker) {
-        g.cmd_buffer_marker = reinterpret_cast<PFN_vkCmdWriteBufferMarkerAMD>(vkGetDeviceProcAddr(g.device, "vkCmdWriteBufferMarkerAMD"));
+        g.cmd_buffer_marker = g_dry_buffer_marker ? &dry_buffer_marker
+                                                  : reinterpret_cast<PFN_vkCmdWriteBufferMarkerAMD>(
+                                                        vkGetDeviceProcAddr(g.device, "vkCmdWriteBufferMarkerAMD"));
         if (!g.cmd_buffer_marker || !create_dev_buffer(g.marker_buf, 256, true)) {
             g.cmd_buffer_marker = nullptr;
             g.has_checkpoints = false;
         } else {
             std::memset(g.marker_buf.map, 0, 256);
-            host_log("gpu: AMD buffer markers on each draw and dispatch (BBHOST_GPU_CHECKPOINTS=amd; a device loss names the work)");
+            host_log("gpu: AMD buffer markers on each draw and dispatch, and the front end's word before the ops between them where "
+                     "it stops or the pass changes, %s (a device loss names the work; BBHOST_GPU_MARKER_OPS=all: before every op)%s",
+                     g_marker_mode == gpu_markers::Mode::kAlways
+                         ? "everywhere (BBHOST_GPU_CHECKPOINTS=amd)"
+                         : "while a loading screen is up - none in the world (BBHOST_GPU_CHECKPOINTS=amd: everywhere, =0: never)",
+                     g_dry_buffer_marker ? " - recorded only, the device has no buffer markers (BBHOST_GPU_CHECKPOINTS=amd-dry, loading-dry)" : "");
         }
     }
     if (g.device && g.has_checkpoints && !g_use_buffer_marker) {
@@ -4793,6 +4961,9 @@ bool init_locked() {
     }
     vkGetDeviceQueue(g.device, g.family, 0, &g.queue);
     if (g.family_queues >= 2) vkGetDeviceQueue(g.device, g.family, 1, &g.present_queue);
+    if (g.family_queues >= 5) {
+        for (std::uint32_t i = 0; i < 3; ++i) vkGetDeviceQueue(g.device, g.family, 2 + i, &g.fg_queues[i]);
+    }
     if (f12.timelineSemaphore) {
         VkSemaphoreTypeCreateInfo st{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
         st.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -4872,6 +5043,7 @@ bool init_locked() {
     VkPipelineCacheCreateInfo side{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     if (vkCreatePipelineCache(g.device, &side, nullptr, &g.side_cache) != VK_SUCCESS) g.side_cache = VK_NULL_HANDLE;
     if (vkCreatePipelineCache(g.device, &side, nullptr, &g.opt_cache) != VK_SUCCESS) g.opt_cache = VK_NULL_HANDLE;
+    if (vkCreatePipelineCache(g.device, &side, nullptr, &g.run_cache) != VK_SUCCESS) g.run_cache = VK_NULL_HANDLE;
 
     // Descriptor layout: params UBO, then sampled images, samplers, storage images.
     std::vector<VkDescriptorSetLayoutBinding> binds;
@@ -5082,6 +5254,21 @@ bool init_locked() {
     // The Shaders setting (host/options.cpp), before the first lift decides
     // the HLSL path's mode; BBHOST_HLSL wins over it.
     hlsl_set_setting(host_opt_index("shaders") != 1);
+    {
+        // Edited shaders' off switch (host/shader_overrides.h): BBHOST_SHADER_OVERRIDES=0|1
+        // wins over bbhost.toml's video.shader_overrides.
+        // The compile session (Compile shaders now) has no draws: it fills the
+        // caches with the game's own shaders, which edited ones never enter.
+        const char* e = std::getenv("BBHOST_SHADER_OVERRIDES");
+        const bool env = e && (e[0] == '0' || e[0] == '1') && !e[1];
+        const bool session = g_compile_session.load();
+        hlsl_set_overrides(!session && (env ? e[0] == '1' : config().shader_overrides),
+                           session ? "the shader compile builds the game's own shaders"
+                           : env   ? "BBHOST_SHADER_OVERRIDES=0"
+                                   : "bbhost.toml's video.shader_overrides = false");
+    }
+    overrides_set_data_maker(&shader_data_make);  // the plugins' shader data, made at an owner's first compile
+    overrides_set_clock(&hle_video_flip_count);   // the exit report names a removed override's flip
     if (const char* root = hle_fs_data_root(); root && *root) hlsl_set_folders(std::string(root) + "/bbhost");
     hlsl_set_name_lookup(&shader_bundle_file_name);
     translation_cache_load(translation_cache_path());
@@ -5184,9 +5371,9 @@ void begin_recording_locked() {
             VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             const VkCommandBuffer cmd = g_cmd();
-            const std::uint64_t t0 = host_clock_monotonic_ns();
+            slow_calls::Scope timed(kBeginInPlaceSite, 0, true);  // its clock reads the figure's too
             vkBeginCommandBuffer(cmd, &bi);
-            bump(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+            bump(g_stream_stats.endbegin_ns, timed.end());
         }
         ++g.record_serial;  // dynamic state recorded so far is gone
         g.recording = true;
@@ -5194,6 +5381,7 @@ void begin_recording_locked() {
         gxvk_begin_recording_locked();  // GX buffers by handle: retired entries taken back
         homes_begin_recording_locked();  // stage 4b.3c: the homes made and ended since, ended ones taken back
         busy_begin_locked(g.slots[g.slot]);
+        markers_window_locked();  // a loading screen's markers begin or end here (host/gpu_markers.h)
         gpu_checkpoint(kGpuMarkSubmission, g.flushes * 4 + 1);
         glitch_begin_recording_locked();
         occlusion_begin_recording_locked();
@@ -5204,6 +5392,7 @@ void begin_recording_locked() {
             rec().write_timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.qpool, kQueriesPerSlot - 2);
             sl.span = true;
         }
+        shader_data_upload_locked();  // the plugins' shader data a frame's end latched (host/shader_overrides.h)
     }
 }
 
@@ -5585,7 +5774,8 @@ gcn::TranslateOptions compute_options(std::uint32_t rsrc1, std::uint32_t rsrc2, 
 // binds those from one list for either.
 std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::uint32_t rsrc1, std::uint32_t rsrc2, const std::uint32_t* threads,
                                                 const std::vector<std::pair<std::uint32_t, bool>>& dims, const std::vector<bool>& modes,
-                                                const gcn::TranslateResult& regular, std::uint64_t key, const std::string& name, bool lift) {
+                                                const gcn::TranslateResult& regular, std::uint64_t key, const std::string& name, bool lift,
+                                                std::uint64_t salt = 0) {
     if (!cs_buffers_on() || (lift && !cs_lift_buffers_on())) return nullptr;
     auto lean = std::make_shared<ComputeLean>();
     const gcn::TranslateOptions lean_options = compute_options(rsrc1, rsrc2, threads, dims, modes, true);
@@ -5627,7 +5817,7 @@ std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::u
     // as it does (gcn::lift_compute_shader); refused, the program has none and
     // keeps its walking lift.
     if (why.empty() && lift) {
-        hlsl_name_next(name);
+        hlsl_name_next(name, salt);
         gcn::LiftResult l = lift_compute_cached(prog, lean_options, lean->meta);
         if (l.ok()) {
             lean->meta.spirv = std::move(l.spirv);
@@ -5664,6 +5854,7 @@ std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::u
             }
             std::vector<std::uint32_t> lift;
             if (why.empty() || !lean->lifted || own || !hlsl_lift_of(lean->meta.spirv, lift)) break;
+            hlsl_note_override_refused(lean->meta.spirv);
             if (lean->module) vkDestroyShaderModule(g.device, lean->module, nullptr);
             lean->module = VK_NULL_HANDLE;
             lean->meta.spirv = std::move(lift);
@@ -5743,7 +5934,7 @@ void note_compute_lift(const std::string& name, bool lifted, const std::string& 
     if (!lifted && at.empty()) at = why.empty() ? std::string("not asked for (BBHOST_LIFT_COMPUTE=0 or BBHOST_DECOMP)") : why;
 }
 void apply_compute_lift(const gcn::Program& prog, const gcn::TranslateOptions& o, gcn::TranslateResult& meta, const std::string& name, bool& lifted,
-                        std::string& why) {
+                        std::string& why, std::uint64_t salt = 0) {
     lifted = false;
     why.clear();
     if (!meta.ok()) return;
@@ -5751,7 +5942,7 @@ void apply_compute_lift(const gcn::Program& prog, const gcn::TranslateOptions& o
         note_compute_lift(name, false, why);
         return;
     }
-    hlsl_name_next(name);
+    hlsl_name_next(name, salt);
     gcn::LiftResult l = lift_compute_cached(prog, o, meta);
     if (l.ok()) {
         meta.spirv = std::move(l.spirv);
@@ -5867,6 +6058,7 @@ struct CsOptimizer {
         std::uint64_t flip = 0;        // when its stand-in was built
         std::uint64_t standin_us = 0;  // and how long that took
         VkPipelineLayout layout = VK_NULL_HANDLE;  // null: Gpu::pipe_layout
+        bool run_only = false;  // an edited shader's (RunOnlyCache): its cache goes, never merged
     };
     struct Running {
         std::string name;  // empty: the thread is idle
@@ -6007,7 +6199,7 @@ void cs_optimize_thread(int index) {
             if (g.opt_cache == VK_NULL_HANDLE || vkCreatePipelineCache(g.device, &pcci, nullptr, &own) != VK_SUCCESS) own = VK_NULL_HANDLE;
             p = create_compute(module, CsBuild::kOptimized, job.name + watch, &job.spirv, own, job.layout);
             if (own != VK_NULL_HANDLE) {
-                if (p) {
+                if (p && !job.run_only) {
                     std::lock_guard<std::mutex> lk(g_opt_cache_mu);
                     vkMergePipelineCaches(g.device, g.opt_cache, 1, &own);
                 }
@@ -6063,6 +6255,7 @@ void queue_compute_optimize(std::uint64_t key, const std::string& name, const st
         job.flip = hle_video_flip_count();
         job.standin_us = standin_us;
         job.layout = layout;
+        job.run_only = t_run_only_cache;
         g_cs_opt.jobs.push_back(std::move(job));
     }
     g_cs_opt.cv.notify_one();
@@ -6308,7 +6501,7 @@ bool precompiled_compute_done(std::uint64_t key) {
 
 ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std::vector<std::uint32_t>& words,
                               const std::string& name, const std::vector<std::pair<std::uint32_t, bool>>& dims,
-                              const std::vector<bool>& sampler_modes) {
+                              const std::vector<bool>& sampler_modes, std::uint64_t salt = 0) {
     auto it = g.pipelines.find(key);
     if (it != g.pipelines.end()) {
         if (!it->second.pending) {
@@ -6345,7 +6538,10 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         host_log("gpu: shader %s copies the V# in user[%d:%d] into an image", name.c_str(), pl.img_src_sgpr, pl.img_src_sgpr + 3);
     }
     if (pl.copy) host_log("gpu: shader %s copies the V# in user[%d:%d] to user[%d:%d] (render targets become snapshots)", name.c_str(), pl.copy_src_sgpr, pl.copy_src_sgpr + 3, pl.copy_dst_sgpr, pl.copy_dst_sgpr + 3);
-    switch (take_precompiled_compute(key, d, name, dims, sampler_modes, pl)) {
+    // A key with edited shaders' salt (host/shader_overrides.h) was never
+    // compiled ahead: built here, its pipelines the run's own, never recorded.
+    const RunOnlyCache run_only(salt != 0);
+    switch (salt ? Precompiled::kBuildHere : take_precompiled_compute(key, d, name, dims, sampler_modes, pl)) {
     case Precompiled::kTaken:
         g.translated.fetch_add(1);
         recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, false);  // a compute record's: its use counted
@@ -6373,7 +6569,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         pl.failed = true;
         return pl;
     }
-    apply_compute_lift(prog, o, pl.meta, name, pl.lifted, pl.lift_why);
+    apply_compute_lift(prog, o, pl.meta, name, pl.lifted, pl.lift_why, salt);
     if (const char* e = std::getenv("BBHOST_DUMP_SPIRV"); e && e[0] == '1') {
         host_mkdir("build/spv");
         const std::string path = "build/spv/" + name + (pl.lifted ? "-cs-lifted.spv" : "-cs.spv");
@@ -6411,6 +6607,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         }
         // BBHOST_HLSL: the driver refused DXC's module - the lift's own next.
         if (std::vector<std::uint32_t> lift; hlsl_lift_of(pl.meta.spirv, lift)) {
+            hlsl_note_override_refused(pl.meta.spirv);
             if (pl.module) vkDestroyShaderModule(g.device, pl.module, nullptr);
             pl.module = VK_NULL_HANDLE;
             pl.meta.spirv = std::move(lift);
@@ -6430,7 +6627,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     // with its buffers pushed, is the form a translated one runs in, and the
     // lift of that translation a lifted one's (BBHOST_LIFT_CS_BUFFERS) - its
     // walking lift when a buffer does not bind.
-    pl.lean = build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name, pl.lifted);
+    pl.lean = build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name, pl.lifted, salt);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     g.translated.fetch_add(1);
     static const char* trace_name = std::getenv("BBHOST_TRACE_DISPATCH");
@@ -6463,7 +6660,8 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     }
     // Built here, on the command processor: the next start (or a list's
     // first start) builds it on a precompile worker instead.
-    if (pl.pipeline) recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, true);
+    if (pl.pipeline && !salt) recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, true);
+    if (pl.pipeline && salt) override_note_pipeline();
     return pl;
 }
 
@@ -6740,14 +6938,53 @@ std::uint32_t gpu_marker_value(unsigned kind, std::uint64_t index) {
 }
 
 void gpu_write_markers(VkCommandBuffer cmd, std::uint32_t value) {
-    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.marker_buf.buffer, 0, value);
-    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.marker_buf.buffer, 4, value);
+    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.marker_buf.buffer, gpu_markers::kStarted, value);
+    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.marker_buf.buffer, gpu_markers::kFinishedBefore, value);
 }
+
+void gpu_write_op_marker(VkCommandBuffer cmd, std::uint32_t seq) {
+    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.marker_buf.buffer, gpu_markers::kOpReached, seq);
+}
+
+// Where a recording begins (begin_recording_locked, under g.mu): the markers'
+// window steps (host/gpu_markers.h Window) - open from the first recording
+// after a loading screen came up to the first one kWindowGraceMs after it
+// went, by default - and a beginning or an end is recorded here, in the
+// stream's order, for the recorder to meet.
+[[gnu::noinline]] void markers_window_locked() {  // (out of begin_recording_locked's own code)
+    if (!g.cmd_buffer_marker) return;
+    const bool loading = loading_screen_now();
+    const std::uint64_t now = g_marker_window.needs_clock(g_marker_mode, loading) ? static_cast<std::uint64_t>(steady_ms()) : 0;
+    const std::uint32_t value = g_marker_window.step(g_marker_mode, loading, now);
+    if (!value) return;
+    g_markers_live.store(g_marker_window.open, std::memory_order_relaxed);
+    g_marker_windows.store(g_marker_window.number, std::memory_order_relaxed);
+    rec().marker_window(value);
+    if (g_marker_mode == gpu_markers::Mode::kLoading && g_marker_window.number <= 2) {
+        host_log("gpu: the GPU's progress markers %s, flip %llu (submission %llu)%s",
+                 g_marker_window.open ? "on for a loading screen" : "off in the world", static_cast<unsigned long long>(hle_video_flip_count()),
+                 static_cast<unsigned long long>(g.flushes), g_marker_window.number == 2 && !g_marker_window.open ? " - said no more" : "");
+    }
+}
+
+}  // namespace gpu
+// The presenter's command buffer (window.cpp): an op's marker at its start and at its end, noted as another thread's
+// (host/gpu_markers.h), while the markers' window is open - the window its start found, for both. The presenter records
+// it under the renderer's lock.
+void host_gpu_present_markers(void* cmd, bool end) {
+    using namespace gpu;
+    static thread_local bool marked = false;
+    if (!end) marked = g.cmd_buffer_marker && markers_live();
+    if (!marked || !cmd) return;
+    gpu_write_op_marker(static_cast<VkCommandBuffer>(cmd), recorder_note_op(static_cast<std::uint16_t>(stream::Op::kForeignSubmit), end ? 1 : 0));
+}
+namespace gpu {
 
 void gpu_checkpoint(unsigned kind, std::uint64_t index) {
     if (g.cmd_buffer_marker) {
         // An op of the stream: recording it in place would drain the
-        // recorder at every dispatch of a start after a lost device.
+        // recorder at every dispatch of a start after a lost device. (Only
+        // in the markers' window: Rec::marker.)
         rec().marker(gpu_marker_value(kind, index));
         return;
     }
@@ -6759,7 +6996,7 @@ void gpu_checkpoint(unsigned kind, std::uint64_t index) {
 // recorded on the command processor beside the stream).
 void gpu_checkpoint_cmd(VkCommandBuffer cmd, unsigned kind, std::uint64_t index) {
     if (g.cmd_buffer_marker) {
-        gpu_write_markers(cmd, gpu_marker_value(kind, index));
+        if (markers_live()) gpu_write_markers(cmd, gpu_marker_value(kind, index));
         return;
     }
     if (!g.cmd_checkpoint) return;
@@ -6777,31 +7014,134 @@ std::string submission_mark(std::uint64_t which) {
 const char* g_dispatch_names[256] = {};
 void note_dispatch_name(std::uint64_t index, const char* name) { g_dispatch_names[index % 256] = name; }
 
+// A marker value as words: "draw N", "dispatch N", a submission's mark, a
+// loading screen's markers' window beginning or ending (host/gpu_markers.h).
+std::string marker_text(std::uint32_t v) {
+    const unsigned kind = v >> 30;
+    const std::uint64_t which = v & 0x3fffffff;
+    if (kind == kGpuMarkSubmission) return submission_mark(which);
+    if (kind == 0) {
+        if (!v) return "(none)";
+        return std::string(v & 1 ? "the beginning" : "the end") + " of markers' window " + std::to_string(which >> 1);
+    }
+    return std::string(kind == 1 ? "draw " : "dispatch ") + std::to_string(which);
+}
+
+// The word the recorder writes before each op between the draws (host/gpu_markers.h): the last op the GPU's front end
+// had reached, and what it says of the draw or dispatch the GPU had started - the ops after it up to that one, and
+// whether a barrier among them, which the front end does not pass before the work before it has finished, says the
+// draw had finished. That rests on barriers holding the front end: NVIDIA's and AMD's GPUs do; the specification
+// does not promise it.
+void report_between_draws(std::uint32_t started) {
+    std::uint32_t reached = 0;
+    std::memcpy(&reached, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kOpReached, 4);
+    if (!reached) return;
+    const std::string s = recorder_op_note_text(reached);
+    host_log("gpu: AMD marker: of the ops between draws, the GPU's front end had reached op %u%s%s", reached, s.empty() ? "" : ": ",
+             s.c_str());
+    const unsigned kind = started >> 30;
+    // (A window's beginning, its ops noted as after it: the ops listed, nothing inferred of a draw.)
+    const bool window = kind == 0 && (started & 1);
+    if (kind != 1 && kind != 2 && !window) return;
+    std::vector<std::string> lines;
+    const gpu_markers::Reach r = recorder_reach_after(started, reached, lines, 24);
+    const std::string what = marker_text(started);
+    if (r.other) {
+        host_log("gpu: AMD marker: that is the presenter's command buffer, whose place among the stream's ops its number does not "
+                 "give: nothing said of %s from it",
+                 what.c_str());
+        return;
+    }
+    if (!r.ops) {
+        host_log("gpu: AMD marker: no op after %s: the front end had not got past it - the GPU stopped in it, or before the next "
+                 "marker",
+                 what.c_str());
+        return;
+    }
+    host_log("gpu: AMD marker: the ops after %s the front end had reached (%u%s):", what.c_str(), r.ops,
+             r.known ? "" : "; the ring has moved past the first of them");
+    for (const std::string& l : lines) host_log("gpu: AMD marker:   %s", l.c_str());
+    if (r.ops > lines.size()) host_log("gpu: AMD marker:   (and %zu more)", static_cast<std::size_t>(r.ops - lines.size()));
+    if (window) return;
+    if (r.holds) {
+        host_log("gpu: AMD marker: past op %u, a barrier that holds the front end until the work before it has finished: %s had "
+                 "finished, and the GPU stopped in the ops after that barrier up to op %u, or before the next marker (barriers hold "
+                 "the front end on NVIDIA's and AMD's GPUs; the specification does not promise it)",
+                 r.holds, what.c_str(), reached);
+    } else {
+        host_log("gpu: AMD marker: no barrier that holds the front end before op %u: %s may not have finished - the GPU stopped in "
+                 "it or in the ops above",
+                 reached, what.c_str());
+    }
+}
+
 // Where the GPU actually got to, when VK_NV_device_diagnostic_checkpoints is
 // there: the recorded draw list is recording order, this is execution order.
 void report_checkpoints() {
     if (!g.has_checkpoints) return;
     if (g.cmd_buffer_marker && g.marker_buf.map) {
         std::uint32_t started = 0, finished = 0;
-        std::memcpy(&started, g.marker_buf.map, 4);
-        std::memcpy(&finished, static_cast<const std::uint8_t*>(g.marker_buf.map) + 4, 4);
+        std::memcpy(&started, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kStarted, 4);
+        std::memcpy(&finished, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kFinishedBefore, 4);
+        if (g_dry_buffer_marker) {
+            host_log("gpu: AMD markers: recorded only, the device has none to write - nothing to read (BBHOST_GPU_CHECKPOINTS=amd-dry, "
+                     "loading-dry)");
+            return;
+        }
         const auto say = [](const char* what, std::uint32_t v) {
             const unsigned kind = v >> 30;
             const std::uint64_t which = v & 0x3fffffff;
-            if (kind == kGpuMarkSubmission) {
-                host_log("gpu: AMD marker: the GPU had %s %s", what, submission_mark(which).c_str());
-                return;
-            }
-            host_log("gpu: AMD marker: the GPU had %s %s %llu", what, kind == 1 ? "draw" : kind == 2 ? "dispatch" : "(none yet)",
-                     static_cast<unsigned long long>(which));
+            host_log("gpu: AMD marker: the GPU had %s %s", what, marker_text(v).c_str());
             if (kind == 1) describe_draw_record(which);
             if (kind == 2) {
                 const char* n = g_dispatch_names[which % 256];
                 host_log("    dispatch[%llu] %s", static_cast<unsigned long long>(which), n ? n : "?");
             }
         };
-        say("finished everything before", finished);
-        say("started", started);
+        // Where the window was, as the words have it (host/gpu_markers.h read_words): a window's beginning and end
+        // write all three, so a loss after its end reads as such and never as the last op before it.
+        const bool loading_only = g_marker_mode == gpu_markers::Mode::kLoading;
+        const gpu_markers::Reading at = gpu_markers::read_words(started, finished);
+        switch (at.where) {
+        case gpu_markers::Where::kNothing:
+            if (loading_only) {
+                host_log("gpu: AMD markers: the GPU had reached none - they are written only while a loading screen is up, and this "
+                         "run's GPU work had not reached one's: the device was lost in the world or at the title, where the markers "
+                         "are off. BBHOST_GPU_CHECKPOINTS=amd writes them there too, at some cost to the frame rate");
+            } else {
+                host_log("gpu: AMD markers: the GPU had reached none yet");
+            }
+            return;
+        case gpu_markers::Where::kEnded:
+            host_log("gpu: AMD markers: the GPU's front end had passed %s: the device was lost in work recorded after that loading "
+                     "screen, in the world, where the markers are off - BBHOST_GPU_CHECKPOINTS=amd writes them there too, at some cost to "
+                     "the frame rate",
+                     marker_text(started).c_str());
+            if (at.finished_all) {
+                host_log("gpu: AMD markers: everything recorded before that end had finished");
+            } else {
+                say("finished everything before", finished);
+                host_log("gpu: AMD markers: not everything before that end had finished: the GPU may have stopped in the loading "
+                         "screen's last work from there on");
+            }
+            return;
+        case gpu_markers::Where::kBegun:
+            host_log("gpu: AMD markers: the GPU's front end had reached %s%s, and none of its draws or dispatches", marker_text(started).c_str(),
+                     loading_only ? " (a loading screen's)" : "");
+            if (!at.finished_all) say("finished everything before", finished);
+            report_between_draws(started);
+            return;
+        case gpu_markers::Where::kInside:
+            if (loading_only) {
+                host_log("gpu: AMD markers: the device was lost inside a loading screen's markers' window (the loading screen and the "
+                         "%llu ms after it)",
+                         static_cast<unsigned long long>(gpu_markers::kWindowGraceMs));
+            }
+            say("finished everything before", finished);
+            say("started", started);
+            report_between_draws(started);
+            return;
+        }
         return;
     }
     auto get_data = reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(vkGetDeviceProcAddr(g.device, "vkGetQueueCheckpointDataNV"));
@@ -6921,11 +7261,12 @@ void report_device_fault() {
     }
 }
 
-// A run that loses the device leaves a note beside the pipeline cache, and the
-// next kMarkedRuns starts run with the GPU's progress markers on (NVIDIA's
-// checkpoints, AMD's buffer markers): off by default for what they cost, they
-// are what names the draw the GPU was in when it is lost again - AMD's driver
-// has said nothing through VK_EXT_device_fault.
+// A run that loses the device leaves a note beside the pipeline cache, and
+// with BBHOST_GPU_CHECKPOINTS=after-loss the next kMarkedRuns starts run with
+// the GPU's progress markers everywhere (NVIDIA's checkpoints, AMD's buffer
+// markers) - what names the draw the GPU was in when it is lost again in the
+// world, where by default they are off for what they cost (AMD's driver has
+// said nothing through VK_EXT_device_fault).
 constexpr int kMarkedRuns = 3;
 std::string device_lost_note_path() {
     const char* root = hle_fs_data_root();
@@ -6992,7 +7333,13 @@ void device_lost_locked(const char* where, bool declared) {
         std::ofstream out(path, std::ios::trunc);
         out << "starts-left " << kMarkedRuns << '\n' << "flip " << flip << ", " << where << (hooks.empty() ? "" : ", with ") << hooks << '\n';
     }
-    if (!g.has_checkpoints) host_log("gpu: no progress markers this run; the next %d starts run with them", kMarkedRuns);
+    if (!g.has_checkpoints) {
+        const char* e = std::getenv("BBHOST_GPU_CHECKPOINTS");
+        host_log("gpu: no progress markers this run (%s%s)%s", e ? "BBHOST_GPU_CHECKPOINTS=" : "the driver has no buffer markers", e ? e : "",
+                 g_marker_after_loss ? "; the next starts run with them everywhere (BBHOST_GPU_CHECKPOINTS=after-loss)" : "");
+    } else if (g_marker_after_loss && g_marker_mode != gpu_markers::Mode::kAlways) {
+        host_log("gpu: the next %d starts run with the GPU's progress markers everywhere (BBHOST_GPU_CHECKPOINTS=after-loss)", kMarkedRuns);
+    }
     // Everything stops after this, so say what was in flight: the last draws
     // name the pipeline that faulted or hung.
     host_gpu_hang_report();  // with the command stream's last op (recorder.cpp)
@@ -7130,15 +7477,20 @@ bool fence_wait_locked(int k, std::uint64_t& waited_us) {
     Gpu::Slot& sl = g.slots[k];
     waited_us = 0;
     if (g_device_lost.load(std::memory_order_acquire)) return false;
-    const auto t0 = std::chrono::steady_clock::now();
-    g.wait_started_ns.store(static_cast<std::uint64_t>(t0.time_since_epoch().count()), std::memory_order_relaxed);
+    // A slow call's (host/slow_calls.h), its clock reads this wait's own: the
+    // monotonic count, steady_clock's on both hosts.
+    slow_calls::Scope timed(kSlotFenceSite, 0, true);
+    const std::uint64_t t0 = timed.start_ns();
+    g.wait_started_ns.store(t0, std::memory_order_relaxed);
     g.waiting_slot.store(k, std::memory_order_relaxed);
     VkResult r = VK_TIMEOUT;
     double secs = 0.0;
     bool slow = false;
+    std::uint64_t t1 = t0;
     for (;;) {
         r = vkWaitForFences(g.device, 1, &sl.fence, VK_TRUE, fence_step_ns());
-        secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        t1 = host_clock_monotonic_ns();
+        secs = static_cast<double>(t1 - t0) / 1e9;
         if (r != VK_TIMEOUT) break;
         slow = true;
         if (!sl.said_stuck) {
@@ -7149,6 +7501,7 @@ bool fence_wait_locked(int k, std::uint64_t& waited_us) {
         }
         if (secs >= fence_limit_s()) break;
     }
+    timed.end_at(t1);
     g.waiting_slot.store(-1, std::memory_order_relaxed);
     waited_us = static_cast<std::uint64_t>(secs * 1e6);
     if (r == VK_SUCCESS) {
@@ -7364,9 +7717,12 @@ void present_reads_wait(std::uint64_t target) {
     const auto start = std::chrono::steady_clock::now();
     for (int k = 0;; ++k) {
         std::uint64_t v = 0;
-        if (vkGetSemaphoreCounterValue(g.device, g.present_timeline, &v) != VK_SUCCESS || v >= target ||
-            g_device_lost.load(std::memory_order_relaxed))
-            return;
+        VkResult r;
+        {
+            slow_calls::Scope timed(kPresentReadsSite);
+            r = vkGetSemaphoreCounterValue(g.device, g.present_timeline, &v);
+        }
+        if (r != VK_SUCCESS || v >= target || g_device_lost.load(std::memory_order_relaxed)) return;
         if (std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) break;
         if (k < 64) std::this_thread::yield();
         else host_sleep_us(250);
@@ -7382,7 +7738,9 @@ namespace {
 // host_gpu_wait_completed land, and the thread is the one landing.
 std::uint64_t timeline_value() {
     std::uint64_t v = 0;
-    if (g_device_lost.load(std::memory_order_relaxed) || vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS) return ~0ull;
+    if (g_device_lost.load(std::memory_order_relaxed)) return ~0ull;
+    slow_calls::Scope timed(kLandingValueSite);
+    if (vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS) return ~0ull;
     return v;
 }
 bool timeline_wait(std::uint64_t need, std::uint64_t timeout_ns) {
@@ -7391,6 +7749,7 @@ bool timeline_wait(std::uint64_t need, std::uint64_t timeout_ns) {
     wi.semaphoreCount = 1;
     wi.pSemaphores = &g.timeline;
     wi.pValues = &need;
+    slow_calls::Scope timed(kLandingWaitSite, poll_slack(timeout_ns));
     return vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
 }
 void landing_thread_start() {
@@ -7463,6 +7822,7 @@ void retire_slot_locked(int k) {
     if (!g.ok && g_sub_failed.load(std::memory_order_relaxed)) {
         // Its submission may never have gone in: the fence would never signal.
         QueueGuard queue;
+        slow_calls::Scope timed(kFailedIdleSite);
         vkDeviceWaitIdle(g.device);
         sl.in_flight = false;
         busy_retired_locked(sl, false);
@@ -8239,11 +8599,19 @@ bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool 
     return true;
 }
 
+// An image or view a plugin's render hook was handed: the hooks' next one of
+// its place is a new generation (host/render_hooks.h), even if the driver
+// makes the next under the same handle.
+static void render_hooks_note_gone(const void* handle) {
+    if (handle && render_hooks_on()) render_hooks_gone_locked(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handle)));
+}
+
 void defer_destroy_image(VkImage image, const ImageMemory& m) {
     if (m.block < 0) {
         defer_destroy_image(image, m.memory);
         return;
     }
+    render_hooks_note_gone(image);
     bump_view_epoch();
     if (image) g.slots[g.slot].dead_images.push_back(image);
     g.slots[g.slot].dead_ranges.push_back(m);
@@ -8900,12 +9268,14 @@ void start_memory_reserve() {
 }
 
 void defer_destroy_image(VkImage image, VkDeviceMemory memory) {
+    render_hooks_note_gone(image);
     bump_view_epoch();
     if (image) g.slots[g.slot].dead_images.push_back(image);
     if (memory) g.slots[g.slot].dead_memory.push_back(memory);
 }
 
 void defer_destroy_view(VkImageView view) {
+    render_hooks_note_gone(view);
     bump_view_epoch();
     if (!view) return;
     set_cache_forget_view_locked(view);
@@ -8920,6 +9290,7 @@ void defer_destroy_view(VkImageView view) {
 // view memos every frame: on a Steam Deck building views was 9.5% of the
 // command processor, the words memo hit 47%.
 void defer_destroy_private_view(VkImageView view) {
+    render_hooks_note_gone(view);
     if (view) g.slots[g.slot].dead_views.push_back(view);
 }
 
@@ -9187,9 +9558,9 @@ void submit_locked() {
     const bool streamed = stream_on();
     if (!streamed) {
         const VkCommandBuffer cmd = g_cmd();
-        const std::uint64_t t0 = host_clock_monotonic_ns();
+        slow_calls::Scope timed(kEndInPlaceSite, 0, true);  // its clock reads the figure's too
         vkEndCommandBuffer(cmd);
-        bump(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+        bump(g_stream_stats.endbegin_ns, timed.end());
         bump(g_stream_stats.endbegin_n);
     }
     g.recording = false;
@@ -9269,7 +9640,11 @@ void submit_locked() {
         busy_submitted_locked(cur);
         TimelineSignal tl;
         tl.add(si, cur.serial);
-        const VkResult r = vkQueueSubmit(g.queue, 1, &si, cur.fence);
+        VkResult r;
+        {
+            slow_calls::Scope timed(kSubmitInPlaceSite);
+            r = vkQueueSubmit(g.queue, 1, &si, cur.fence);
+        }
         g_stream_submitted.store(cur.serial + 1, std::memory_order_release);
         if (r != VK_SUCCESS) {
             host_log("gpu: submit of %u items failed (%d)%s", g.queued, r,
@@ -9515,7 +9890,7 @@ bool host_gpu_available() {
 GpuStats host_gpu_stats() {
     GpuStats st{g.draws.load(),      g.dispatches.load(),        g.flushes, g.gpu_us.load(),
                 g.gfx_pipelines.load(), g.transfers.load(), g.transfer_batches.load(), {}};
-    for (int i = 0; i < 8; ++i) st.phase_ns[i] = g.phase_ns[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < kPhaseCount; ++i) st.phase_ns[i] = g.phase_ns[i].load(std::memory_order_relaxed);
     st.draw_calls = g.draw_calls.load();
     st.draw_failures = g.draw_failures.load();
     st.draws_empty = g.draws_empty.load();
@@ -9579,7 +9954,9 @@ const char* host_gpu_vs_why_name(int why) {
                                                     "a short stride",      "data outside one buffer"};
     return why >= 0 && why < kVsWhyCount ? names[why] : nullptr;
 }
-void host_gpu_phase_add(int phase, std::uint64_t ns) { g.phase_ns[phase & 7].fetch_add(ns, std::memory_order_relaxed); }
+void host_gpu_phase_add(int phase, std::uint64_t ns) {
+    if (phase >= 0 && phase < kPhaseCount) g.phase_ns[phase].fetch_add(ns, std::memory_order_relaxed);
+}
 
 GpuHandles host_gpu_handles() {
     GpuHandles h;
@@ -9588,20 +9965,30 @@ GpuHandles host_gpu_handles() {
     h.device = g.device;
     h.queue = g.queue;
     h.present_queue = g.present_queue;
+    for (int i = 0; i < 3; ++i) h.fg_queues[i] = g.fg_queues[i];
     h.family = g.family;
     h.fifo_latest_ready = g.fifo_latest_ready_ext != nullptr;
+    h.full_screen_exclusive = g.full_screen_exclusive;
     return h;
 }
 
 void host_gpu_lock() { g.mu.lock(); }
 bool host_gpu_device_lost() { return g_device_lost.load(std::memory_order_acquire); }
 void host_gpu_unlock() { g.mu.unlock(); }
+std::string host_gpu_lock_holder() {
+    void* const site = gpu::g.mu.holder();
+    return site ? GpuMutex::name_of(site) : std::string("none");
+}
 void host_gpu_queue_lock() {
+    slow_calls::Scope timed(kHostQueueLockSite);
     queue_drain();
     g.queue_mu.lock();
 }
 void host_gpu_queue_unlock() { g.queue_mu.unlock(); }
-void host_gpu_queue_lock_only() { g.queue_mu.lock(); }
+void host_gpu_queue_lock_only() {
+    slow_calls::Scope timed(kHostQueueLockSite);
+    g.queue_mu.lock();
+}
 
 std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wait_stage, void* signal, void* fence) {
     if (!g_sub_running) return 0;
@@ -9624,6 +10011,7 @@ std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wai
 
 void host_gpu_wait_submitted(std::uint64_t ticket) {
     if (!ticket) return;
+    slow_calls::Scope timed(kPresenterTicketSite);  // ends after the lock is let go
     std::unique_lock<std::mutex> lk(g_sub_mu);
     if (ticket & kForeignTicket) {
         // A kForeignSubmit: once the recorder has replayed up to it and
@@ -9640,7 +10028,8 @@ void host_gpu_wait_work_submitted(std::uint64_t need) {
     // Its serial is need - 1: in the driver once stream_submitted_serial() is
     // past it. Bounded, and over at a lost device, whose recording is dropped
     // and never submitted: the presenter must not sit here for good.
-    const std::uint64_t t0 = host_clock_monotonic_ns();
+    slow_calls::Scope timed(kFrameSubmittedSite, 0, true);
+    const std::uint64_t t0 = timed.start_ns();
     for (std::uint64_t spins = 0; stream_submitted_serial() < need; ++spins) {
         if (g_device_lost.load(std::memory_order_acquire)) return;
         if (spins < 4096) {
@@ -9683,6 +10072,9 @@ struct CachedCompute {
     std::string name;
     std::uint64_t hash = 0;
     std::uint32_t head[16];
+    // Its edited shaders (host/shader_overrides.h): their salt as of the
+    // overrides' generation `hlsl_gen`, made again once it moves.
+    mutable std::uint64_t hlsl_gen = 0, hlsl_salt = 0;
 };
 std::unordered_map<std::uint64_t, CachedCompute> g_compute_programs;
 
@@ -9952,8 +10344,18 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         image_dims_for(paths_for(code_hash, words, gcn::Stage::Compute, d.rsrc1, d.rsrc2), d.user_data);
     const auto sampler_modes = sampler_modes_for(paths_for(code_hash, words, gcn::Stage::Compute, d.rsrc1, d.rsrc2), d.user_data);
     stamp.to(kDpPaths);
-    const std::uint64_t key = compute_key(code_hash, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes);
-    ComputePipeline& pl = pipeline_for(d, key, words, name, dims, sampler_modes);
+    std::uint64_t key = compute_key(code_hash, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes);
+    // Its edited shaders: a pipeline per set of their sources (host/shader_overrides.h).
+    std::uint64_t salt = 0;
+    if (const std::uint64_t gen = override_gen()) [[unlikely]] {
+        if (cc->hlsl_gen != gen) {
+            cc->hlsl_salt = override_salt(name);
+            cc->hlsl_gen = gen;
+        }
+        salt = cc->hlsl_salt;
+        if (salt) key = fnv1a(&salt, sizeof(salt), key ^ 0x0ed17edc0de5a17ull);
+    }
+    ComputePipeline& pl = pipeline_for(d, key, words, name, dims, sampler_modes, salt);
     if (g.oob.map && !pl.failed && !pl.oob_named) {  // BBHOST_OOB_COUNT: the slot's name, once
         pl.oob_named = true;
         note_oob_compute_slot(pl.meta.oob_slot, pl.name);
@@ -10893,7 +11295,13 @@ std::string host_gpu_compile_report() {
     std::string out = compute_optimize_window();
     const std::string tc = translation_cache_window();
     if (!tc.empty()) out += (out.empty() ? "" : "; ") + tc;
+    const std::string ov = overrides_window();  // edited shaders built (host/shader_overrides.h)
+    if (!ov.empty()) out += (out.empty() ? "" : "; ") + ov;
     return out;
+}
+
+void host_gpu_frame_recorded() {
+    override_data_latch();  // the plugins' shader data: the next frame reads what they wrote by now
 }
 
 void host_gpu_submit() {
@@ -11488,7 +11896,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     }
     if (g_twins.load(std::memory_order_relaxed) == 3 && !twin_armed_meets_locked(va, bytes)) return false;
     // A candidate's twin made, let go or dropped, a pass ended: in order.
-    if (run_part_stop(kRunStopBuffers)) return false;
+    if (run_part_stop_buffers(kBsTwin)) return false;
     std::uint64_t memory = 0, cbytes = 0, gen = 0;
     std::uint64_t edge[2] = {0, 0};  // twins a range across their edge must let go first
     int n_edge = 0;
@@ -11622,6 +12030,8 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     }
     return true;
 }
+
+std::uint64_t twins_shape_locked() { return g_twin_live.shape(); }
 
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
     if (gxvk_homes::bind_on() && homes_meet_locked(va, bytes)) return true;  // a home's guest bytes are stale too (stage 4b.3c)
@@ -12236,6 +12646,21 @@ void host_gpu_resources_report() {
         if (nl == std::string::npos) break;
         at = nl + 1;
     }
+    // BBHOST_MARKER_TRACE with the markers written (a check of the loss report without a loss): the words as they
+    // stand while the GPU runs on, read as a device loss now would read them (host/gpu_markers.h).
+    static const bool snapshot = [] {
+        const char* e = std::getenv("BBHOST_MARKER_TRACE");
+        return e && *e;
+    }();
+    if (snapshot && g.cmd_buffer_marker && g.marker_buf.map && !g_dry_buffer_marker) {
+        std::uint32_t started = 0, finished = 0;
+        std::memcpy(&started, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kStarted, 4);
+        std::memcpy(&finished, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kFinishedBefore, 4);
+        host_log("gpu: marker snapshot (as a device loss now would read the words; the GPU runs on): last started %s, everything "
+                 "finished before %s",
+                 gpu::marker_text(started).c_str(), gpu::marker_text(finished).c_str());
+        gpu::report_between_draws(started);
+    }
 }
 
 std::string host_gpu_image_heap_report() {
@@ -12249,7 +12674,13 @@ std::string host_gpu_video_memory_report(bool at_exit) {
     return gpu::video_memory_report_locked(at_exit);
 }
 
-void host_gpu_memory_census_refresh() { (void)host_gpu_video_memory_report(false); }
+bool host_gpu_memory_census_refresh() {
+    if (!gpu::g.ok || !gpu::vram_report_on()) return true;  // nothing to run
+    std::unique_lock<GpuMutex> lock(gpu::g.mu, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    (void)gpu::video_memory_report_locked(false);
+    return true;
+}
 
 bool host_gpu_memory_glance(GpuMemoryGlance& out) {
     using namespace gpu;
@@ -12522,8 +12953,42 @@ void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_
     textures_retire(base, bytes, after_submitted, gen);  // its own lock: callable from the kernel's unmap
 }
 
+void host_gpu_targets_rebuild(bool on) {
+    textures_rebuild_window(on);
+    if (on) return;
+    // The change ran with the command processor drained, so the old size's
+    // retirements are due: a submission of their own carries them out (its
+    // textures_before_submit) and is retired at once, which gives their room
+    // in the image heap back before the next frame makes the new size's
+    // targets. Retired with the next frame's work instead, the old images
+    // still held it while the new size's were placed.
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok) return;
+    begin_recording_locked();
+    flush_locked();
+}
+
 void host_gpu_texture_written(std::uint64_t base, std::size_t bytes) {
     textures_gx_written(base, bytes);  // its own lock, as the retirement's
+}
+
+bool host_gpu_yebis_texture_update(std::uint64_t memory, std::uint64_t gen, std::uint32_t mip, std::uint32_t slice, std::uint32_t x, std::uint32_t y,
+                                   std::uint32_t w, std::uint32_t h, const void* rows, std::uint32_t pitch, std::uint64_t submitted) {
+    if (!rows || !w || !h || !pitch) return false;
+    TexUpdate u;
+    u.memory = memory;
+    u.gen = gen;
+    u.mip = mip;
+    u.slice = slice;
+    u.x = x;
+    u.y = y;
+    u.w = w;
+    u.h = h;
+    u.pitch = pitch;
+    u.submitted = submitted;
+    const auto* p = static_cast<const std::uint8_t*>(rows);
+    u.rows.assign(p, p + static_cast<std::size_t>(pitch) * h);
+    return textures_yebis_update(std::move(u));  // its own lock
 }
 
 bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes) {
@@ -13410,8 +13875,12 @@ std::uint64_t host_gpu_work_needs() {
 std::uint64_t host_gpu_submissions_completed() {
     if (g_timeline_on.load(std::memory_order_acquire)) {
         std::uint64_t v = 0;
-        if (g_device_lost.load(std::memory_order_relaxed) || vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS)
-            v = ~0ull;  // nothing more will run: nothing to wait for
+        bool read = false;
+        if (!g_device_lost.load(std::memory_order_relaxed)) {
+            slow_calls::Scope timed(kTimelineValueSite);
+            read = vkGetSemaphoreCounterValue(g.device, g.timeline, &v) == VK_SUCCESS;
+        }
+        if (!read) v = ~0ull;  // nothing more will run: nothing to wait for
         // What counts as run has its labels in memory (label_landing.h).
         if (landing_on()) label_landing::land_through(v);
         return v;
@@ -13447,9 +13916,180 @@ bool host_gpu_wait_completed(std::uint64_t need, std::uint64_t timeout_ns) {
     wi.semaphoreCount = 1;
     wi.pSemaphores = &g.timeline;
     wi.pValues = &need;
-    const bool done = vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
+    bool done;
+    {
+        slow_calls::Scope timed(kTimelineWaitSite, poll_slack(timeout_ns));
+        done = vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
+    }
     if (done && landing_on()) label_landing::land_through(need);  // its labels in memory before the caller reads it
     return done;
+}
+
+namespace {
+
+// BBHOST_GX_CATCH_UP=0: the GX layer's catch-ups are flushes, as before (the measurement's baseline).
+bool catch_up_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_GX_CATCH_UP");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+// The catch-ups by the way they went (gpu_catch_up::Way), their time in all (the call's: the lock taken, the wait,
+// the slots retired) and the longest.
+std::atomic<std::uint64_t> g_cu_n[4] = {}, g_cu_us[4] = {}, g_cu_longest_us{0};
+constexpr slow_calls::Site kCatchUpValueSite{slow_calls::kSemaphoreValue, "a GX catch-up"};
+
+// BBHOST_TEST_GPU_STALL_CATCH_UP=<flip>:<ms> (tests): the first submission a GX catch-up forces from that flip on
+// carries BBHOST_TEST_GPU_STALL's GPU job (shaders/gpu_stall.comp, BBHOST_TEST_GPU_STALL_PIECES pieces of at most
+// BBHOST_TEST_GPU_STALL_TURNS turns), let go <ms> later - 0: never, it ends once its pieces are done - and no submit
+// waits for it: the catch-up's own wait outside the renderer's lock meets the busy GPU and runs out, and the same
+// submission is waited for under the lock as a flush waits for it (fence_wait_locked's steps, and past its limit the
+// stop). BBHOST_TEST_GPU_STALL's job cannot meet that wait - the submit that carries it waits for it itself, under
+// the lock - and its code stays as it is: it is inlined into submit_locked, whose Windows profile a change there costs.
+void catch_up_stall_record_locked() {
+    struct Cfg {
+        std::uint64_t flip = 0, ms = 0, pieces = 2000, turns = 4096;
+        bool on = false;
+    };
+    static const Cfg cfg = [] {
+        Cfg c;
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL_CATCH_UP"); e && *e) {
+            char* end = nullptr;
+            c.flip = std::strtoull(e, &end, 10);
+            c.ms = end && *end == ':' ? std::strtoull(end + 1, nullptr, 10) : 0;
+            c.on = true;
+        }
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL_PIECES"); e && *e) c.pieces = std::max<std::uint64_t>(1, std::strtoull(e, nullptr, 10));
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL_TURNS"); e && *e) c.turns = std::strtoull(e, nullptr, 10);
+        return c;
+    }();
+    static bool done = false;
+    if (!cfg.on || done || !g.recording || hle_video_flip_count() < cfg.flip) return;
+    done = true;
+    // Kept for the run: the GPU runs the job until it ends.
+    static VkPipelineLayout layout = VK_NULL_HANDLE;
+    static VkPipeline pipeline = VK_NULL_HANDLE;
+    static DevBuffer flag;
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = sizeof(k_gpu_stall_spv);
+    smi.pCode = k_gpu_stall_spv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &range;
+    bool ok = vkCreateShaderModule(g.device, &smi, nullptr, &module) == VK_SUCCESS &&
+              vkCreatePipelineLayout(g.device, &pli, nullptr, &layout) == VK_SUCCESS;
+    if (ok) {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = module;
+        ci.stage.pName = "main";
+        ci.layout = layout;
+        ok = vkCreateComputePipelines(g.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) == VK_SUCCESS;
+    }
+    if (module) vkDestroyShaderModule(g.device, module, nullptr);
+    if (!ok || !create_dev_buffer(flag, 64, true) || !flag.map) {
+        host_log("gpu: test: the GPU job of BBHOST_TEST_GPU_STALL_CATCH_UP could not be made");
+        return;
+    }
+    volatile std::uint32_t* w = static_cast<volatile std::uint32_t*>(flag.map);
+    for (int i = 0; i < 4; ++i) w[i] = 0;
+    struct Push {
+        std::uint64_t flag;
+        std::uint32_t max_turns, pad;
+    } push{flag.address, static_cast<std::uint32_t>(std::min<std::uint64_t>(cfg.turns, 0xffffffffu)), 0};
+    // Outside a pass and a transfer run, as a dispatch is recorded.
+    transfer_flush_locked();
+    render_end_pass_locked();
+    rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    rec().push_constants(layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    for (std::uint64_t k = 0; k < cfg.pieces; ++k) {
+        rec().dispatch(1, 1, 1);
+        if (k + 1 < cfg.pieces) rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+    char when[48];
+    if (cfg.ms) std::snprintf(when, sizeof(when), "%llu ms later", static_cast<unsigned long long>(cfg.ms));
+    else std::snprintf(when, sizeof(when), "never");
+    host_log("gpu: test: submission %llu (flip %llu), a GX catch-up's, carries a GPU job of %llu pieces of up to %llu turns that runs "
+             "until the host lets it go: %s; the catch-up waits for it itself (BBHOST_TEST_GPU_STALL_CATCH_UP)",
+             static_cast<unsigned long long>(g.flushes), static_cast<unsigned long long>(hle_video_flip_count()),
+             static_cast<unsigned long long>(cfg.pieces), static_cast<unsigned long long>(cfg.turns), when);
+    if (cfg.ms) {
+        std::thread([ms = cfg.ms, w] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            const std::uint32_t pieces = w[2], turns = w[1];
+            w[0] = 1;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            host_log("gpu: test: the catch-up's GPU job is let go %llu ms after it was recorded, %u pieces and %u turns in",
+                     static_cast<unsigned long long>(ms), pieces, turns);
+        }).detach();
+    }
+}
+
+// The renderer as gpu_catch_up::run uses it.
+struct CatchUpOps {
+    void lock() { g.mu.lock(); }
+    void unlock() { g.mu.unlock(); }
+    bool ok() const { return g.ok; }
+    bool timeline() const { return g_timeline_on.load(std::memory_order_acquire); }
+    void flush_locked() { gpu::flush_locked(); }
+    void submit_locked() {
+        catch_up_stall_record_locked();  // BBHOST_TEST_GPU_STALL_CATCH_UP
+        gpu::submit_locked();
+    }
+    std::uint64_t submissions_locked() const { return g.flushes; }
+    // Without the lock. Inside the driver where that wait is sound (host_gpu_wait_completed, which lands the labels
+    // after it). Where the driver holds its own lock through such a wait - NVIDIA's on Windows, for a value still
+    // to be submitted, as this one may be (bb-submit submits it) - every other thread's call would queue behind it,
+    // the submission's own too: there the value is read, the thread asleep between reads (label_landing::waits_block).
+    bool wait(std::uint64_t need, std::uint64_t timeout_ns) {
+        if (label_landing::waits_block() || g_device_lost.load(std::memory_order_relaxed)) return host_gpu_wait_completed(need, timeout_ns);
+        const bool done = gpu_catch_up::poll_until(
+            need, timeout_ns,
+            [] {
+                if (g_device_lost.load(std::memory_order_relaxed)) return ~0ull;  // nothing more will run
+                std::uint64_t v = 0;
+                slow_calls::Scope timed(kCatchUpValueSite);
+                return vkGetSemaphoreCounterValue(g.device, g.timeline, &v) == VK_SUCCESS ? v : ~0ull;
+            },
+            [] { return host_clock_monotonic_ns(); },
+            [](int k) {
+                if (k < 32) std::this_thread::yield();
+                else host_sleep_us(50);
+            });
+        if (done && landing_on()) label_landing::land_through(g_device_lost.load(std::memory_order_relaxed) ? ~0ull : need);
+        return done;
+    }
+    void retire_through_locked(std::uint64_t serial) { gpu::retire_through_locked(serial); }
+};
+
+}  // namespace
+
+void host_gpu_catch_up(std::uint64_t timeout_ns) {
+    const std::uint64_t t0 = host_clock_monotonic_ns();
+    CatchUpOps ops;
+    const gpu_catch_up::Result r = gpu_catch_up::run(ops, catch_up_on(), timeout_ns);
+    const std::uint64_t us = (host_clock_monotonic_ns() - t0) / 1000;
+    const int way = static_cast<int>(r.way);
+    g_cu_n[way].fetch_add(1, std::memory_order_relaxed);
+    g_cu_us[way].fetch_add(us, std::memory_order_relaxed);
+    for (std::uint64_t m = g_cu_longest_us.load(std::memory_order_relaxed); us > m && !g_cu_longest_us.compare_exchange_weak(m, us, std::memory_order_relaxed);) {
+    }
+    if (r.way == gpu_catch_up::Way::kWaitedLocked) {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 8) {
+            host_log("gpu: a GX catch-up's submission %llu had not run %llu ms after it was handed over: waited for under the renderer's "
+                     "lock, as a flush waits (%llu ms in all)",
+                     static_cast<unsigned long long>(r.need - 1), static_cast<unsigned long long>(timeout_ns / 1000000),
+                     static_cast<unsigned long long>(us / 1000));
+        }
+    }
 }
 
 void host_gpu_report() {
@@ -13657,6 +14297,19 @@ void host_gpu_report() {
                  static_cast<unsigned long long>(g_arena_retires_ordered.load()));
         host_log("gpu: %s", landing.c_str());
         if (!landing_reused.empty()) host_log("gpu: %s", landing_reused.c_str());
+        if (const std::uint64_t n = g_cu_n[0].load() + g_cu_n[1].load() + g_cu_n[2].load() + g_cu_n[3].load()) {
+            using gpu_catch_up::Way;
+            const auto at = [](Way w) { return static_cast<int>(w); };
+            host_log("gpu: GX catch-ups (the block reclaim's and the discard rename's waits for the GPU): %llu - %llu waited for outside "
+                     "the renderer's lock (%llu ms in all), %llu ran out after their timeout and waited under the lock as a flush does "
+                     "(%llu ms), %llu flushes (%s); the longest %llu ms",
+                     static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_cu_n[at(Way::kCaughtUp)].load()),
+                     static_cast<unsigned long long>(g_cu_us[at(Way::kCaughtUp)].load() / 1000),
+                     static_cast<unsigned long long>(g_cu_n[at(Way::kWaitedLocked)].load()),
+                     static_cast<unsigned long long>(g_cu_us[at(Way::kWaitedLocked)].load() / 1000),
+                     static_cast<unsigned long long>(g_cu_n[at(Way::kFlushed)].load()),
+                     catch_up_on() ? "no timeline" : "BBHOST_GX_CATCH_UP=0", static_cast<unsigned long long>(g_cu_longest_us.load() / 1000));
+        }
         if (!landing_on()) {
             host_log("gpu: command-processor writes recorded as fills into memory the game had written again since their submission (a "
                      "command buffer begun again): %llu, %llu of them within what its new round had written; filled by the GPU over "
@@ -13691,12 +14344,26 @@ void host_gpu_report() {
                  static_cast<unsigned long long>(g_counter_fills.load()));
     }
     if (g.cmd_buffer_marker && g.marker_buf.map) {
-        std::uint32_t started = 0, finished = 0;
-        std::memcpy(&started, g.marker_buf.map, 4);
-        std::memcpy(&finished, static_cast<const std::uint8_t*>(g.marker_buf.map) + 4, 4);
-        host_log("gpu: AMD markers at exit: last started %s %u, everything finished before %s %u",
-                 (started >> 30) == 1 ? "draw" : (started >> 30) == 2 ? "dispatch" : "-", started & 0x3fffffff,
-                 (finished >> 30) == 1 ? "draw" : (finished >> 30) == 2 ? "dispatch" : "-", finished & 0x3fffffff);
+        // The words once the GPU has run all it was given (a lost device answers at once): with nothing in flight
+        // they agree - the last started is the last finished before (the last submission's end, as a rule, or the
+        // last loading screen's window's end) - and the last op the front end reached is the last noted with a word,
+        // but for ops recorded and never submitted before the exit (the command processor runs ahead of the GPU
+        // uncapped) - so a start's exit line checks the markers themselves. (A window closed long before needs no
+        // wait: its end's words are the last written.)
+        const std::uint32_t windows = g_marker_windows.load(std::memory_order_relaxed);
+        const bool open = markers_live();
+        if (open) {
+            QueueGuard queue;
+            vkQueueWaitIdle(g.queue);
+        }
+        std::uint32_t started = 0, finished = 0, reached = 0;
+        std::memcpy(&started, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kStarted, 4);
+        std::memcpy(&finished, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kFinishedBefore, 4);
+        std::memcpy(&reached, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kOpReached, 4);
+        host_log("gpu: AMD markers at exit (%s, %u window%s, the last %s): last started %s, everything finished before %s; ops between "
+                 "draws: the last the front end reached %u (the last noted with a word %u)",
+                 g_marker_mode == gpu_markers::Mode::kAlways ? "everywhere" : "in loading screens", windows, windows == 1 ? "" : "s",
+                 open ? "open" : "closed", marker_text(started).c_str(), marker_text(finished).c_str(), reached, recorder_last_op_note());
     }
     host_log("gpu: dispatches=%llu draws=%llu draw-failures=%llu flushes=%llu failures=%llu pipelines=%llu/%llu dummy-images=%llu gpu-time=%llu ms",
              static_cast<unsigned long long>(g.dispatches.load()), static_cast<unsigned long long>(g.draws.load()),

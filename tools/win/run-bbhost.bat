@@ -20,6 +20,6 @@ set RC=%ERRORLEVEL%
 echo.
 echo  bbhost が終了しました（終了コード %RC%）。ログの末尾:
 echo.
-powershell -NoProfile -Command "Get-Content -Tail 15 '%LOG%'"
+powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 15 '%LOG%'"
 echo.
 pause

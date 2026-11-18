@@ -9,6 +9,8 @@
 // account whatever a config file says.
 #pragma once
 
+#include "net/sign_in_check.h"
+
 #include <string>
 
 namespace net {
@@ -20,13 +22,64 @@ bool account_logged_in();
 void account_set(const std::string& name, const std::string& token);
 void account_clear();
 
-// The server refused this PC's sign-in (HTTP 401 on its surfaces): the token
-// expired or was replaced, or, with no token, the online id is an account's
-// name. Kept until the next account_set / account_clear; the event poller
-// slows down while it holds and the F10 Account section says what to do.
-// account_mark_refused logs the reason once per sign-in.
+// The server refused this PC's sign-in (HTTP 401 on its surfaces, or the
+// sign-in check below): the token expired or was revoked, or, with no token,
+// the online id is an account's name. Kept until the next account_set /
+// account_clear or a check the server answers yes; the event poller slows
+// down while it holds, the game stays signed out where the server requires an
+// account (hle/system.cpp), and F10's account section (the Game page) says what to do.
+// account_mark_refused logs the reason once per sign-in and, while the game's
+// window is up, says once over the game what to do about it.
 bool account_refused();
 void account_mark_refused(const std::string& reason);
+
+// The setup window's check of this PC's sign-in with the server (POST
+// /auth/whoami to auth_server_base(), read by net/sign_in_check.h), on a
+// thread of its own: nothing waits for it. A refusal marks the sign-in
+// refused (above); a yes clears an earlier refusal. An answer that comes back
+// after the sign-in changed, or after a newer check began, is dropped. The
+// token goes in the request's body and header only; nothing logs it.
+enum class AccountCheckState {
+    None,       // no check since the sign-in last changed (or nobody is signed in)
+    Checking,   // asked, no answer yet
+    Valid,      // the server knows the sign-in
+    Refused,    // it does not: expired, or this PC was signed out
+    Unchecked,  // no verdict: no answer, a busy server, one without the check
+};
+struct AccountCheck {
+    AccountCheckState state = AccountCheckState::None;
+    std::string name;  // the account checked
+    std::string why;   // Refused: the server's words; Unchecked: what came back instead
+    long status = 0;   // the answer's HTTP status, 0 when none came
+    NatTestRecord nat_test;  // Valid: the account's last connection test (whoami's NatTest)
+    RelaySwitch relay;       // Valid: the account's relay switch (whoami's RelayDirect)
+};
+void account_check_start(int timeout_ms = 5000);
+AccountCheck account_check();
+
+// The account's relay switch, as the website's account page has it: off
+// (`direct`), co-op and PvP connect directly to other hunters; on, through the
+// server's relay, which works on every network. POST /auth/profile {Token,
+// RelayDirect} to auth_server_base(), on a thread of its own; once the server
+// has taken it, the sign-in check runs again, and its answer (whoami's
+// RelayDirect) is what the setup window shows. The setting is the account's,
+// applied by the server to the addresses its games play from: the request may
+// go over IPv4 or IPv6. One at a time; a sign-in or sign-out meanwhile drops
+// its answer.
+enum class RelayChangeState {
+    None,
+    Saving,  // asked, no answer yet
+    Saved,   // the server took it (the check that follows has the switch)
+    Failed,  // `why` says what came back instead
+};
+struct RelayChange {
+    RelayChangeState state = RelayChangeState::None;
+    bool direct = false;  // what was asked: off (true) or on
+    std::string why;      // Failed: the server's words, or the transport's
+    long status = 0;      // Failed: the answer's HTTP status, 0 when none came
+};
+void account_relay_change_start(bool direct, int timeout_ms = 8000);
+RelayChange account_relay_change();
 
 // All of these talk to the server (blocking, host thread) and fill `error`
 // with the server's message when they fail.

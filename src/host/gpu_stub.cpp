@@ -1,6 +1,7 @@
 // No Vulkan at build time: GPU work is skipped.
 #include "host/gpu.h"
 #include "host/memory_policy.h"
+#include "host/shader_overrides.h"
 
 bool host_gpu_init(const char* const*, std::uint32_t, bool) { return false; }
 bool host_gpu_available() { return false; }
@@ -19,10 +20,18 @@ void host_gpu_wait_submitted(std::uint64_t) {}
 GpuBusy host_gpu_busy() { return {}; }
 void host_gpu_busy_present_begin(void*) {}
 void host_gpu_busy_present_end(void*) {}
+void host_gpu_present_markers(void*, bool) {}
 void host_gpu_busy_present_done() {}
 std::string host_gpu_busy_report() { return {}; }
 void host_gpu_queue_lock_only() {}
 bool host_gpu_submit_for_flip(std::uint64_t) { return false; }
+void host_gpu_frame_recorded() {}
+// Edited shaders (host/shader_overrides.h) without the HLSL path: none apply.
+namespace gpu {
+std::string hlsl_file_name(const std::string& program) { return program; }
+bool override_prepare(const std::shared_ptr<const OverrideSource>&) { return false; }
+int hlsl_override_source(const std::string&, std::string&) { return 2; }
+}  // namespace gpu
 bool host_gpu_display_image(std::uint64_t, void**, std::uint32_t*, std::uint32_t*, std::uint32_t*) { return false; }
 bool host_gpu_dispatch(const GpuDispatch&) { return false; }
 GpuDispatchClass host_gpu_last_dispatch_class(const char** program) {
@@ -32,6 +41,7 @@ GpuDispatchClass host_gpu_last_dispatch_class(const char** program) {
 bool host_gpu_draw(const GpuDraw&) { return false; }
 int host_gpu_run_commit(const GpuDraw*, const std::uint64_t*, std::uint32_t, std::uint32_t&) { return 0; }
 void host_gpu_flush() {}
+void host_gpu_forget_region(std::uint64_t, std::uint64_t) {}
 void host_gpu_report() {}
 void host_gpu_submit() {}
 void host_gpu_save_pipeline_cache() {}
@@ -49,7 +59,7 @@ bool host_gpu_counter_copy(std::uint64_t, std::uint64_t, std::size_t) { return f
 bool host_gpu_counter_fill(std::uint64_t, std::uint32_t, std::size_t) { return false; }
 void host_gpu_import_prefetch(std::uint64_t, std::uint64_t, std::uint8_t, std::uint8_t) {}
 bool host_gpu_memory_glance(GpuMemoryGlance&) { return false; }
-void host_gpu_memory_census_refresh() {}
+bool host_gpu_memory_census_refresh() { return false; }
 void host_gpu_import_waits(std::uint64_t* n, std::uint64_t* us) {
     if (n) *n = 0;
     if (us) *us = 0;
@@ -81,7 +91,9 @@ GpuHandles host_gpu_handles() { return {}; }
 void host_gpu_lock() {}
 void host_gpu_unlock() {}
 bool host_gpu_blit_display(void*, std::uint64_t, void*, std::int32_t, std::int32_t, std::uint32_t, std::uint32_t, std::uint32_t,
-                           std::uint32_t, std::uint32_t, std::uint32_t, void*) { return false; }
+                           std::uint32_t, std::uint32_t, std::uint32_t, void*, bool*) { return false; }
+bool host_gpu_fsr_upscale(void*, void*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+                          std::uint32_t, void*, std::int32_t, std::int32_t, std::uint32_t, std::uint32_t) { return false; }
 bool host_gpu_dump_display(std::uint64_t, const char*, bool) { return false; }
 void host_gpu_request_dump() {}
 bool host_gpu_take_dump_request(std::string*) { return false; }
@@ -94,6 +106,7 @@ std::uint64_t host_gpu_draw_mark() { return 0; }
 std::uint64_t host_gpu_work_needs() { return 0; }
 std::uint64_t host_gpu_submissions_completed() { return ~0ull; }
 bool host_gpu_wait_completed(std::uint64_t, std::uint64_t) { return false; }
+void host_gpu_catch_up(std::uint64_t) {}
 void* host_gpu_timeline() { return nullptr; }
 void* host_gpu_present_timeline() { return nullptr; }
 void host_gpu_present_reads_locked(std::uint64_t) {}
@@ -108,6 +121,11 @@ std::string host_gpu_occlusion_report() { return {}; }
 std::string host_gpu_image_heap_report() { return {}; }
 void host_gpu_resources_report() {}
 void host_gpu_texture_written(std::uint64_t, std::size_t) {}
+bool host_gpu_yebis_texture_update(std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+                                   std::uint32_t, const void*, std::uint32_t, std::uint64_t) {
+    return false;
+}
+void host_gpu_targets_rebuild(bool) {}
 void host_gpu_shadow_gx_write(std::uint64_t, std::size_t) {}
 void host_gpu_shadow_gx_created(std::uint64_t, std::size_t) {}
 void host_gpu_shadow_gx_handed(std::uint64_t, std::size_t, int) {}
@@ -125,4 +143,5 @@ void host_gpu_set_compile_session(bool) {}
 HostShaderCompileProgress host_gpu_compile_progress() { return {}; }
 void host_gpu_compile_cancel() {}
 std::string host_gpu_device_identity() { return {}; }
+std::string host_gpu_lock_holder() { return "none"; }
 int host_gpu_stream_selftest(int) { return 2; }  // no Vulkan: nothing to test

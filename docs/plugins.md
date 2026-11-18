@@ -31,8 +31,11 @@ settings. In game, F9 opens the patch and plugin menu over the game.
 
 ## A first plugin
 
-`plugins/hello/hello.c` is the example. bbhost's own build produces it as
-`build/plugins/hello.so` (or `hello.dll`). A plugin needs only the header:
+`examples/plugins/hello/hello.c` is the example, and `examples/plugins/` holds
+the others. bbhost's own build compiles it as `build/hello.so` (or
+`hello.dll`), beside bbhost and not in `build/plugins/`, so no run loads or
+lists it until you copy it into a `plugins/` folder. A plugin needs only the
+header:
 
 ```sh
 # Linux
@@ -79,7 +82,7 @@ log line. Everything a plugin logs is prefixed with `plugin:`.
 
 The API only ever grows. A plugin checks that `api->version` is at least the
 version whose calls it makes, and `api->size` for fields a newer host
-appended. The current version is 12 (`BB_PLUGIN_API_VERSION`).
+appended. The current version is 29 (`BB_PLUGIN_API_VERSION`).
 
 ## Addresses
 
@@ -159,12 +162,19 @@ gives the Binary Ninja address.
   Space, 224 Left Ctrl), the mouse's buttons held and pressed since the last
   read, its motion in its own counts and the wheel's notches - and `playing`,
   1 while the mouse turns the camera (in the world, no menu up). One reader:
-  the motion, presses and notches are the caller's once read.
+  the motion, presses and notches are the caller's once read - since v29
+  `input_as` gives a plugin reads of its own, and `input` is the read of the
+  plugins that do not name themselves.
 - `input_take(scancodes, n, buttons, wheel, motion)`: while the player is
   playing, those keys and mouse buttons stop pressing what they are bound to,
   the wheel's notches stay out of the game, and the mouse stops turning the
   game's camera - the plugin reads them all through `input`. The menus keep
-  every key. A call replaces the last; nothing taken gives everything back.
+  every key. A call replaces the last; nothing taken gives everything back,
+  but a key held then stays taken until it is let go (since v29), so the
+  game never sees it go down, while a key a call leaves out as it goes on
+  taking others is the game's again at once. Since v29 this is the take of
+  the plugins that do not name themselves: `input_take_as` gives a plugin a
+  take of its own, and the takes add up.
 - `on_camera(fn, user)`: each frame once the game has placed the player's
   camera - the follow camera's update and the camera manager's blend of the
   cameras it owns - and before the scene is drawn from it or a scripted camera
@@ -173,6 +183,171 @@ gives the Binary Ninja address.
   clip planes, all writable. The character's update has run by then; its next
   one moves by where this camera looks. The Quake plugin is a first-person
   view this way.
+- `on_view(fn, user)` (v20): each frame after the game has copied that camera
+  into the scene's, before a scripted camera replaces it: what `fn` writes is
+  drawn, while the game's own camera - which the follow camera keeps, the
+  controls move by and the aim reads - stays as `on_camera` left it. The
+  Isometric plugin draws its view this way. Since v29 it is not called during
+  a cutscene (`cutscene()`), and a view it changes is another camera's picture
+  to the other plugins (`world_state`'s `BB_WORLD_VIEW`).
+- `on_camera_target(fn, user)` (v28): the recompiled follow camera's target.
+  Registered once, from `bb_plugin_image`; on the game thread at each of the
+  camera's updates `fn` gets the character whose controls the camera uses and
+  returns a live `ChrIns` to follow instead, or NULL to leave it. Only the
+  model and the moving floor's position are followed elsewhere, never the
+  input, and a plugin keeps no pointer to an actor that may die. A spectator
+  camera this way; where the game's own follow camera runs instead of the
+  recompiled one, a plugin still needs its own camera hooks. One plugin owns
+  it: 1 outside image setup, for NULL, or once taken; 0 otherwise.
+- `cutscene()` (v29): 1 while one of the game's cutscenes is asked for or
+  playing. The cutscene places the hunter and the camera itself, so a plugin
+  that moves either, hides the body, holds its gravity or takes the controls
+  gives them back for its length and takes them up again from wherever the
+  cutscene leaves the hunter (Quake, Hunter Cam and Isometric do). `on_view` is
+  not called during one; `on_camera` still is.
+
+**The world held still, the controller, who else is in the world, the HUD, the look and a panel** (v29)
+
+What a photo mode needs: the world stopped while its own camera flies, the
+controller read as the plugin's own while the game reads none of what it
+takes, a way to know that nobody else is in the world, the HUD out of the
+picture, a look of its own over the area's, and a panel of its settings
+over the game.
+
+- `world_pause(name, paused)`: holds the world - its characters, physics, AI,
+  events, effects and cloth - while frames go on being drawn and `on_view`
+  goes on being called. It is the game's own pause, the one it holds while it
+  leaves a world, taken at the world's next update. `name` is the plugin's
+  `BbPluginInfo` name; the world is held while any plugin asks. A load lets
+  every hold go, so a world never starts held, and so does turning the plugin
+  off. `set_time_scale` cannot do this: it stops at 0.1, and at frame rates
+  above 30 what the game counts in frames keeps real time.
+- `world_step(name, updates)`: while the plugin holds the world, that many
+  more updates run, one a frame, and then it is held again - a frame advance.
+- `pad(&pad)`: the controller as `BbPad` (set `pad.size` first): its own
+  buttons as `BB_PAD_*` bits, whatever the player's bindings make of them in
+  play, the sticks from -1 to 1 with the player's dead zones applied, the
+  triggers from 0 to 1, and the presses since the last frame, latched so that
+  a press shorter than a frame still counts - the same for every plugin that
+  reads in that frame. `play` is the held buttons as what they press in play
+  under the player's bindings (Key Bindings' controller column), for controls
+  that follow the game's own: photo mode's L3 is whichever button presses the
+  game's L3. From the main thread (`on_frame`). While bbhost's own menus, a
+  binding being chosen or a text box have the controller, nothing reads as
+  held. A test's taps (`BBHOST_AUTOPRESS`, the `tap` request) count as the
+  controller's.
+- `pad_take(name, buttons, axes)`: the game reads those buttons (the
+  controller's own) let go and those axes (`BB_PAD_LEFT_STICK`,
+  `BB_PAD_RIGHT_STICK`, `BB_PAD_TRIGGERS`) at rest - whatever they are bound
+  to in play is not pressed - while `pad` still reads them. Keys are
+  `input_take_as`'s. Each plugin's take is its own and the game loses what any
+  plugin takes; a call replaces the plugin's last. `0, 0` gives its buttons
+  back, but a button held then stays taken until it is let go, so the game
+  never sees it go down; a button a call leaves out as it goes on taking
+  others is the game's again at once. Turning the plugin off gives its take
+  back.
+- `input_take_as(name, scancodes, n, buttons, wheel, motion)`: `input_take`
+  for the plugin named `name`. The plugins' takes add up, each call replacing
+  only that plugin's last, so a plugin giving its keys back leaves another's
+  taken - photo mode ending leaves the Quake plugin's movement keys and mouse
+  its own. `input_take` is the take of every plugin that does not name
+  itself. Nothing taken gives the plugin's back, but a key held then stays
+  taken until it is let go; a key a call leaves out as it goes on taking
+  others is the game's again at once (the Quake plugin's movement keys on a
+  ladder). Turning the plugin off gives its take back.
+- `input_as(name, &in)`: `input` for the plugin named `name`: the presses,
+  motion and wheel since that plugin's own last read, so plugins reading every
+  frame never take them from one another - photo mode looking for P each frame
+  leaves the Quake plugin's mouse look whole. `input`'s are the read of every
+  plugin that does not name itself; a plugin's first read starts its count.
+- `world_state(&state)`: `BbWorldState` (set `state.size` first). `flags`:
+  `BB_WORLD_IN` (a world is loaded and running, or held), `BB_WORLD_LOADING`,
+  `BB_WORLD_CUTSCENE` (one plays or is queued), `BB_WORLD_MENU` (one of the
+  game's menus or dialogs has the controls, its debug menu included),
+  `BB_WORLD_PAUSED` (a plugin holds
+  the world), `BB_WORLD_VISITING` (the player is in another player's world or
+  on the way there), `BB_WORLD_OPEN` (the world's own session is up:
+  players matched to it, or in it - a bell rung alone does not open it; the
+  game makes the session when matchmaking finds a player) and `BB_WORLD_VIEW`
+  (another camera has the picture: a plugin's `on_view` moved the view this
+  frame or the last - a plugin's free camera - so a plugin whose own camera
+  is not the one drawn can give the hunter back to the game meanwhile; a
+  plugin that moves the view itself sees its own). `others`: other
+  players' characters in this world now - co-operators, invaders, the host one
+  visits. `arriving`: players on their way in - members of the world's session
+  or of its matchmaking room who are not in the world yet, counted from the
+  server's word that one joined the room. `session`: the game's own session
+  role (`BB_SESSION_*`).
+- `hud_hide(name, hidden)`: the game's HUD, menus and prompts left out of the
+  picture. The game draws them as always; they are left out where the
+  picture is put together for the screen - the point frame generation takes
+  its picture without the HUD from - so nothing of the game's own state
+  changes, and its HUD option keeps its value. bbhost's overlay and menus are
+  drawn as always, and so is a plugin's menu in the game's dialog: while one
+  is up, the game's HUD option is held off instead, and prompts may show. The HUD is left out while any plugin asks; turning the
+  plugin off lets go. It costs two copies of the picture a frame while on.
+  `hidden` -1 asks for the HUD shown instead, even where the player's own HUD
+  option hides it: the option is held on while any plugin asks so (and none
+  asks for the HUD left out) and is the player's again once none does. A
+  plugin's ask replaces its last.
+- `post_look(name, &look, &available)`: the picture's look over the area's
+  own, as `BbLook` (set `look.size` first): the groups in `set` apply - tone
+  (exposure, gamma, saturation, brightness and contrast, each times the
+  area's; the exposure is the eye adaptation's target while it adapts, the
+  fixed exposure otherwise), the vignette's power, depth of field (off, or on
+  with a focus distance, an aperture and the blur's levels in front of and
+  behind the focus - the lens's blur, in place of the area's own distance
+  ramps while it is on; with `BB_LOOK_DOF_RANGE` as well, the blur placed by
+  distance instead, as the areas' own is: sharp from `dof_near_end` to
+  `dof_far_start` metres, the blur in front full `dof_near_fade` metres
+  nearer and the blur behind full `dof_far_fade` metres further, each as
+  strong as its levels say), chromatic aberration (off, or on with its
+  lateral and uniform dispersions), motion blur (off, or on with its times, scale and
+  samples - 2 to 8, the most the game's motion blur has shaders for, and 7
+  where the area interleaves its samples, which makes 8 a 9) and the fog (its
+  distance, density and contrast times the area's, its distance and height
+  offsets added) - and the rest stay the area's. It is
+  written every view into the numbers the area gives the post-processing and
+  the fog, so nothing of the game's is kept or put back: `NULL` or `set` 0 is
+  the area's own from the next frame. One look for all plugins - the last
+  call's - and turning its plugin off takes it away. Depth of field and motion
+  blur show while the look sets them on whatever the Graphics settings say,
+  and are left out while it sets them off; Performance mode jumps past every
+  depth of field pass and leaves the scene's motion blur off, so `available`
+  (may be `NULL`) leaves those two out then. Values outside what the post
+  effect takes are clamped.
+- `panel_show(name, &panel)`: the plugin's panel up (`BbPanel`) or down
+  (`NULL`). Its pages are the plugin's own options table: a `BB_OPT_HEADING`
+  with `BB_OPT_PANEL` or-ed in starts a page, the rows under it up to the next
+  heading are on it, and neither shows in the menus. It is an in-game menu
+  (see [In-game menus](#in-game-menus-v29)): pages of the game's own options
+  dialog - its rows, cursor, sounds, line help and key guide, read from the
+  player's dump (nothing of it is shipped) - at the dialog's place with the
+  screen dimmed behind it, or smaller at the bottom right with
+  `BB_PANEL_CORNER`. Its rows' changes go to `on_option` as the menus' do (so
+  its rows want `BB_OPT_LIVE`); the line help shows the first sentence of the
+  row's help, then `guide` or `guide_keys` - whichever device the player used
+  last. The controller drives it (the d-pad up and down to a row, left and
+  right to change it, Cross to set a switch or press a button, L1 and R1 the
+  pages, Circle goes back or closes it), as do the keyboard (the arrows,
+  Enter, Page Up and Page Down, Escape or Backspace) and the pointer. While a
+  centred menu is up neither the game's play nor the plugins read the
+  controller, the keyboard or the mouse; while a corner one is, only what the
+  dialog moves by, and everything else is as it was. Where the game cannot
+  open its dialog, the host draws the same pages in a panel of its own.
+  `BB_PANEL_DEFAULTS` ends each page with a Defaults row. One panel at a time;
+  turning the plugin off takes it down.
+- `panel_state(name, &state)`: `BbPanelState` (set `state.size` first) -
+  whether the panel is up, whether the player closed it (Circle, Escape) since
+  the last call, and the page shown or shown last, by its heading's key.
+- `option_set(name, key, value)`: one of the plugin's options set as the menus
+  set it - kept in the player's config, and handed to `on_option` from the
+  next frame - for a row the plugin changes itself (a mode it always starts
+  in).
+- `panel_rows(name, page, rows, n)`, `panel_value(name, page, key, value)`,
+  `panel_open(name, page)`: a menu page's rows set at run time, one of their
+  values, and a page opened on top of the one shown - see
+  [In-game menus](#in-game-menus-v29).
 
 **Settings, UI and files**
 
@@ -191,25 +366,105 @@ gives the Binary Ninja address.
   the banner on an older host. The Quake plugin names the weapon it switches to
   this way, small, in the bottom left corner.
 - `on_scene_category(pass, fn, user)` (v15): drawing inside the scene.
-  `fn(cc, user)` runs once a frame on the GX worker that records the first
-  chunk of the scene's render queue at or after `pass` - a sort key's category
-  and sub-category, `(bits 22-27 << 6) | bits 16-21` (`BBHOST_SCENE_CATEGORIES=1`
+  `fn(cc, user)` runs once a frame on the GX worker that records the scene's
+  render queue's first item at or after `pass` - a sort key's category and
+  sub-category, `(bits 22-27 << 6) | bits 16-21` (`BBHOST_SCENE_CATEGORIES=1`
   logs those a frame holds) - in a GX command context of its own with that
-  chunk's pass set up, queued just ahead of it: what it records draws into the
-  scene's targets before that pass does. One pass for all plugins; -1 takes it
-  away. The Lo-Hit plugin plays the game's collision debug draw there, under
-  the effects.
+  item's pass set up, queued just ahead of it (the worker's chunk is cut
+  there): what it records draws into the scene's targets after the passes
+  before it and before that pass does. One pass for each `fn` and `user`
+  (v17, up to four; v15-16 one for all plugins); -1 takes it away. The Lo-Hit
+  plugin plays the game's collision debug draw there, under the effects.
 - `draw_style(style)` (v16): inside an `on_scene_category` fn, the draws the
   game's code records on that thread from then on restyled, until set back to
   `BB_DRAW_AS_IS` before fn returns: `BB_DRAW_LINES` (each triangle's edges a
   pixel wide, pulled toward the viewer, no depth written;
   `BBHOST_WIREFRAME_BIAS` -512 and `BBHOST_WIREFRAME_SLOPE` -1 by default),
   `BB_DRAW_BLACK` (zero written), `BB_DRAW_SUBTRACT` (the draw's colour less the
-  target's, once a pixel), or-ed.
-- `campaign_tracking_pause(name, paused)` (v17): main thread only. Excludes a
-  plugin's practice session from local campaign time and boss records. Each
-  plugin owns its named pause; pass zero to release it. Boss Rush uses this
-  during its runs and practices, including loads and the return trip.
+  target's, once a pixel), `BB_DRAW_DEPTH_ONLY` (v17: no colour, the depth
+  written), `BB_DRAW_DEPTH_EQUAL` (v17: tested less-or-equal against the depth
+  an earlier depth-only draw of the same geometry wrote), or-ed.
+  `BB_DRAW_GBUFFER` (v19) draws into the G-buffer (a pass ahead of `3e/13`,
+  such as `3e/0c`) with the host's pixel shader (`gbuffer_flat.frag`) in
+  place of the draw's, marking the stencil as the map's G-buffer draws do,
+  so the game's lighting lights it as it does the map: the sun, the lamps
+  and their shadows, the fog. For the game's simple coloured draw (the debug
+  draw's): rgb the albedo (linear), alpha the face's world normal when
+  negative, `-(1 + u + 2048 v)` with u and v its octahedral coordinates in
+  11 bits. Lo-Hit draws the collision this way (always, on a host with it).
+- `gbuffer_ambient(level)` (v19): `BB_DRAW_GBUFFER` draws' indirect light,
+  which the map gets from its lightmaps (0.03 by default).
+- `audio_crush(rate_hz, bits, lowpass_hz)` (v21): old-hardware sound. The
+  game's final mix, as it reaches the device, low-passed at `lowpass_hz` (one
+  pole), held down to `rate_hz` (sample-and-hold, kept across buffers so their
+  boundaries don't click), rounded to `bits` a sample with no dither (quieter
+  than half a step is silence) and, after a hold, smoothed by a second-order
+  low-pass at 0.45 of `rate_hz`, as a DAC's output filter took out the steps'
+  images above the rate; 0 turns each off, and all three 0 costs nothing. Any thread, from the next
+  buffer. The Bloodborne PS1 plugin's Sound.
+- `view_cutaway(tan_x, tan_y, near_z, radius)` (v22): a cutaway for a high
+  camera. The camera's draws are clipped (a clip distance added to their last
+  stage before the rasterizer) within `radius` metres of the view's axis and
+  nearer than `near_z` along it - the roof, ceiling or near wall between the
+  camera and the character it centres. Camera-relative, so it is set when the
+  distance or field of view change, not as the camera moves; each new set
+  makes the camera draws' pipelines again.
+- `view_cutaway2(const BbCutaway*)` (v23): the cutaway per pixel, faded. The
+  map's own draws into the G-buffer (never the characters, the objects or
+  their parts: the G-buffer's stencil marks them 8 and 12, the map 9) leave
+  out, in their pixel stage, what lies within `radius` of the view's axis -
+  `widen` metres wider for each metre nearer the camera than the point looked
+  at, a cone opening toward the camera - more than `height` metres above that
+  point and more than `margin` in front of it, faded over `feather` metres at
+  those edges by a screen-door dither (the G-buffer has no blending). `pitch`
+  and `distance` place the point; the field of view and the depth's decode
+  come from the drawn view's own block. Turning it on makes the map's
+  pipelines again once; since v26 the numbers (and the view's field of view
+  and depth) are read live from a small buffer, so a new set each frame - a
+  zoom easing in - builds nothing (before, each new set made them all again:
+  the Isometric's zoom stutter). NULL or radius 0 turns it off. The Isometric plugin's Cutaway; it costs a third of a
+  millisecond of GPU time a frame at 1080p.
+- `view_cutaway_objects(float start)` (v24): `view_cutaway2`'s cone for the
+  draws the stencil marks 8 and 12 too, its tip `start` of the way from the
+  point looked at toward the camera (0.5 halfway); read live since v26, so it
+  may change each frame. Those marks hold the characters and the map's
+  objects alike - neither the stencil, the vertex shader nor what moves tells
+  them apart - so a character standing into the cone above its tip is cut
+  with the objects. Below 0, the default, they are never cut. The Isometric
+  plugin's Cut objects (its tip 1.4 m over the hunter's feet); no GPU time to
+  measure beyond the map's cut.
+- `scene_dither(bits)` (v25): the finished picture - the 3D and its post
+  effects, before the HUD and the menus are drawn over it - rounded to `bits`
+  a channel through the PS1 GPU's 4x4 ordered dither, a cell of the pattern a
+  pixel of the 3D (`scene_scale`'s lines). 5 is the PS1's 15-bit colour; 0,
+  the default, off. The Bloodborne PS1's Dithering.
+- `camera_zoom(int* steps, int* reset)` (v26): the player's Camera Zoom
+  presses since the last call - the wheel and the middle button by default,
+  as bound, in the world only: `steps` notches out (in when negative), `reset`
+  1 for Camera Zoom Reset. From the first call they are the plugin's and the
+  game's camera no longer zooms. The Isometric's zoom.
+- The 3D's look (v18): how the camera's draws - the world, its characters, the
+  sky and the effects, the draws with the scene's depth that are not
+  full-screen rect lists - are drawn; the shadow maps, the post-processing and
+  the HUD and menus keep the game's own. `scene_snap(lines)` moves each vertex,
+  as its stage writes it, to the nearest corner of a grid of the screen `lines`
+  cells high (as many across as the 3D's shape gives; `BB_SNAP_PIXELS` the
+  3D's own pixels; 0 off) - the PS1's wobble. `scene_filter(BB_FILTER_NEAREST)`
+  samples their textures nearest (the nearest mip, no anisotropy; depth
+  comparisons keep theirs). `scene_scale(BB_SCALE_NEAREST, lines)` draws the
+  game, its HUD and menus at the window's size and the 3D at the Resolution, or
+  `lines` high, brought up to the window texel for texel with no upscaler.
+  `scene_colour_bits(8)` makes the scene's colour targets RGBA8, as the rgba8f
+  patch does. `grading_filter(BB_FILTER_NEAREST)` samples the colour grading's
+  table nearest - the area's `CGrading` textures (`map/mXX/mXX_cgrading.tpf`)
+  are copied each frame into a 16x16x16 table that the grading pass samples -
+  so the grading steps from entry to entry, 16 shades a channel.
+  `scene_scale` and `scene_colour_bits` decide the scene's targets: call them
+  from `bb_plugin_init` for the start, or once the game runs from the main
+  thread (`on_frame`, `on_option`), which makes the targets again at the next
+  quiet point; the others work from any thread. With `scene_scale` on, the
+  game and its HUD are always the window's size and the 3D at most that. The
+  Bloodborne PS1 plugin is all of these.
 - `plugin_dir(name)` (v8): a data folder of the plugin's own.
 - `game_file(path, ...)` (v9): a game file by its `/app0` path, decompressed.
 - `overlay_file(name, path, data, size)` (v9): a file the game reads instead
@@ -224,6 +479,98 @@ gives the Binary Ninja address.
   functions by their Japanese names, and with those names in English every
   character died at load.
 
+**Rendering effects** (v27)
+
+- `frame_info`, `on_render` and `aa_claim`: the frame as bbhost draws it,
+  compute work of the plugin's own recorded into it before and after the
+  upscale, and who does the anti-aliasing. See
+  [Rendering effects](#rendering-effects-v27).
+
+**Shaders** (v27)
+
+A plugin can put HLSL of its own in place of any of the game's shaders, as an
+edited file in `<data>/bbhost/shaders` does ([modding.md](modding.md#shaders)):
+the same names, compiled and checked the same way, and applied while the game
+runs.
+
+- **Names.** A shader is named as `BBHOST_HLSL_DUMP=1` names its file, less
+  `.hlsl`: `GXGuiShader_Tex.ppo@6d921b0b.ps` for every variant of that pixel
+  shader whose inputs and outputs the source declares,
+  `GXGuiShader_Tex.ppo@6d921b0b.ps~7de085b59d21219a` for one variant, and a
+  lift's hash, `7de085b59d21219a.ps`, for a shader whose name is not known.
+  The stages are `vs`, `ps`, `hs`, `ds`, `gs` and `cs`.
+- `shader_override(name, shader, hlsl)`: the source for a shader (UTF-8, at
+  most 4 MiB); `NULL` gives the shader back to the game. DXC compiles it for
+  each variant of the shader met so far, off the thread that draws, and then
+  the shader's next draw uses it: its pipelines are built again, once. Going
+  back to a source drawn with before takes the pipelines built for it and
+  compiles nothing, and the same text again changes nothing. A source is
+  taken where it declares the stage's interface - the dumped file's bindings,
+  inputs and outputs - and its SPIR-V validates; elsewhere the shader keeps
+  its own. A value that changes goes through `shader_data`, not a new text:
+  each new text is a compile and new pipelines.
+- `shader_folder(name, dir)`: every `<shader>.hlsl` in a folder, relative to
+  the plugin's own folder (`plugin_dir`) or absolute, as `shader_override`
+  takes a text; `NULL` takes the plugin's folders away. The plugin's own texts
+  come first, then its folders in the order it added them. It returns how many
+  files it found, or -1 for no such folder.
+- `shader_state(name, shader, why, n)`: what became of it, and why:
+  `BB_SHADER_WAITING` (its shader not met since, compiling, or the plugin is
+  off), `BB_SHADER_TAKEN`, `BB_SHADER_REFUSED` (DXC's error, citing the
+  source's own line; another interface than the shader's; invalid SPIR-V; a
+  pipeline holding it that the driver refused - that pipeline draws with the
+  game's shader), `BB_SHADER_SHADOWED` (a file of the same name in the
+  player's folder, or an earlier plugin's, comes first) or `BB_SHADER_OFF`.
+- `shader_source(shader, &hlsl, &size)`: the HLSL this build prints for a
+  shader, as the dump writes it - the first variant met this run, or the one a
+  `~<lift hash>` name gives - so a plugin can patch the game's own source
+  instead of shipping whole copies, which an update that changes the shader's
+  interface would refuse. It returns 1 until the game has built a stage of
+  that shader in this run (ask again from `on_frame`), and 2 when overrides do
+  not apply. The text is printed for the player's GPU, whose features change
+  it (half-precision values among them), so a file made from another GPU's
+  dump can be refused there: patch what `shader_source` gives on the player's
+  machine.
+- `shader_data(name, offset, data, size)`: numbers of the plugin's own that
+  its shaders read with no binding: `BB_SHADER_DATA_BYTES` (64 KiB), zero at
+  the start, written from any thread. A shader includes `bbhost.hlsli` - the
+  host provides it; the dump folder has a copy - and reads it with
+  `bb_data_float(offset)`, `bb_data_float2` to `bb_data_float4`,
+  `bb_data_float4x4`, `bb_data_int`, `bb_data_uint` to `bb_data_uint4` (byte
+  offsets: 4-aligned, 8 for two elements, 16 for three, four or a matrix,
+  rows first). Each frame's draws read one copy of it, as it stood when the
+  frame before had been recorded, so write what belongs together in one call.
+  Changing a value builds nothing.
+
+```hlsl
+#include "bbhost.hlsli"
+// ... the shader's own source, as shader_source gave it, and in its main:
+    lifted_main();
+    mrt0.rgb = lerp(mrt0.rgb, mrt0.rgb * float3(1.0f, 0.35f, 0.35f), saturate(bb_data_float(0)));
+```
+
+```c
+float strength = 0.5f;
+api->shader_data("mine", 0, &strength, sizeof(strength));  /* from the next frame */
+```
+
+The player's own file of a name comes first, then the plugin loaded first (by
+file name); the one not used is logged once. A plugin turned off in game keeps
+its shaders until it is on again. Overrides apply on the HLSL path only (the
+Shaders setting at HLSL, the default) and to the stages it compiles: a draw
+drawn with the shader's translation instead (one whose constant buffers do not
+all bind) keeps the game's. A compute shader's
+new source is compiled where it is first dispatched when it was not met before
+(a short stall). The log's start and exit reports list each override, who gave
+it and what became of it - the exit's every one set during the run, one given
+back with the flip it went at; `BBHOST_SHADER_WATCH=1` reads the plugins' folders
+and the player's again while the game runs; `video.shader_overrides = false` or
+`BBHOST_SHADER_OVERRIDES=0` turns all of them off. Not yet: textures or
+samplers of an override's own, and an override for some draws of a shader and
+not others. `examples/plugins/shader_tint` is a worked example: a plugin that
+tints one shader live, on and off, its strength pulsing through its shader
+data (built beside the tests, in no package).
+
 **Online rules** (v10)
 
 A gameplay plugin is announced to the server with every request
@@ -232,6 +579,384 @@ only meet others with the same rules. `set_rules` updates the plugin's entry
 (for example when its seed changes); `on_world_rules` and `visitor` let a
 plugin flagged `BB_PLUGIN_ADOPTS_RULES` play by a host's rules when summoned
 into another player's modded world.
+
+## In-game menus (v29)
+
+A plugin can have menus that are the game's own: pages of its options dialog,
+with its rows, cursor, scrolling, sounds, line help and key guide - the
+machinery bbhost's PC Settings pages use, read from the player's dump
+(nothing of the game's is shipped). A menu is pages of the plugin's options
+table, and a page is a `BB_OPT_HEADING` with `BB_OPT_PANEL` or-ed in and the
+rows under it, up to the next heading. Those rows are not in the settings of
+the in-game plugin menu (F10); the menu shows them.
+
+**Declaring menus.** `BB_OPT_MENU` on a page's heading starts a menu, named
+by the heading's `def` (its label when `NULL`); the pages after it, up to the
+next `BB_OPT_MENU` heading, are that menu's, in L1/R1 order. For each named
+menu the plugin's entry in F10 has an *Open* button, and the game's System
+menu has a *Plugins* row (beside PC Settings) that lists every turned-on
+plugin's named menus - so a plugin needs only its table to have a menu: no
+input code. A plugin with no `BB_OPT_MENU` heading has one unnamed menu of
+all its pages and no button; it shows it itself with `panel_show` (photo mode
+does, on L3). `BB_OPT_SUBPAGE` on a page's heading keeps it out of the L1/R1
+order: it is opened on top of another page, by a row or by `panel_open`.
+
+**The rows.** Each row is one of the dialog's own:
+
+- `BB_OPT_BOOL`: the game's On/Off row.
+- `BB_OPT_CHOICE`: of two choices, the game's left/right pair; of more, a row
+  whose value Left and Right step through (wrapping).
+- `BB_OPT_INT`, `BB_OPT_FLOAT`: the game's slider. An INT from 0 to 10 is the
+  game's own slider; any other range has one position a step - 1 for an INT,
+  a hundredth of the range for a FLOAT - its bar at the value's share of the
+  range and its number the host's (a FLOAT to its step's decimals). Left and
+  Right step it, held they repeat.
+- `BB_OPT_INFO`: a label and a value the player cannot change (`def`).
+- `BB_OPT_ACTION`: a button; Cross presses it.
+- `BB_OPT_ACTION | BB_OPT_OPEN`: the button opens the page named by its `def`
+  on top of the one shown and calls `on_action`, which can fill that page;
+  Circle there comes back to the button.
+- `BB_OPT_ACTION | BB_OPT_CONFIRM`: the host asks first, in the game's yes/no
+  dialog ("*label*?", the first sentence of the row's help under it);
+  `on_action` comes only on Yes.
+- `BB_OPT_TEXT`: Cross or Enter opens the host's text box (the one the game's
+  name and glyph dialogs use) with the row's label and value; Enter accepts and
+  Escape cancels. A keyboard types in it; a controller alone can only accept
+  or cancel it, as with the game's own name dialog.
+- A row whose `BB_OPT_WHEN` is not met is shown dimmed and does nothing.
+
+A page of more than eight rows scrolls. The game's fields hold about 24
+characters of a label and 18 of a value; longer ones are set smaller to fit,
+so keep them short. A row in the table is a setting: the config keeps it, and
+its changes come to `on_option` with its key, as the F10 settings' do.
+
+**The help line.** The dialog's line help is one line under the rows: the
+cursor's row's help, **its first sentence** (up to the first `.`, `!` or `?`
+followed by a space), cut at a word with `...` when it does not fit, then the
+menu's guide. The line holds about 68 characters inside the dialog's frame,
+the guide's included, so give each row a short first sentence that says what
+it does, and the details after it: F10 and the host's own panel show the
+whole help.
+
+**Rows set at run time.** `panel_rows(name, page, rows, n)` gives `page` rows
+of the plugin's own from then on - a list (lamps, items, saves), info, or
+anything that is not a setting - copied by the host, strings too; `n` 0
+gives the page its table rows again. The page must be a page of the table,
+which gives its title, help and menu. These rows are never in the config: a
+change comes to `on_option`, and a press to `on_action`, with the key
+`"<page>/<key>"`, so the plugin knows the page it came from.
+`panel_value(name, page, key, value)` sets one of their values while the
+menu is up or not. `panel_open(name, page)` opens a page on top of the one
+shown - from `on_action`, say, after filling the page with one item's
+details.
+
+**Showing a menu.** The System menu's *Plugins* row, F10's *Open* button, or
+`panel_show(name, &panel)` from the plugin's own key or button, at the title
+or in the world. `BbPanel.page` is the page to start at (`NULL`: the one shown
+last); `pages` and `page_count` name the pages of the menu in L1/R1 order when
+they are not the table's; `guide` and `guide_keys` the hint after the help on
+the help line, for the controller and for the keyboard - keep them short
+("L1 R1: page    R3: show"); without them the host puts the menu's page keys
+there when it has more than one page. Without `BB_PANEL_CORNER` the menu is
+the game's dialog at its normal place, the screen dimmed behind it. With it,
+the dialog is smaller at the bottom right and leaves the world in view (photo
+mode's). `BB_PANEL_DEFAULTS` ends each page with a Defaults row. Where the
+game cannot open its dialog - another eboot, a dump the options movie could
+not be made from, a moment its menus stay locked - the host draws the same
+menu in a panel of its own instead (logged once).
+
+**The rules.**
+
+- One menu at a time: a `panel_show` from another plugin replaces it, and a
+  new one starts its pages again.
+- L1 and R1 (Page Up and Page Down, or the player's Menu Previous and Next
+  Page keys) turn the menu's pages; Circle (Backspace, Escape) goes back from
+  a page opened on top, and on a page of the menu closes it, which
+  `panel_state` reports as `closed`.
+- Input: while a centred menu is up neither the game's play nor any plugin
+  reads the controller, the keyboard or the mouse, and what is held as it
+  closes stays out of both until let go. A corner menu takes only what the
+  dialog moves by - the d-pad, Cross, Circle, L1 and R1; the arrows, Enter,
+  Backspace, Escape and the page keys - and gets them even when the plugin
+  takes the controller from the game; the sticks, the triggers and the other
+  buttons and keys stay the plugin's (`pad`, `input`). The pointer works the
+  rows as it does the game's own settings.
+- `world_state` does not count a plugin's menu as one of the game's.
+- A menu shown over the title's holds that one - no input, out of view -
+  until it is gone, as the game does when it opens a menu from another. One
+  shown over a menu of the game's in the world takes that menu's place, as
+  the game's own menus do, and closing it leaves the player in the world.
+  The overlay (F9, F10) opens over a menu and hides it until it closes.
+- The game's own interruptions close a centred menu: a loading screen coming
+  up (lamp travel, the one after a death), a cutscene starting, or the
+  player's character dying. `panel_state` then reads `shown` 0 and `closed`
+  1, as when the player closes it, and a text box or a yes/no open on it goes
+  with it. One already under way when the menu opens (a load, a cutscene, the
+  death's screen) leaves it up. A corner menu stays: the plugin takes it
+  down when it should (photo mode ends itself at a load or a cutscene).
+  When the game closes its menus itself under a corner menu - a load, or
+  frame after frame while the hunter is dying - the host brings the corner
+  menu back as soon as the game lets it; where the game keeps closing them,
+  will not take one back within a second, or takes the menu a third time in
+  ten seconds, it draws the menu itself until it is next shown. The plugin
+  sees it up throughout.
+- The world keeps running while a menu is up, unless the plugin holds it with
+  `world_pause`; the menu works either way.
+- Turning the plugin off takes its menu down.
+
+The example below is `examples/plugins/menu/menu.c`, built with bbhost as
+`build/menu.so` (`menu.dll`); copy it into a `plugins/` folder and open its
+menu from F10:
+
+```c
+/* An in-game menu (plugin API 29): a counter with two buttons, in the game's
+ * own look. Its table names the menu, so the in-game plugin menu (F10) has an
+ * "Open Counter" button for it: the plugin has no input code at all. */
+#include "bbhost_plugin.h"
+
+#include <stdio.h>
+#include <string.h>
+
+static const BbHostApi* api;
+static int count;
+
+/* The page's rows, set at run time: they are not settings, so the host keeps
+ * them for the menu and never writes them to the config. */
+static void fill(void) {
+    char text[16];
+    snprintf(text, sizeof(text), "%d", count);
+    const BbOption rows[] = {
+        {BB_OPT_INFO, "count", "Count", "How many times Add one was pressed.", text},
+        {BB_OPT_ACTION, "add", "Add one", "Adds one to the count."},
+        {BB_OPT_ACTION | BB_OPT_CONFIRM, "reset", "Reset the count", "The count goes back to 0."},
+    };
+    api->panel_rows("menu", "counter", rows, sizeof(rows) / sizeof(rows[0]));
+}
+
+/* A run-time row's button comes back as "<page>/<key>". */
+static void on_action(const char* action, void* user) {
+    char text[16];
+    (void)user;
+    if (strcmp(action, "counter/add") == 0) count += 1;
+    else if (strcmp(action, "counter/reset") == 0) count = 0;
+    else return;
+    if (strcmp(api->config("menu.loud"), "true") == 0) api->log("menu: %s, the count %d", action, count);
+    snprintf(text, sizeof(text), "%d", count);
+    api->panel_value("menu", "counter", "count", text);
+}
+
+BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
+    BB_PLUGIN_API_VERSION, 0, "menu", "Menu example", "1.0.0", "bbhost", "An in-game menu in the game's look."};
+
+/* A setting, kept in the config and shown with the plugin in the overlay; then
+ * the menu: one page, named Counter, its rows filled at run time. */
+BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
+    {BB_OPT_BOOL | BB_OPT_LIVE, "loud", "Log each press", 0, "false"},
+    {BB_OPT_HEADING | BB_OPT_PANEL | BB_OPT_MENU, "counter", "Counter", "Press Add one, or Reset.", "Counter"},
+    {0}};
+
+BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
+    if (host->version < 29 || host->size < sizeof(BbHostApi)) return 1; /* panel_rows arrived in 29 */
+    api = host;
+    api->on_action("menu", on_action, 0);
+    fill();
+    return 0;
+}
+```
+
+## Rendering effects (v27)
+
+A plugin can draw effects of its own into the frame - ambient occlusion,
+fog, a colour pass - from the frame bbhost describes and the images it hands
+over, in the Vulkan command buffer the frame is recorded into. It needs only
+Vulkan's headers (`#define VK_NO_PROTOTYPES` before `vulkan/vulkan.h`): every
+function comes from the device it is given, so it never links the Vulkan
+loader. `examples/plugins/render_probe` is a working example: it registers
+both hooks, writes a marker into each, and checks everything below on the
+GPU.
+
+### The frame: `frame_info`
+
+`frame_info(&info)` fills a `BbFrameInfo` with the last 3D frame described -
+inside a hook, the one being recorded - from any thread. Set `info.size` to
+`sizeof(info)` first: the host fills as much as both of you know and sets
+`size` to that, and a newer host only ever appends fields. From the first call
+on (or the first `on_render`) the host describes every 3D frame; before that
+it costs nothing, and the first call returns 1.
+
+- `frame` counts the 3D frames from 1 (a loading screen is none); `flip` is
+  the host's flip count, as its log has it.
+- `render_width` x `render_height` is the 3D's size - the scene's, the depth's,
+  the motion's and the glow's; `output_width` x `output_height` the picture's,
+  larger than the render size when an upscaler draws the 3D smaller (an
+  Upscaling quality below Native AA, or a Resolution below the window's).
+- `method` is what takes the 3D to the picture this frame: `BB_UPSCALE_NONE`
+  (Upscaling Off, an upscaler this machine cannot run, or a plugin's own
+  anti-aliasing), `BB_UPSCALE_DLSS`, `BB_UPSCALE_FSR` or `BB_UPSCALE_TAA`, and
+  `quality` the Upscaling quality the upscaler is told (`BB_QUALITY_*`; work
+  from the sizes, which are exact).
+- `jitter_x`, `jitter_y`: the render pixels this frame's camera draws were
+  moved by - +x right, +y down - exactly what the upscaler is told; 0 when none
+  runs.
+- `now` and `prev`: this frame's camera and the last frame's, as drawn (an
+  `on_view` plugin's change included) and without the jitter. Each is a
+  `BbFrameCamera`: a `BbCamera` - the basis (right, up, forward) and the eye,
+  which in a row are the view-to-world matrix column by column, the vertical
+  field of view, the aspect, and `near_z`/`far_z`, the view distances the
+  depth's 0 and 1 stand for - and the matrices `view` (world to view), `proj`
+  (view to clip), `view_proj` and `inv_view_proj` (clip to world).
+- `reset` is 1 when there is nothing to blend with: the first frame, a new
+  render or output size or method, no camera this frame or the last, a cut
+  (`BB_FRAME_CUT`: the eye moved more than 4 m, the view turned more than 75
+  degrees or its field of view changed by more than 10), or more than a
+  quarter of a second since the last frame.
+- `flags`: `BB_FRAME_CAMERA` (`now` is this frame's), `BB_FRAME_PREV` (`prev`
+  is the last frame's; else it repeats `now`), `BB_FRAME_CUT`,
+  `BB_FRAME_DEPTH_REVERSED` and `BB_FRAME_AA_PLUGIN` (a plugin does the
+  anti-aliasing).
+
+The conventions:
+
+- Matrices are 16 floats, column-major (`m[column * 4 + row]`: GLSL's `mat4`
+  and GLM's layout; HLSL's `column_major`), applied to column vectors:
+  `clip = proj * view * (x, y, z, 1)`.
+- The world is the game's, in metres, y up - `player_position`'s and
+  `BbCamera`'s. The view: x right, y up, z the way the camera looks.
+- Clip space is Vulkan's over the 3D's images: after the divide by w (the
+  view's z) x runs from -1 at their left edge to +1 at their right, y from -1
+  at their top to +1 at their bottom, and z is the value the depth image holds
+  there: 0 at the near plane and 1 at the far one as the game draws (the other
+  way round with `BB_FRAME_DEPTH_REVERSED`). The pixel (px, py) of a w x h
+  image is centred at `((px + 0.5) / w * 2 - 1, (py + 0.5) / h * 2 - 1)`; the
+  picture at the output size covers the same view.
+- The frame's draws were moved by the jitter: their projection is `proj` with
+  `m[8] = 2 * jitter_x / render_width` and `m[9] = 2 * jitter_y / render_height`.
+- Angles are radians, sizes pixels, times seconds.
+
+### The hooks: `on_render`
+
+`on_render(name, points, fn, user)` has `fn(call, user)` called at each of
+`points` of every 3D frame:
+
+- `BB_RENDER_BEFORE_UPSCALE`: the 3D is drawn - lit, its transparency on it -
+  and nothing has read it yet: the upscaler, TAA, the embers, the sharpening
+  and frame generation come after. With Upscaling Off it is called all the
+  same.
+- `BB_RENDER_AFTER_UPSCALE`: the final picture, after all of them, before the
+  post-processing (exposure, bloom, depth of field, tone mapping, grading) and
+  the HUD. With no upscaler the picture is the scene itself.
+- `| BB_RENDER_MOTION` asks for the frame's motion, made for the hooks whether
+  or not an upscaler or frame generation needs it.
+
+A later call with the same `fn` and `user` replaces its points; no points take
+it away. `name` is the plugin's `BbPluginInfo` name: its hooks are not called
+while it is off, and go if it is unloaded. Several plugins' hooks run in the
+order they were registered.
+
+`call` (a `BbRenderCall`, size first) holds the command buffer, the frame's
+`BbFrameInfo`, the device (`BbRenderDevice`: the instance, physical device and
+device, `get_instance_proc_addr` and `get_device_proc_addr`, the queue family
+and `frames_in_flight`), and the images, each as its `VkImage`, view,
+generation, format, layout, usage, size and `BB_IMAGE_WRITE` when the hook may
+write it:
+
+| Image | What it is | Size | Layout | Written |
+|---|---|---|---|---|
+| `scene` | the lit 3D in linear light: RGBA16F, or B10G11R11 with the Performance patch | render | `GENERAL` | before the upscale |
+| `depth` | the G-buffer's depth, through a view of its depth aspect; jittered as the scene | render | read-only optimal, or `GENERAL` | never |
+| `motion` | with `BB_RENDER_MOTION`: R16G16_SFLOAT, render pixels from each pixel to where its surface was in the last frame, x right, y down, without the jitter | render | `GENERAL` | never |
+| `glow` | the scene's second target, the effects' glow the bloom reads, when the frame has one | render | `GENERAL` | never |
+| `picture` | after the upscale: the final picture - the upscaler's RGBA16F image (a storage image), or the scene when no upscaler runs | output | `GENERAL` | after the upscale |
+
+The scene is a render target: it can be sampled, copied and blitted, never
+bound as a storage image - write your result into an image of your own and
+copy or blit it in. Every writable image takes copies; check `usage` for
+storage.
+
+The contract:
+
+- Record compute and transfer work only: dispatches, copies, blits, clears,
+  and the barriers between your own steps. No render pass, draw, graphics
+  pipeline or dynamic state.
+- Leave every image in the layout the call gives (change one only to put it
+  back before you return).
+- Never submit, end the command buffer or wait for the GPU: no queue, fence,
+  semaphore or query-wait calls. The host submits the frame.
+- The host puts the barriers around each hook - what the frame wrote is
+  visible to your compute and transfer, what you wrote is visible to
+  everything after - and binds all of its own state again afterwards.
+- Hooks run on the thread that records the frame, not the game's main thread,
+  with the renderer's lock held: the host's GPU work waits while one runs. Keep
+  it to recording; build pipelines once. From a hook, call nothing of the
+  host's but `log`, `frame_info` and `on_render`.
+
+How long things last:
+
+- The command buffer and the frame info: for the call.
+- The device: for the whole run (bbhost makes one).
+- An image's handle and view: in every call while its `generation` stays the
+  same - so views and descriptors of your own can be kept by generation. A new
+  generation (a Resolution change makes one) is a new image.
+- What a hook records may still be read by the GPU `frames_in_flight` frames
+  later: free or reuse a resource your commands used no sooner.
+
+### Who does the anti-aliasing: `aa_claim`
+
+`aa_claim(name, claim)` says whether your plugin leaves the anti-aliasing to
+bbhost or does its own; `BB_PLUGIN_AA_LEAVE` or `BB_PLUGIN_AA_TAKE` in
+`BbPluginInfo.flags` is the claim it starts with, which the setup window can
+read before the plugin runs.
+
+- `BB_AA_LEAVE`: your plugin does none and moves no draws. bbhost's runs as
+  the settings say - also beside a Vulkan layer that would otherwise keep its
+  TAA off.
+- `BB_AA_TAKE`: your plugin does it. While it is on, bbhost moves no draws (no
+  jitter) and runs no TAA, FSR or DLSS, nor the game's own anti-aliasing pass,
+  and draws the 3D at the Resolution, as with Upscaling Off. The Upscaling and
+  Anti-aliasing rows name your plugin, in bbhost's menus and the game's; the
+  player's settings are kept for when it is off.
+
+Of the plugins that are on, the strongest claim holds: TAKE before LEAVE. If
+two plugins take it over, both run their own, and the menus name the first
+loaded. Claim from `bb_plugin_init` for the start, or once the game runs from
+the main thread (`on_frame`, `on_option`): the 3D's size follows at the next
+quiet point, as at a Resolution change.
+
+### What it costs
+
+With no hook registered and `frame_info` never called, nothing runs. A hook
+costs a frame description, a barrier on each side, and with Upscaling Off one
+camera read a frame. `BB_RENDER_MOTION` with no upscaler makes the motion as
+frame generation does - the motion pass, the characters' capture - and beside
+TAA one motion pass more. Each hook's GPU time shows in `BBHOST_GPU_PROFILE`
+as `plugin <name> before` and `plugin <name> after`.
+
+## From a Vulkan layer to a plugin
+
+A mod that sits beside `bbhost.exe` as `vulkan-1.dll` and finds the camera,
+the scene and the depth by watching draws breaks whenever bbhost's rendering
+changes. As a bbhost plugin it gets them from bbhost, on Windows and Linux:
+
+1. Export `bb_plugin_info` - opt-in, and `BB_PLUGIN_LIVE_SWITCH` so the
+   player turns it on and off in game - and register from `bb_plugin_init`.
+2. Take the device from the first hook's `call->device`, and every Vulkan
+   function from its `get_device_proc_addr` and `get_instance_proc_addr`.
+3. Read the camera from `frame_info`'s `now` and `prev` instead of finding it
+   in the draws.
+4. Take the scene, the depth, the motion and the glow from the call; keep
+   your views of them by `generation` instead of finding them again.
+5. Move your passes to `BB_RENDER_BEFORE_UPSCALE` (they are then upscaled and
+   anti-aliased with the scene) or `BB_RENDER_AFTER_UPSCALE` (on the final
+   picture).
+6. Never jitter the camera: claim `BB_AA_LEAVE` and bbhost's TAA, FSR or DLSS
+   runs as the player chose, or `BB_AA_TAKE` to do the anti-aliasing yourself.
+7. Remove the `vulkan-1.dll` from beside `bbhost.exe`. As a plugin nothing
+   needs it there, and while a `vulkan-1.dll` that is not the Vulkan loader
+   sits there the upscaler bridge keeps DLSS and FSR off, and bbhost's TAA
+   stays off unless a plugin leaves the anti-aliasing to bbhost.
+8. Check your plugin with `BBHOST_VK_VALIDATE=1`: the Vulkan validation layer
+   reports any layout or barrier it gets wrong.
+9. Build the same source as a `.so` for Linux.
 
 ## The C++ SDK
 
@@ -285,12 +1010,17 @@ setup window can download the latest signed plugins from the newest release.
 | Plugin | What it does |
 |---|---|
 | `randomizer` | Shuffles one-time pickups and shop stock from a seed, and optionally enemies: each regular enemy becomes another kind (model, AI and gear together), drawn from its own area or from the whole game, with optional roaming bosses. Writes a spoiler file. |
-| `boss_rush` | Fights the 19 story bosses back to back, optionally with the ten chalice-dungeon bosses, starting each round outside the boss's fog wall. Tracks time and deaths. Practice fights one boss, picked by name, again and again: once, N times, or until stopped, a death trying again from the fog wall and a win waking the boss for the next fight. Each fight that ends in a win or a death is an attempt, so Once and N times end after that many attempts; Restart starts the fight under way over from the fog wall without counting it. With Refill on, every attempt starts with the most blood vials and quicksilver bullets. A practice can start each fight at the boss's phase 2 or 3: once the fight begins, the boss is put just under the HP at which its own event script or AI changes phase, and the game plays the change itself (Ludwig's cutscene and Holy Blade, Gascoigne's beast, Lady Maria's blood and fire). Attempts, wins, deaths, the best and last clear times and, from phase 1, the time to phase 2 are shown after each fight and written to `results.txt`. |
+| `boss_rush` | Fights the 19 story bosses back to back, optionally with the ten chalice-dungeon bosses, starting each round outside the boss's fog wall. Tracks time and deaths. Practice fights one boss, picked by name, again and again: once, N times, or until stopped, a death trying again from the fog wall and a win waking the boss for the next fight. Each fight that ends in a win or a death is an attempt, so Once and N times end after that many attempts; Restart starts the fight under way over from the fog wall without counting it. With Refill on, every attempt starts with the most blood vials and quicksilver bullets. A practice can start each fight at the boss's phase 2 or 3: once the fight begins, the boss is put just under the HP at which its own event script or AI changes phase, and the game plays the change itself (Ludwig's cutscene and Holy Blade, Gascoigne's beast, Lady Maria's blood and fire). Attempts, wins, deaths, the best and last clear times and, from phase 1, the time to phase 2 are shown after each fight and written to `results.txt`. Boss HP and Your HP are practice's cheats, for learning a fight: Can't die keeps hits taking HP down to 1 and no further (the debug menu's No Dead), and Infinite also puts the HP back after every hit, so the boss stays in the phase its fight began in and the player stays at full health. A boss that cannot die is not defeated, so its fights end in a death, a Restart or Stop. |
 | `mutators` | Switchable rules: gravity, game speed, bullet time at low HP, one-hit deaths, blood drain, enemy HP, echo rate, random effects. |
-| `quake` | Off until turned on. First person with Quake 3's movement and view: strafe jumping, bunny hopping (hold jump to keep hopping), crouching, the walls only characters meet (the invisible ones along ledges) as solid as the rest, creatures as solid as Quake 3's players, and a choice of physics - Quake 3 (VQ3, the default), CPMA, Quake 1 + CPMA, QuakeWorld and DeFRaG's. Five guns made of Bloodborne's (Cannon, Church Cannon, Piercing Rifle, Blunderbuss, Gatling Gun), always +10, firing from the view with each gun's own flash and sound: rockets and grenades at Quake 3's speeds (the grenade bouncing until its fuse), the Blunderbuss's and the Gatling Gun's own bullets, and a plasma of A Call Beyond's star or Blacksky Eye's shard; their blasts throw the player (rocket and grenade jumps, plasma climbing), and the gun that is up is drawn at the lower right with Quake 3's bob and kick. Field of view, mouse sensitivity, gravity and knockback are settings. |
-| `lohit` | Off until turned on. The map's lo-hit collision drawn in place of the map's own geometry (the game's own WorldHitMan debug draw, with GROUP MASK > Map off): the part you stand on and the parts connected to it, one step out (Whole map: every part loaded). It is drawn inside the scene ahead of its effects so fire, sparks, blood and mist show over it, in the launcher's deep violet (walls) and dark blue (floors). Pair it with Performance mode (the setup window's main page) for the post-effects off. |
+| `quake` | Off until turned on. First person with Quake 3's movement and view: strafe jumping, bunny hopping (hold jump to keep hopping), crouching, the walls only characters meet (the invisible ones along ledges) as solid as the rest, creatures as solid as Quake 3's players, and a choice of physics - Quake 3 (VQ3, the default), CPMA, Quake 1 + CPMA, QuakeWorld and DeFRaG's. Five guns made of Bloodborne's (Cannon, Church Cannon, Piercing Rifle, Blunderbuss, Gatling Gun), always +10, firing from the view with each gun's own flash and sound: rockets and grenades at Quake 3's speeds (the grenade bouncing until its fuse), the Blunderbuss's and the Gatling Gun's own bullets, and a plasma of A Call Beyond's star or Blacksky Eye's shard; their blasts throw the player (rocket and grenade jumps, plasma climbing), and the gun that is up is drawn at the lower right with Quake 3's bob and kick. Field of view, mouse sensitivity, gravity and knockback are settings. While another plugin holds the world, or its camera has the picture (a free camera's, the world held or running), Quake holds too: the player stays where they were and the view as it was, and the keys and the mouse fly that camera alone. |
+| `lohit` | Off until turned on. The map's lo-hit collision drawn in place of the map's own geometry (the game's own WorldHitMan debug draw, with GROUP MASK > Map off): every part loaded (Whole map, the default), or the part you stand on and the parts connected to it, one step out; Hi-hit shows the detailed collision characters and objects use instead. Each mesh is built once into a vertex buffer of its own and drawn with two draws a frame, where the game's debug draw rebuilt every triangle each frame and copied it twice (the triangles' edges the game drew over the faces, a second draw costing the GPU more than the faces, are left out). Its depth (plugin API 17) is drawn ahead of the scene's objects too, so the game's occlusion culling skips what is behind its walls, as the map's own geometry would. It is drawn inside the scene ahead of its effects so fire, sparks, blood and mist show over it, by default in the launcher's deep violet (walls) and dark blue (floors); the Colours sliders set both (0-255, as they come out on the screen) for the lo-hit and the hi-hit. Pair it with Performance mode (the setup window's main page) for the post-effects off. |
+| `ps1` | Off until turned on. Bloodborne PS1: the 3D drawn as the first PlayStation drew it, the HUD and the menus left sharp at the window's size: its vertices snapped to a grid of the screen as it moves (Vertex snap: 240p, the PS1's own screen, by default; 480p, 360p, 120p or off), its textures unfiltered (no bilinear, trilinear or anisotropic filtering), its colour targets 8 bits a channel (8-bit colour, as the rgba8f patch makes them; the colour grading then steps between its table's entries too, where it is smooth without it), and the 3D at its own Resolution - Native (the Resolution setting, at most the window's), 480p, 360p or 240p, each as wide as the window's shape gives - brought up to the window pixel for pixel, with no smoothing. Upscaling and the anti-aliasing stand aside while it is on. Old-hardware sound (off by default) makes everything the game plays sound like an old console's sound chip: PS1 (22050 Hz, 12 bits, muffled above 10 kHz), Crunchy (11025 Hz, 8 bits, no low-pass going in, so it aliases) or Custom (a rate and bits of its own). Each option changes in the game (F9). |
+| `hunter_cam` | Off until turned on. Hunter Cam: the hunter from closer in. Over the shoulder: a close third-person camera over the right or left shoulder, as Silent Hill 2's remake frames its hero, pulled in at walls by the game's own sphere cast, with a key that swaps shoulders while playing (Tab by default), the wheel zooming it and the middle button resetting the zoom. First person (Z toggles it): the view from the hunter's eyes with only their gloves (the arm armour) and weapons drawn, Head bob riding the view on the head's bone, the mouse turning it and the view free to look 80 degrees up and down (the game's aim stops at 35 and 40; Look up/down limit sets it). Only where the camera stands moves: the stick, the lock-on and the aim keep the game's turning; Right stick speed multiplies it. Always face the camera keeps the hunter facing where the camera looks (the monocular's precision-shooting state) while the script is answered as locked on, so they strafe, run and sprint at full speed; X still opens, picks up and talks there, items (Blood Vials, papers, tools) take effect, the mouse turns the view (its own sensitivity and Y reverse), and Crosshair shows or hides the monocular's sight. Dodge is a slider: 0 always the roll, locked on too, and the stick's way while facing the camera or in first person; 1 a sidestep in the stick's direction (the omni-roll); the Modern Movement Lite patch keeps working beside it. Distance, side offset, height, eye height, fields of view (+% wider, as F10's Field of view) and swap time are settings, all live. During a cutscene, and while another plugin's camera has the picture (a free camera's), the camera, the facing and the body are the game's again - that camera's pictures show the whole hunter - and its keys and the mouse do nothing; Hunter Cam takes them up again after. |
+| Photo mode | Not one of bbhost's plugins: Nox-'s [bbhost-photo-mode-plugin](https://github.com/Noxde/bbhost-photo-mode-plugin) carries on bbphoto, the photo mode plugin API 29's calls were made for - the world held still and stepped, the controller and the keyboard read as its own, the HUD left out of the picture, a look over the area's own and its settings as the game's own dialog at the bottom right. A `photo_mode` plugin in a plugins folder, not switched off (`photo_mode = false` under `[plugins]`), keeps bbhost from loading bbphoto beside it, so the two never both answer L3 and P. |
 | `debug_menu` | Restores the developers' debug menu (`` ` `` opens it), in English or the developers' Japanese, and makes the debug font it draws with from the public-domain X11 fonts k14 and 7x14, so nothing has to be downloaded. Cheating against other players with it gets an account banned; trying it out online with friends is fine. |
 
 The gameplay plugins - all five - announce themselves in the session's
 ruleset, so the server keeps their players' messages, bloodstains and
-statistics apart from those of players without them.
+statistics apart from those of players without them. Lo-Hit and Bloodborne PS1
+change only the picture: they are not in the rules, and their players meet
+everyone.

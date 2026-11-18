@@ -53,8 +53,9 @@ void* hle_kernel_dmem_mirror();
 // The image slide (0 before the eboot is bound), for diagnostics that print
 // ELF addresses.
 std::uint64_t hle_image_slide();
-// Windows: reserves the guest's fixed address windows as placeholders; call
-// first thing in main, before anything else can take them. Linux: no-op.
+// Reserves the guest's fixed address windows (Windows: placeholders, Linux:
+// PROT_NONE ranges, core/linux_vm.h); call first thing in main, before
+// anything else can take them.
 bool hle_kernel_reserve_guest_windows();
 std::uint64_t hle_kernel_dmem_high();  // highest allocated physical end
 // Live guest mappings, for the GPU page table.
@@ -91,6 +92,9 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
 void hle_gnm_explain_table(std::uint64_t va, std::size_t bytes);
 void hle_gnm_cp_drain();
 std::uint64_t hle_gnm_cp_backlog();
+// The game's flips (sceGnmSubmitAndFlip) so far: the next one is `stall:`'s
+// "flip #N" with this N.
+std::uint64_t hle_gnm_flip_calls();
 // Command buffers submitted by the game and retired by the command processor,
 // summed over the queues: work submitted before `submitted` is done once
 // `retired` reaches it.
@@ -234,6 +238,12 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
 void hle_gx_native_release();
 // The command processor's lookahead: a draw token further on in the stream.
 void hle_gx_native_prefetch(std::uint64_t id, bool next);
+// Whether the draw pool (host/gxvk_lists.h) was given draw token `id`'s draw:
+// false for one stored while it rested (or in the overflow map, which it never
+// reads) - none of its threads reads that slot, and it has no commit, so the
+// command processor takes it as with the pool off and asks nothing of the pool
+// (BBHOST_GXVK_LISTS_SKIP_UNFED=0: it asks as before). Command-processor thread.
+bool hle_gx_native_fed(std::uint64_t id);
 // The run look ahead (BBHOST_RUN_COMMIT, host/list_resolve.h): a draw token's
 // inputs in its slot when they are stored and still that token's, without
 // taking them, and its GX objects (`objects`, when asked); nullptr otherwise.

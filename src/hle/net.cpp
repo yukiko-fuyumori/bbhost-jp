@@ -3,6 +3,7 @@
 #include "hle/platform.h"
 #include "hle/hle.h"
 #include "hle/net_p2p.h"
+#include "hle/np.h"
 #include "net/session.h"
 #include "net/stun.h"
 
@@ -233,42 +234,41 @@ constexpr std::uint8_t kP2pFlagP2p = 0x80, kP2pFlagByteVports = 0x40, kP2pFlagCo
 
 // The game's transport packs what one frame sends a peer into one datagram of
 // chunks, [kind 0-3][length u16 BE][payload], up to 9184 bytes: a busy frame
-// comes to several KB. A 2 KB buffer here dropped such a datagram whole; the
-// transport took it for a loss, and its retransmissions brought the chunks
-// over a few at a time, up to seconds late.
-// Now a P2P datagram of more than kSplitPayload bytes leaves as several, each
-// of whole chunks (a longer chunk alone). Each fits one 1500-byte frame, so
-// none crosses the internet as IP fragments, which some NATs drop, and a peer
-// still on a 2 KB buffer takes them all; the receiving game parses each
-// datagram's chunks on their own and gets what the one datagram held.
-// Anything else goes whole, up to what UDP carries (65535 less the IP and UDP
-// headers), and the reader takes 64 KB. BBHOST_NET_SPLIT_DATAGRAMS=0
-// sends the game's datagrams whole; BBHOST_NET_LARGE_DATAGRAMS=0 keeps the
-// 2 KB limit of before, both ways, and no split.
-constexpr std::size_t kMaxUdpPayload = 65507;
-constexpr std::size_t kReadBuffer = 65536;
-constexpr std::size_t kSmallDatagram = 2048;
+// comes to several KB. Larger than one 1500-byte frame, such a datagram
+// crosses the internet as IP fragments, which some NATs and firewalls drop;
+// the transport takes that for a loss, and its retransmissions bring the
+// chunks over a few at a time, up to seconds late.
+// So a P2P datagram of more than kSplitPayload bytes leaves as several, each
+// of whole chunks (a longer chunk alone) behind its own P2P header, and the
+// relay's when it goes through the relay. Each fits one 1500-byte frame. The
+// receiving game parses each datagram's chunks on their own - its
+// demultiplexer hands every chunk to its kind's handler and ignores a cut one
+// at the end - so it gets what the one datagram held. Bytes that are not
+// whole chunks go whole, up to what UDP carries (kMaxDatagram), and so does
+// everything with BBHOST_NET_SPLIT_DATAGRAMS=0.
 constexpr std::size_t kOneFramePayload = 1472;  // 1500 less the IPv4 and UDP headers
 constexpr std::size_t kSplitPayload = 1200;     // a piece and every header in one frame, with room for a tunnel's
-const bool g_net_large_datagrams = [] {
-    const char* e = std::getenv("BBHOST_NET_LARGE_DATAGRAMS");
-    return !(e && e[0] == '0');
-}();
 const bool g_net_split_datagrams = [] {
     const char* e = std::getenv("BBHOST_NET_SPLIT_DATAGRAMS");
-    return g_net_large_datagrams && !(e && e[0] == '0');
+    return !(e && e[0] == '0');
 }();
 
 // Where the game's datagram d[0, n) splits into pieces of whole chunks of at
-// most kSplitPayload bytes: each piece's end, the last n. Empty when the bytes
-// are not whole chunks; they then go as they are.
-std::vector<std::size_t> chunk_split(const std::uint8_t* d, std::size_t n) {
-    std::vector<std::size_t> ends;
+// most kSplitPayload bytes: each piece's end in `ends`, the last n. Empty when
+// the bytes are not whole chunks; they then go as they are.
+void chunk_split(const std::uint8_t* d, std::size_t n, std::vector<std::size_t>& ends) {
+    ends.clear();
     std::size_t at = 0, start = 0;
     while (at < n) {
-        if (n - at < 3 || d[at] > 3) return {};
+        if (n - at < 3 || d[at] > 3) {
+            ends.clear();
+            return;
+        }
         const std::size_t chunk = 3 + ((static_cast<std::size_t>(d[at + 1]) << 8) | d[at + 2]);
-        if (chunk > n - at) return {};
+        if (chunk > n - at) {
+            ends.clear();
+            return;
+        }
         if (at > start && at + chunk - start > kSplitPayload) {
             ends.push_back(at);
             start = at;
@@ -276,7 +276,6 @@ std::vector<std::size_t> chunk_split(const std::uint8_t* d, std::size_t n) {
         at += chunk;
     }
     ends.push_back(n);
-    return ends;
 }
 
 struct Datagram {
@@ -342,6 +341,9 @@ constexpr std::uint8_t kProbe[8] = {0xfe, 'b', 'b', 'h', 'p', 0, 0, 0};
 // The game sees none of it: its peers stay server:port both ways.
 constexpr std::uint8_t kRelayMagic = 0xfb, kRelayToServer = 'R', kRelayToClient = 'r';
 constexpr std::size_t kRelayHeader = 12;
+// The largest UDP payload over IPv4. The game's lower network layer batches
+// its frames into datagrams well past 2 KB (5 KB seen on a warp).
+constexpr std::size_t kMaxDatagram = 65507;
 struct RelayLink {
     std::mutex mu;
     bool on = false;
@@ -481,7 +483,7 @@ std::size_t p2p_header(const std::uint8_t* d, std::size_t n, std::uint16_t* src,
 }
 
 void p2p_reader(std::shared_ptr<P2pPort> port) {
-    std::vector<std::uint8_t> store(g_net_large_datagrams ? kReadBuffer : kSmallDatagram);
+    std::vector<std::uint8_t> store(kMaxDatagram);
     std::uint8_t* const buf = store.data();
     int logs = 0;
     while (!port->stop.load(std::memory_order_relaxed)) {
@@ -507,6 +509,20 @@ void p2p_reader(std::shared_ptr<P2pPort> port) {
             // Not the game's: a peer's hole-punch probe, or the STUN
             // server's answer to our Binding Request. Neither reaches a
             // game socket.
+            if (n >= 4 && std::memcmp(buf, kSignalMagic, 4) == 0) {
+                {
+                    std::lock_guard<std::mutex> lk(port->mu);
+                    ++port->rx;
+                    port->heard[source_key(sa.sin_addr.s_addr, sa.sin_port)] = std::chrono::steady_clock::now();
+                }
+                std::vector<std::uint8_t> pkt(buf, buf + n);
+                const std::uint32_t from_addr = sa.sin_addr.s_addr;
+                const std::uint16_t from_port = sa.sin_port;
+                net::dispatch_after(0, net::Prio::Signaling, [pkt, from_addr, from_port] {
+                    hle_np_signaling_control(pkt.data(), pkt.size(), from_addr, from_port);
+                });
+                continue;
+            }
             if (n >= 8 && std::memcmp(buf, kProbe, 5) == 0) {
                 std::lock_guard<std::mutex> lk(port->mu);
                 ++port->rx;
@@ -918,14 +934,17 @@ int dgram_recv(int s, void* buf, std::uint64_t len, int flags, SceSockaddrIn* fr
     return static_cast<int>(n);
 }
 
-// Sends one datagram, with the P2P header in front on a P2P socket.
+// Sends one datagram, with the P2P header in front on a P2P socket. One of the
+// game's of more than kSplitPayload bytes leaves as pieces of whole chunks
+// (chunk_split), each behind its own headers. The game hears of it as one:
+// its length once a piece has left, an error only when none has.
 int dgram_send(int s, const void* buf, std::uint64_t len, int flags, const SceSockaddrIn* to) {
     NetSock sock;
     if (!sock_state(s, &sock)) return net_err(EBADF);
     const sockfd_t fd = sock.port ? sock.port->fd : sock.fd;
     if (!sock_ok(fd)) return static_cast<int>(len);
     if (!to) return net_err(EINVAL);
-    std::uint8_t ph[6];  // the P2P header
+    std::uint8_t ph[6] = {};  // the P2P header
     std::size_t hdr = 0;
     const std::uint16_t dst_vport = bswap16(to->vport);
     if (sock.p2p) {
@@ -949,43 +968,43 @@ int dgram_send(int s, const void* buf, std::uint64_t len, int flags, const SceSo
     const bool relayed = sock.p2p && relay_target(to->addr, to->port, token, &stun_sa);
     const std::size_t lead = relayed ? kRelayHeader : 0;  // the relay frame's header
     const auto* bytes = static_cast<const std::uint8_t*>(buf);
-    std::vector<std::size_t> ends;  // the pieces' ends; one piece, the whole, unless split
-    if (sock.p2p && g_net_split_datagrams && bytes && len > kSplitPayload && len <= kMaxUdpPayload)
-        ends = chunk_split(bytes, static_cast<std::size_t>(len));
+    const bool fits = len <= kMaxDatagram - hdr;  // the game's bytes and the P2P header in what UDP carries
+    // The pieces' ends in the game's bytes; one piece, the whole, unless split.
+    static thread_local std::vector<std::size_t> ends;
+    ends.clear();
+    if (sock.p2p && g_net_split_datagrams && bytes && len > kSplitPayload && fits)
+        chunk_split(bytes, static_cast<std::size_t>(len), ends);
     if (ends.empty()) ends.push_back(static_cast<std::size_t>(len));
-    std::uint64_t largest = 0;
+    std::size_t largest = 0;
     for (std::size_t i = 0, begin = 0; i < ends.size(); begin = ends[i++])
         if (ends[i] - begin > largest) largest = ends[i] - begin;
-    const std::uint64_t biggest = lead + hdr + largest;  // the longest datagram this sends, every header in
-    if (len > kMaxUdpPayload ||
-        (g_net_large_datagrams ? biggest > kMaxUdpPayload : hdr + len > kSmallDatagram)) {
+    if (!fits || lead + hdr + largest > kMaxDatagram) {
         static std::atomic<bool> told{false};
         if (!told.exchange(true)) {
-            host_log("net: a %llu-byte datagram (%llu with its headers) is larger than %zu B and was dropped; the game "
-                     "resends what it carried (logged once)",
-                     static_cast<unsigned long long>(len), static_cast<unsigned long long>(biggest),
-                     g_net_large_datagrams ? kMaxUdpPayload : kSmallDatagram);
+            host_log("net: a %llu-byte datagram is larger than %zu B with its headers and was dropped; the game resends "
+                     "what it carried (logged once)",
+                     static_cast<unsigned long long>(len), kMaxDatagram);
         }
         g_net_errno = to_freebsd(EMSGSIZE);
         return net_err(EMSGSIZE);
     }
+    // One buffer per thread, with room in front for the relay header: the
+    // game's bytes are copied in once, and each piece's headers are written
+    // just in front of its bytes - over the end of the piece before, which
+    // has left by then.
+    static thread_local std::vector<std::uint8_t> store(kRelayHeader + kMaxDatagram);
+    if (bytes && len) std::memcpy(store.data() + kRelayHeader + hdr, bytes, static_cast<std::size_t>(len));
     sockaddr_in sa{};
     sa.sin_family = AF_INET;
     sa.sin_port = to->port;
     sa.sin_addr.s_addr = to->addr;
     const bool dontwait = sock.nonblock || (flags & 0x80);
-    // Each piece is built on the stack up to the old limit, on the heap above.
-    std::uint8_t small[kRelayHeader + kSmallDatagram];
-    std::vector<std::uint8_t> large;
     ssize_type n = -1;
+    int err = 0;
     std::size_t sent = 0, big = 0;
     for (std::size_t i = 0, begin = 0; i < ends.size(); begin = ends[i++]) {
-        const std::size_t piece = ends[i] - begin, total = lead + hdr + piece;
-        std::uint8_t* out = small;
-        if (total > sizeof(small)) {
-            large.resize(total);
-            out = large.data();
-        }
+        std::uint8_t* const out = store.data() + (kRelayHeader - lead) + begin;  // its bytes at out + lead + hdr
+        const std::size_t total = lead + hdr + (ends[i] - begin);
         if (relayed) {
             out[0] = kRelayMagic;
             out[1] = kRelayToServer;
@@ -993,11 +1012,14 @@ int dgram_send(int s, const void* buf, std::uint64_t len, int flags, const SceSo
             std::memcpy(out + 10, &to->port, 2);  // network order is the frame's big-endian
         }
         std::memcpy(out + lead, ph, hdr);
-        if (piece) std::memcpy(out + lead + hdr, bytes + begin, piece);
         n = sock_sendto(fd, out, total, dontwait, relayed ? &stun_sa : &sa);
-        // A piece after the first that fails is a loss on the way, as it would
-        // be for one of the datagram's fragments: the game resends.
-        if (n < 0) break;
+        if (n < 0) {
+            // The error now, before the log below can change it. A piece after
+            // the first that fails is a loss on the way, as one of the
+            // datagram's fragments would be: the game resends what it held.
+            err = sock_errno();
+            break;
+        }
         ++sent;
         if (total > kOneFramePayload) ++big;
     }
@@ -1009,14 +1031,18 @@ int dgram_send(int s, const void* buf, std::uint64_t len, int flags, const SceSo
                  bswap16(to->port), sock.vport, dst_vport, static_cast<unsigned long long>(len), sent, ends.size(),
                  static_cast<long long>(n));
     }
-    if (!sent) return sock_errno() == EAGAIN ? net_again() : net_fail();
+    if (!sent) {
+        if (err == EAGAIN) return net_again();
+        g_net_errno = to_freebsd(err);
+        return net_err(err);
+    }
     if (sock.queue) {
         std::lock_guard<std::mutex> lk(sock.queue->mu);
         ++sock.queue->out_dgrams;
         sock.queue->out_bytes += len;
         if (ends.size() > 1) ++sock.queue->out_split;
         sock.queue->out_big += big;
-        if (biggest > sock.queue->out_largest) sock.queue->out_largest = static_cast<std::size_t>(biggest);
+        if (lead + hdr + largest > sock.queue->out_largest) sock.queue->out_largest = lead + hdr + largest;
     }
     return static_cast<int>(len);
 }
@@ -1540,6 +1566,34 @@ bool hle_net_p2p_relay(std::uint32_t* server, std::uint16_t* vport) {
     if (server) *server = g_relay.server;
     if (vport) *vport = g_relay.vport;
     return g_relay.on;
+}
+
+void hle_net_p2p_signal(std::uint32_t addr, std::uint16_t port_host, const void* data, std::size_t len) {
+    std::shared_ptr<P2pPort> port;
+    {
+        std::lock_guard<std::mutex> lock(g_net_mu);
+        auto it = g_p2p_ports.find(static_cast<std::uint16_t>(net::p2p_port()));
+        if (it != g_p2p_ports.end()) port = it->second;
+    }
+    if (!port || !addr || !port_host || len > 512) return;
+    std::uint8_t token[net::stun::kTokenLen];
+    sockaddr_in stun_sa{};
+    const std::uint16_t port_nbo = bswap16(port_host);
+    if (relay_target(addr, port_nbo, token, &stun_sa)) {
+        std::uint8_t frame[512 + kRelayHeader];
+        frame[0] = kRelayMagic;
+        frame[1] = kRelayToServer;
+        std::memcpy(frame + 2, token, net::stun::kTokenLen);
+        std::memcpy(frame + 10, &port_nbo, 2);
+        std::memcpy(frame + kRelayHeader, data, len);
+        (void)sock_sendto(port->fd, frame, kRelayHeader + len, true, &stun_sa);
+        return;
+    }
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = addr;
+    to.sin_port = port_nbo;
+    (void)sock_sendto(port->fd, data, len, true, &to);
 }
 
 void hle_net_p2p_punch(const char* label, std::uint32_t addr, std::uint16_t port_host, std::uint32_t local_addr,

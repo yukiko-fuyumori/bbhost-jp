@@ -1,8 +1,10 @@
 #include "hle/common.h"
 #include "hle/trophy.h"
 #include "hle/np.h"
+#include "hle/np_score.h"
 #include "hle/fs.h"
 #include "hle/platform.h"
+#include "hle/save_commit.h"
 #if !defined(_WIN32)
 #include <dirent.h>
 #endif
@@ -13,12 +15,14 @@
 #include "engine/camera.h"
 #include "engine/debug_menu.h"
 #include "engine/menu_pointer.h"
+#include "engine/plugin_dialog.h"
 #include "engine/mouse_camera.h"
 #include "host/bindings.h"
 #include "host/ingame_menu.h"
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/window.h"
+#include "host/plugin_panel.h"
 #include "net/account.h"
 #include "net/session.h"
 #include "core/config.h"
@@ -165,6 +169,25 @@ GUEST_ABI int hle_user_event(std::int32_t* ev) {
         return 0;
     }
     return static_cast<int>(0x80960005);  // SCE_USER_SERVICE_ERROR_NO_EVENT
+}
+
+// The system language a console of the disc's region answers, as far as the
+// game's text goes. A save that has no language picked in System > Language
+// follows the system language, and since every region now keeps every
+// language as it is (engine/patch_manifest.cpp all-languages) the answer is
+// the text: English (UK) on a European or Asian disc, Japanese on a Japanese
+// one, English (US) on an American one - what each region's own mapping made
+// of English (US) before.
+int region_system_lang() {
+    // The game's region (sub_23b9190): USER_DEFINED_PARAM_1 modulo ten
+    // through its table at 0x4b36690, 0 past 5.
+    static constexpr int kRegion[] = {5, 0, 1, 2, 3, 4};
+    const int m = sfo_user_param(1) % 10;
+    const int region = m >= 0 && m <= 5 ? kRegion[m] : 0;
+    // Japan, Americas, Europe, Asia, region 4 (Europe's English alone), the
+    // build's own.
+    static constexpr int kLang[] = {0, 1, 18, 18, 18, 1};
+    return kLang[region];
 }
 
 GUEST_ABI int hle_sysparam_int(int id, int* value) {
@@ -450,8 +473,11 @@ GUEST_ABI int hle_np_get_state(int, int* state) {
     }();
     // online.require_account: signed out until the F10 screen has logged an
     // account in, so the game plays offline rather than as a name
-    // taken from a file.
-    *state = (forced == 2 && config().online_require_account && !net::account_logged_in()) ? 1 : forced;
+    // taken from a file - and while the server refuses the sign-in it has
+    // (net::account_refused: the setup window's check, or a 401), rather
+    // than asking again all session for answers it refuses.
+    const bool signed_in = net::account_logged_in() && !net::account_refused();
+    *state = (forced == 2 && config().online_require_account && !signed_in) ? 1 : forced;
     return 0;
 }
 std::string g_online_id = "Player";
@@ -482,17 +508,28 @@ GUEST_ABI int hle_np_presence_status(int, int* st) {
     }
     return 0;
 }
+// As shadPS4's (np_common.cpp): the name up to its terminator, then opt and
+// reserved; anything after the name's terminator is not compared. A plain
+// memcmp of the whole 36 bytes called the same player two different ones
+// whenever two copies differed past the name, and the game then kept a
+// second record and connection for that player.
+constexpr int kNpUtilErrorNotMatch = static_cast<int>(0x80550609);
 GUEST_ABI int hle_np_cmp_online(const void* a, const void* b) {
     if (!a || !b) {
         return static_cast<int>(0x80550003);
     }
-    return std::memcmp(a, b, 16);
+    return std::strncmp(static_cast<const char*>(a), static_cast<const char*>(b), 16) != 0 ? kNpUtilErrorNotMatch : 0;
 }
 GUEST_ABI int hle_np_cmp_npid(const void* a, const void* b) {
     if (!a || !b) {
         return static_cast<int>(0x80550003);
     }
-    return std::memcmp(a, b, 36);
+    const auto* x = static_cast<const std::uint8_t*>(a);
+    const auto* y = static_cast<const std::uint8_t*>(b);
+    if (std::strncmp(reinterpret_cast<const char*>(x), reinterpret_cast<const char*>(y), 16) != 0) return kNpUtilErrorNotMatch;
+    if (std::memcmp(x + 20, y + 20, 8) != 0) return kNpUtilErrorNotMatch;   // opt
+    if (std::memcmp(x + 28, y + 28, 8) != 0) return kNpUtilErrorNotMatch;   // reserved
+    return 0;
 }
 GUEST_ABI int hle_np_unreg_state(void*) {
     g_np_state_cb = nullptr;
@@ -562,6 +599,10 @@ struct SaveMount {
     std::string dir_name;
     bool used = false;
     bool writable = false;  // mounted to write: the unmount may back it up
+    // Where the mount points: the save's directory, or its stage when the
+    // session writes there (hle/save_commit.h) - committed at the unmount.
+    std::string host;
+    bool staged = false;
 };
 SaveMount g_save_mounts[16];
 
@@ -650,9 +691,63 @@ void back_up_save(const std::string& dir) {
              std::min(backups.size(), static_cast<std::size_t>(keep)));
 }
 
+// What a run that ended mid-commit or mid-session left beside the saves (a
+// stage, its marker, an old copy), settled for each save before the game
+// looks: a save is then whole, the old one or the new one (save_commit.h).
+void recover_all_saves() {
+    namespace fs = std::filesystem;
+    const std::string root = hle_fs_map_path("/data/saves");
+    if (root.empty()) return;
+    std::vector<std::string> dirs;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(fs::path(root), ec)) {
+        const std::string n = e.path().filename().string();
+        for (const char* tail : {".stage", ".old", ".commit", ".commit.new"}) {
+            const std::size_t t = std::strlen(tail);
+            if (n.size() > t + 1 && n[0] == '.' && n.compare(n.size() - t, t, tail) == 0) dirs.push_back(n.substr(1, n.size() - t - 1));
+        }
+    }
+    std::sort(dirs.begin(), dirs.end());
+    dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
+    for (const std::string& d : dirs) {
+        if (!valid_dir_name(d.c_str())) continue;
+        std::string did;
+        save_commit::recover(save_dir_host(d), &did);
+        if (!did.empty()) host_log("save %s: %s", d.c_str(), did.c_str());
+    }
+}
+
+// BBHOST_TEST_SAVE_KILL=STEP[:N] (a test switch): the process ends at once -
+// no exit, no reports, as a kill or a power cut would - at the N-th time (1)
+// a save reaches STEP: "session" (a writable mount's stage just made, the
+// game about to write it) or one of a commit's steps (save_commit.h: flushed,
+// marker-written, marker; the exchange's exchanged, old-removed,
+// marker-removed; file by file moved (once per file), extras-removed,
+// marker-removed, stage-removed). The next start's recovery must leave the
+// old save or the new one, whole.
+void save_test_kill(const char* step) {
+    static const char* const want = std::getenv("BBHOST_TEST_SAVE_KILL");
+    static int left = [] {
+        const char* c = want ? std::strchr(want, ':') : nullptr;
+        return c ? std::max(1, std::atoi(c + 1)) : 1;
+    }();
+    if (!want) return;
+    const std::size_t n = std::strcspn(want, ":");
+    if (std::strlen(step) != n || std::strncmp(step, want, n) != 0 || --left != 0) return;
+    host_log("save: BBHOST_TEST_SAVE_KILL - the process ends here, at %s (a test switch)", step);
+    std::fflush(nullptr);
+#if defined(_WIN32)
+    TerminateProcess(GetCurrentProcess(), 9);
+#endif
+    _exit(9);
+}
+
 GUEST_ABI int hle_save_init(void*) {
     host_log("sceSaveDataInitialize");
     hle_fs_mount("/data/saves", "saves");  // ensures <data>/saves exists
+    std::lock_guard<std::mutex> lock(g_save_mu);
+    recover_all_saves();
+    if (std::getenv("BBHOST_TEST_SAVE_KILL")) save_commit::set_test_hook(save_test_kill);
     return 0;
 }
 GUEST_ABI int hle_save_term() { return 0; }
@@ -666,7 +761,22 @@ GUEST_ABI int hle_save_mount(const SaveMountReq* req, SaveMountResult* result) {
 #if defined(_WIN32)
     if (const char* e = std::getenv("BBHOST_SAVE_DUMP"); e && e[0] == '1') win_vm_dump_views();
 #endif
-    const bool exists = save_dir_exists(dir);
+    std::lock_guard<std::mutex> lock(g_save_mu);
+    // An interrupted commit or session settled first; `holds` is the
+    // directory with the newest whole save (the save's own, unless a swap
+    // could not be finished).
+    const std::string live = save_dir_host(dir);
+    std::string did;
+    const std::string holds = live.empty() ? live : save_commit::recover(live, &did);
+    if (!did.empty()) host_log("save %s: %s", dir.c_str(), did.c_str());
+    if (!live.empty() && holds.empty()) {
+        // Neither the save's directory nor its stage holds it whole (a file
+        // held by another process, and the stage not made whole again): it
+        // is not read in pieces; the next mount tries again.
+        host_log("sceSaveDataMount %s: the save cannot be read whole now; busy", dir.c_str());
+        return kSaveErrBusy;
+    }
+    const bool exists = save_dir_exists(dir) || holds != live;
     const bool create = (req->mount_mode & (kMountCreate | kMountCreate2)) != 0;
     if (!exists && !create) {
         host_log("sceSaveDataMount %s: not found", dir.c_str());
@@ -676,7 +786,6 @@ GUEST_ABI int hle_save_mount(const SaveMountReq* req, SaveMountResult* result) {
         !(req->mount_mode & (kMountRdwr | kMountRdonly))) {
         return kSaveErrExists;
     }
-    std::lock_guard<std::mutex> lock(g_save_mu);
     int slot = -1;
     for (int i = 0; i < 16; ++i) {
         if (g_save_mounts[i].used && g_save_mounts[i].dir_name == dir) {
@@ -691,12 +800,25 @@ GUEST_ABI int hle_save_mount(const SaveMountReq* req, SaveMountResult* result) {
     }
     char mp[16] = {};
     std::snprintf(mp, sizeof(mp), "/savedata%d", slot & 15);
-    if (!hle_fs_mount(mp, ("saves/" + dir).c_str())) {
+    const bool writable = (req->mount_mode & (kMountRdwr | kMountCreate | kMountCreate2)) != 0;
+    // A session that writes gets a stage, a copy of the save the unmount
+    // makes the save; where none could be made it writes where the newest
+    // save is, and the unmount commits that one if it is a stage.
+    std::string host = holds;
+    if (writable && !live.empty()) {
+        const std::string stage = save_commit::begin(live);
+        if (!stage.empty()) host = stage, save_test_kill("session");
+        else host_log("save %s: no stage could be made; this session writes in place", dir.c_str());
+    }
+    const bool staged = writable && host != live && host == save_commit::paths_of(live).stage;
+    if (!hle_fs_mount(mp, ("saves/" + std::filesystem::path(host.empty() ? dir : host).filename().string()).c_str())) {
         return kSaveErrParam;
     }
     g_save_mounts[slot].used = true;
     g_save_mounts[slot].dir_name = dir;
-    g_save_mounts[slot].writable = (req->mount_mode & (kMountRdwr | kMountCreate | kMountCreate2)) != 0;
+    g_save_mounts[slot].writable = writable;
+    g_save_mounts[slot].host = host.empty() ? save_dir_host(dir) : host;
+    g_save_mounts[slot].staged = staged;
     std::memcpy(result->mount_point, mp, sizeof(mp));
     result->required_blocks = 0;
     result->mount_status = exists ? 0 : 1;  // 1 = SCE_SAVE_DATA_MOUNT_STATUS_CREATED
@@ -723,7 +845,19 @@ GUEST_ABI int hle_save_umount(const char* mount_point) {
     hle_fs_umount(mount_point);
     g_save_mounts[slot].used = false;
     host_log("sceSaveDataUmount %s", mount_point);
-    if (g_save_mounts[slot].writable) back_up_save(g_save_mounts[slot].dir_name);
+    bool committed = true;
+    if (g_save_mounts[slot].staged) {
+        // The session's writes become the save, whole (save_commit.h); a
+        // commit that cannot finish leaves the stage for the next mount.
+        std::string why;
+        committed = save_commit::commit(save_dir_host(g_save_mounts[slot].dir_name), &why);
+        if (!committed)
+            host_log("save %s: the commit stopped at %s; the next mount finishes it", g_save_mounts[slot].dir_name.c_str(), why.c_str());
+        g_save_mounts[slot].staged = false;
+    }
+    // A save's directory a commit stopped in may hold some of its files
+    // moved and some not: not a backup.
+    if (g_save_mounts[slot].writable && committed) back_up_save(g_save_mounts[slot].dir_name);
     return 0;
 }
 
@@ -754,6 +888,13 @@ GUEST_ABI int hle_save_delete(const SaveMountReq* req) {
 #else
     _rmdir(h.c_str());
 #endif
+    {
+        // What a session or a commit left beside it goes too.
+        const save_commit::Paths sp = save_commit::paths_of(h);
+        std::error_code ec;
+        for (const std::string& left : {sp.stage, sp.old, sp.marker, sp.marker_new})
+            std::filesystem::remove_all(std::filesystem::path(left), ec);
+    }
     host_log("sceSaveDataDelete %s", req->dir_name);
     return 0;
 }
@@ -798,9 +939,9 @@ struct SaveSearchResult {
     std::uint8_t reserved[12];
 };
 
-bool load_param(const std::string& dir_name, SaveParam* p) {
+// A save's param from the directory `h` (the save's, or a session's stage).
+bool load_param_at(const std::string& h, SaveParam* p) {
     std::memset(p, 0, sizeof(*p));
-    std::string h = save_dir_host(dir_name);
     if (h.empty()) {
         return false;
     }
@@ -817,8 +958,9 @@ bool load_param(const std::string& dir_name, SaveParam* p) {
     return n == sizeof(*p);
 }
 
-bool store_param(const std::string& dir_name, const SaveParam* p) {
-    std::string h = save_dir_host(dir_name);
+bool load_param(const std::string& dir_name, SaveParam* p) { return load_param_at(save_dir_host(dir_name), p); }
+
+bool store_param_at(const std::string& h, const SaveParam* p) {
     if (h.empty()) {
         return false;
     }
@@ -914,7 +1056,7 @@ GUEST_ABI int hle_save_set_param(const char* mount_point, int type, const void* 
         return kSaveErrParam;
     }
     SaveParam p;
-    load_param(g_save_mounts[slot].dir_name, &p);
+    load_param_at(g_save_mounts[slot].host, &p);
     auto copy = [&](char* dst, std::size_t cap) {
         std::memset(dst, 0, cap);
         std::memcpy(dst, buf, static_cast<std::size_t>(std::min<std::uint64_t>(size, cap - 1)));
@@ -944,7 +1086,7 @@ GUEST_ABI int hle_save_set_param(const char* mount_point, int type, const void* 
     if (type != 5) {
         p.mtime = static_cast<std::int64_t>(std::time(nullptr));
     }
-    return store_param(g_save_mounts[slot].dir_name, &p) ? 0 : kSaveErrParam;
+    return store_param_at(g_save_mounts[slot].host, &p) ? 0 : kSaveErrParam;
 }
 
 // SceSaveDataIcon { void* buf; size_t bufSize; size_t dataSize; reserved[32] }
@@ -960,7 +1102,7 @@ GUEST_ABI int hle_save_save_icon(const char* mount_point, const SaveIcon* icon) 
     if (slot < 0 || !icon || !icon->buf) {
         return kSaveErrParam;
     }
-    std::string h = save_dir_host(g_save_mounts[slot].dir_name);
+    const std::string& h = g_save_mounts[slot].host;
     std::FILE* f = h.empty() ? nullptr : std::fopen((h + "/icon0.png").c_str(), "wb");
     if (!f) {
         return kSaveErrParam;
@@ -1049,7 +1191,25 @@ GUEST_ABI int hle_score_offline() {
     }
     return kScoreErrOffline;
 }
-GUEST_ABI int hle_score_comment_ok(int, const char*) { return 0; }
+// sceNpScoreCensorComment(reqId, comment, option): 0, nothing to censor. The
+// game asks it of a new character's name (sub_10d0720 refuses the name on
+// SCE_NP_COMMUNITY_SERVER_ERROR_CENSORED); the private server has no word
+// filter, so every name passes.
+GUEST_ABI int hle_score_censor_comment(int, const char* comment, void*) {
+    return comment ? 0 : np_score::kErrInvalidArgument;
+}
+// sceNpScoreSanitizeComment(reqId, comment, sanitizedComment, option): the
+// text back in sanitizedComment (hle/np_score.h). The game's own character
+// name goes through it before it is sent to the other players, who show it
+// when Player Name Display is "名前": an answer that leaves the buffer empty
+// sends the name empty, and they show this player blank.
+GUEST_ABI int hle_score_sanitize_comment(int, const char* comment, char* sanitized, void*) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        host_log("HLE fake: sceNpScoreSanitizeComment gives the text back as it came (the private server has no word filter)");
+    }
+    return np_score::sanitize_copy(comment, sanitized);
+}
 
 // Mouse: no device yet. Open hands out a handle; Read reports no data.
 GUEST_ABI int hle_mouse_init() { return 0; }
@@ -1491,7 +1651,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         // who wants the pad to own the camera.
         const HostSettings& hs = host_settings_ref();  // the snapshot as published: no copy, no lock
         const bool want = hs.mouse_camera && !host_options_open() && !ingame_menu_open() &&
-                          !menu_pointer_in_menu() && !host_text_entry_open();
+                          !menu_pointer_in_menu() && !host_text_entry_open() && !plugin_panel_shown();
         // What the follow camera turns by, and whether its own turns as the
         // character moves are held: the keyboard and mouse used last, the
         // mouse turning the camera, and Mouse auto-rotation off. A controller
@@ -1748,6 +1908,9 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         return v > 0 ? v : 500;
     }();
 
+    // What the taps and the autopress below add stands for the controller
+    // (plugin API 29: a plugin reads it, and what it takes the game does not).
+    const PadState before_taps = p;
     // Taps the port itself asks for (hle_pad_tap): a press the game reads as
     // the player's, for a few polls - on a pad that is there. With no window
     // and no controller (a headless test run) the record is a disconnected
@@ -1765,7 +1928,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             if (now >= it->from) {
                 // A stick name (lup .. rright, bits above the pad's) deflects that stick fully
                 // for the hold, as BBHOST_AUTOPRESS's do: a test request's walk.
-                if (it->button & 0x1ef0000u) {
+                if (it->button & 0x3ef0000u) {
                     if (it->button & 0x10000u) p.ly = 0;
                     if (it->button & 0x20000u) p.ly = 255;
                     if (it->button & 0x40000u) p.lx = 0;
@@ -1774,6 +1937,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
                     if (it->button & 0x400000u) p.ry = 255;
                     if (it->button & 0x800000u) p.rx = 0;
                     if (it->button & 0x1000000u) p.rx = 255;
+                    if (it->button & 0x2000000u) p.rx = 192;  // half way right: a partial turn
                 } else {
                     p.buttons |= it->button;
                 }
@@ -1830,6 +1994,25 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             p.buttons |= seq[(ms / 1500) % 4];
         }
         p.timestamp = static_cast<std::uint64_t>(ms) * 1000;
+    }
+    {
+        const std::uint32_t tapped = p.buttons & ~before_taps.buttons;
+        const auto moved = [](std::uint8_t now, std::uint8_t was) { return now != was ? now : kStickRest; };
+        // As the controller's own (host/window.cpp): a panel in the game's
+        // dialog has its buttons, whatever a plugin takes, and the plugins not.
+        const std::uint32_t dialog = plugin_panel_dialog_buttons();
+        host_plugin_pad_test(tapped & ~dialog, moved(p.lx, before_taps.lx), moved(p.ly, before_taps.ly), moved(p.rx, before_taps.rx),
+                             moved(p.ry, before_taps.ry));
+        const std::uint32_t take_axes = host_plugin_pad_taken_axes();
+        p.buttons &= ~(tapped & host_plugin_pad_taken_buttons() & ~dialog);
+        if (take_axes & kPadTakeLeftStick) {
+            p.lx = before_taps.lx;
+            p.ly = before_taps.ly;
+        }
+        if (take_axes & kPadTakeRightStick) {
+            p.rx = before_taps.rx;
+            p.ry = before_taps.ry;
+        }
     }
     // BBHOST_TRACE_PAD=1: every read that sees a button change, with the
     // flip count and the reads-per-flip rate (double-press investigations).
@@ -1891,6 +2074,10 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         p.connected = connected;
         p.timestamp = ts;
     }
+    // A plugin's menu in the game's dialog keeps what is not the dialog's
+    // (engine/plugin_dialog.h): Circle on a page opened on top, Up and Down
+    // at a long page's ends, and a corner page's camera.
+    plugin_dialog::pad_filter(p.buttons, p.lx, p.ly, p.rx, p.ry, p.l2, p.r2);
     {
         const std::uint32_t was = g_pad_delivered.exchange(p.buttons, std::memory_order_relaxed);
         if (p.buttons & ~was & 0x6000u)  // Cross or Circle went down
@@ -2109,8 +2296,8 @@ void hle_register_system() {
     REG("sceNpScoreRecordScore", hle_score_offline);
     REG("sceNpScoreGetBoardInfo", hle_score_offline);
     REG("sceNpScoreRecordGameData", hle_score_offline);
-    REG("sceNpScoreCensorComment", hle_score_comment_ok);
-    REG("sceNpScoreSanitizeComment", hle_score_comment_ok);
+    REG("sceNpScoreCensorComment", hle_score_censor_comment);
+    REG("sceNpScoreSanitizeComment", hle_score_sanitize_comment);
     REG("sceMouseInit", hle_mouse_init);
     REG("sceMouseOpen", hle_mouse_open);
     REG("sceMouseClose", hle_mouse_close);
@@ -2134,6 +2321,7 @@ std::uint32_t hle_pad_button_named(const std::string& name) {
         std::uint32_t bit;
     } names[] = {{"lup", 0x10000u}, {"ldown", 0x20000u}, {"lleft", 0x40000u}, {"lright", 0x80000u},  // left stick, full
                  {"rup", 0x200000u}, {"rdown", 0x400000u}, {"rleft", 0x800000u}, {"rright", 0x1000000u},  // right stick, full
+                 {"rright_half", 0x2000000u},  // right stick, half way
                  {"cross", 0x4000u}, {"circle", 0x2000u}, {"square", 0x8000u}, {"triangle", 0x1000u},
                  {"options", 0x8u}, {"up", 0x10u},        {"down", 0x40u},     {"left", 0x80u},
                  {"right", 0x20u},  {"l1", 0x400u},       {"r1", 0x800u},      {"l2", 0x100u},

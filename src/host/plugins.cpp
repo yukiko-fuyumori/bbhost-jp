@@ -6,9 +6,13 @@
 #include "core/config.h"
 #include "core/elf.h"
 #include "core/imports.h"
+#include "core/legacy_cpu.h"
 #include "core/memory.h"
 #include "core/portable.h"
 #include "engine/addr.h"
+#include "engine/camera.h"
+#include "engine/camera_target.h"
+#include "engine/debug_menu.h"
 #include "engine/frame_rate.h"
 #include "engine/graphics_patch.h"
 #include "engine/gx_state.h"
@@ -18,9 +22,12 @@
 #include "gcn/container.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"
+#include "engine/plugin_dialog.h"
 #include "engine/world_chr.h"
 #include "engine/lua_events.h"
 #include "engine/loading.h"
+#include "engine/menu_pointer.h"
+#include "engine/world_pause.h"
 #include "engine/paramdef.h"
 #include "engine/params.h"
 #include "engine/patch_manifest.h"
@@ -30,13 +37,23 @@
 #include "guest_abi.h"
 #include "hle/fs.h"
 #include "hle/modules.h"
+#include "hle/np.h"
+#include "host/audio_crush.h"
 #include "host/bindings.h"
+#include "host/options.h"
+#include "host/plugin_panel.h"
 #include "host/ruleset.h"
+#include "host/pixel_cutaway.h"
+#include "host/render_api.h"
+#include "host/render_hooks.h"
+#include "host/shader_overrides.h"
+#include "host/scene_look.h"
 #include "host/updater.h"
 #include "host/window.h"
 #include "log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -48,6 +65,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -70,7 +88,15 @@ struct Plugin {
     const BbOption* options = nullptr;  // bb_plugin_options, ended by a zero type
     bool official = false;  // signed with the release key
     bool visitor = false;   // off, but loaded to play other players' worlds (BB_PLUGIN_ADOPTS_RULES)
+    bool dormant = false;   // off, but loaded to be turned on in game (BB_PLUGIN_LIVE_SWITCH); main thread
+    int shader_owner = 0;   // its shader overrides' owner (host/shader_overrides.h): its place in the load order, from 1
 };
+
+// A plugin that turns on and off while the game runs (BB_PLUGIN_LIVE_SWITCH):
+// opt-in and not a gameplay plugin, whose rules are the session's.
+bool live_switch(std::uint32_t flags) {
+    return (flags & BB_PLUGIN_LIVE_SWITCH) && (flags & BB_PLUGIN_OPT_IN) && !(flags & BB_PLUGIN_GAMEPLAY);
+}
 std::vector<Plugin> g_plugins;
 ElfImage* g_image = nullptr;
 bool g_early = true;  // register_hle allowed
@@ -160,12 +186,22 @@ int api_read(std::uint64_t bn, void* out, std::size_t n) {
     const std::uint64_t at = plugin_address::read_address(bn, n, g_image->mem.slide, g_image->mem.size,
                                                           [](std::uint64_t a, std::size_t len) { return hle_kernel_va_mapped(a, len); });
     if (!at) return 1;
-    return host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), out, n) ? 0 : 1;
+    if (!host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), out, n)) return 1;
+    // The game's code reads as the game has it where a site was rewritten
+    // for this processor (core/legacy_cpu.h).
+    if (legacy_cpu_meets(at, n)) legacy_cpu_original(at, n, static_cast<std::uint8_t*>(out));
+    return 0;
 }
 
 int api_write(std::uint64_t bn, const void* data, std::size_t n) {
     const std::uint64_t at = runtime_of(bn, n);
     if (!at || !api_eboot_is_109()) return 1;
+    if (legacy_cpu_meets(at, n)) {
+        // A site rewritten for this processor (core/legacy_cpu.h): its jump would break.
+        host_log("plugin: a write to 0x%llx refused: it covers a site rewritten for this processor (api_patch can replace it)",
+                 static_cast<unsigned long long>(bn));
+        return 1;
+    }
     GuestMemory& mem = g_image->mem;
     const std::uint64_t lo = at & ~0xfffull, hi = (at + n + 0xfff) & ~0xfffull;
     if (!guest_protect_rw(&mem, lo, hi - lo)) return 2;
@@ -196,9 +232,20 @@ int api_patch(std::uint64_t bn, const void* expect, const void* bytes, std::size
     if (!at || !api_eboot_is_109()) return 1;
     GuestMemory& mem = g_image->mem;
     auto* p = static_cast<std::uint8_t*>(guest_ptr(mem, at));
-    if (std::memcmp(p, expect, n) != 0) return std::memcmp(p, bytes, n) == 0 ? 0 : 1;
+    // Against the bytes as the game has them; a site rewritten for this
+    // processor (core/legacy_cpu.h) is given up to a patch that replaces it
+    // whole, and refused to one that would cut its jump.
+    std::vector<std::uint8_t> have(n);
+    legacy_cpu_original(at, n, have.data());
+    if (std::memcmp(have.data(), expect, n) != 0) return std::memcmp(have.data(), bytes, n) == 0 ? 0 : 1;
+    if (legacy_cpu_meets(at, n) < 0) {
+        host_log("plugin: a patch at 0x%llx refused: it cuts a site rewritten for this processor",
+                 static_cast<unsigned long long>(bn));
+        return 1;
+    }
     const std::uint64_t lo = at & ~0xfffull, hi = (at + n + 0xfff) & ~0xfffull;
     if (!guest_protect_rwx(&mem, lo, hi - lo)) return 2;
+    legacy_cpu_release(at, n, "a plugin's patch");
     std::memcpy(p, bytes, n);
     if (!guest_protect_rx(&mem, lo, hi - lo)) {
         host_log("plugin: cannot restore the protection of 0x%llx", static_cast<unsigned long long>(bn));
@@ -237,7 +284,7 @@ int api_hook(std::uint64_t bn, const void* prologue, std::size_t n, BbHookFn fn,
     if (!at) return 1;
     std::uint8_t have[64];
     if (n > sizeof(have)) return 1;
-    std::memcpy(have, guest_ptr(g_image->mem, at), n);
+    legacy_cpu_original(at, n, have);  // as the game has them (core/legacy_cpu.h)
     if (std::memcmp(have, prologue, n) != 0) return 1;
     g_hooks.push_back({fn, nullptr, user});
     const std::uint64_t id = g_hooks.size();
@@ -334,6 +381,10 @@ int api_player_warp(std::uint32_t block, const float xyz[3], float yaw) { return
 // Version 12: the loading screen, as the host's own test last saw it (engine/loading.h).
 int api_loading_screen() { return loading_screen_up() ? 1 : 0; }
 
+int api_on_camera_target(void* (*fn)(void*, void*), void* user) {
+    return g_in_image && api_eboot_is_109() && camera_target::register_callback(fn, user) ? 0 : 1;
+}
+
 int api_on_event_flag(void (*fn)(std::uint32_t, int, void*), void* user) {
     if (!fn || !api_eboot_is_109()) return 1;
     {
@@ -370,7 +421,7 @@ int api_hook2(std::uint64_t bn, const void* prologue, std::size_t n, BbHookFn2 f
     const std::uint64_t at = runtime_of(bn, n);
     if (!at) return 1;
     std::uint8_t have[64];
-    std::memcpy(have, guest_ptr(g_image->mem, at), n);
+    legacy_cpu_original(at, n, have);  // as the game has them (core/legacy_cpu.h): what the stub runs, expanded there
     if (prologue && std::memcmp(have, prologue, n) != 0) return 1;
     g_hooks.push_back({nullptr, fn, user});
     const std::uint64_t id = g_hooks.size();
@@ -816,6 +867,7 @@ std::vector<ActionCallback> g_action_callbacks;  // under g_frame_mu
 struct MenuRequest {
     bool action;
     std::string name, key, value;
+    bool kept = true;  // a setting the config keeps; false: a menu's run-time row (panel_rows), on_option only
 };
 std::vector<MenuRequest> g_menu_requests;  // under g_frame_mu
 
@@ -1047,10 +1099,9 @@ int api_on_world_rules(const char* name, void (*fn)(const char*, void*), void* u
 }
 
 // Version 13: controls and a view of a plugin's own.
-int api_input(BbInput* out) {
-    if (!out) return 1;
+int input_read(const char* reader, BbInput* out) {
     PluginInput in;
-    const bool ok = host_plugin_input(in);
+    const bool ok = host_plugin_input(reader, in);
     std::memcpy(out->key, in.key, sizeof(out->key));
     out->buttons = in.buttons;
     out->pressed = in.pressed;
@@ -1061,9 +1112,13 @@ int api_input(BbInput* out) {
     return ok ? 0 : 1;
 }
 
+// The read of the plugins that do not name themselves (input_as names one).
+int api_input(BbInput* out) { return out ? input_read("", out) : 1; }
+
+// The take of the plugins that do not name themselves (input_take_as names one).
 int api_input_take(const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, int wheel, int motion) {
     if (n && !scancodes) return 1;
-    host_plugin_input_take(scancodes, n, buttons, wheel != 0, motion != 0);
+    host_plugin_input_take("", scancodes, n, buttons, wheel != 0, motion != 0);
     return 0;
 }
 
@@ -1128,6 +1183,59 @@ int api_on_camera(void (*fn)(BbCamera*, void*), void* user) {
     return 0;
 }
 
+// The scene's camera, after the copy above: the game state's update keeps it
+// in r15, loaded at 0x1d3bb93 from the object the slot at 0x594f880 holds
+// (+0x10). At 0x1d3bec5 the copy is done and the debug free camera's replacing
+// it is still to come (mov rax, [r13+0x110]; cmp dword [rax+0xc4], 0 - its switch;
+// set, its camera at +0xd0 is copied over the scene's). The stub keeps only the
+// argument registers, so the camera is found again through the slot rather than r15.
+std::vector<CameraCallback> g_view_callbacks;  // under g_frame_mu
+bool g_view_hooked = false;
+// world_state's BB_WORLD_VIEW: one more than the flip at which a plugin's
+// on_view last changed the view (0: never) - another camera's picture.
+std::atomic<std::uint64_t> g_view_moved{0};
+
+GUEST_ABI std::int64_t view_hook(std::uint64_t, const std::uint64_t*) {
+    // A cutscene's own camera, left as it places it (plugin API 29).
+    if (loading_cutscene()) return 0;
+    const std::uint64_t slot = runtime_of(0x594f880, 8);
+    std::uint64_t holder = 0, scene = 0;
+    if (!slot || !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(slot)), &holder, 8) || !holder ||
+        !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(holder + 0x10)), &scene, 8) || !scene)
+        return 0;
+    std::vector<CameraCallback> now;
+    {
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        now = g_view_callbacks;
+    }
+    auto* cam = reinterpret_cast<BbCamera*>(static_cast<std::uintptr_t>(scene + 0x10));
+    BbCamera before;
+    std::memcpy(&before, cam, sizeof before);
+    for (const CameraCallback& c : now) c.fn(cam, c.user);
+    if (std::memcmp(&before, cam, sizeof before) != 0) g_view_moved.store(hle_video_flip_count() + 1, std::memory_order_relaxed);
+    return 0;
+}
+
+int api_on_view(void (*fn)(BbCamera*, void*), void* user) {
+    if (!fn || !g_image || !api_eboot_is_109()) return 1;
+    {
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        g_view_callbacks.push_back({fn, user});
+    }
+    if (g_view_hooked) return 0;
+    g_view_hooked = true;
+    static const std::uint8_t after_copy[14] = {0x49, 0x8b, 0x85, 0x10, 0x01, 0x00, 0x00,
+                                                0x83, 0xb8, 0xc4, 0x00, 0x00, 0x00, 0x00};
+    if (!engine_site_hook(g_image, runtime_of(0x1d3bec5, sizeof after_copy), after_copy, sizeof after_copy,
+                          reinterpret_cast<void*>(&view_hook))) {
+        host_log("plugin: 0x1d3bec5 is not the end of the scene camera's copy; on_view is not called");
+    }
+    return 0;
+}
+
+// Version 29: a cutscene asked for or playing (engine/loading.h).
+int api_cutscene() { return loading_cutscene() ? 1 : 0; }
+
 int api_key_bound(std::uint16_t scancode) {
     if (scancode == 0) return 0;
     // A plugin's own keys work in play, where a menu's actions press nothing
@@ -1139,11 +1247,568 @@ int api_key_bound(std::uint16_t scancode) {
     return 0;
 }
 
-void api_draw_style(int style) { gx_draw_style(style & (kGxDrawLines | kGxDrawBlack | kGxDrawSubtract)); }
+void api_draw_style(int style) { gx_draw_style(style & kGxDrawAll); }
 
 int api_on_scene_category(std::int32_t pass, void (*fn)(std::uint64_t, void*), void* user) {
     if (!g_image || !api_eboot_is_109()) return 1;
     render_queue_scene_insert(pass, fn, user);
+    return 0;
+}
+
+// Version 18: the 3D's look (host/scene_look.h).
+void api_scene_snap(std::uint32_t lines) {
+    scene_look_set_snap(lines);
+    if (!lines) host_log("plugin: the 3D's vertices as they are");
+    else if (lines == kSnapPixels) host_log("plugin: the 3D's vertices snapped to its pixels");
+    else host_log("plugin: the 3D's vertices snapped to a grid %u lines high", lines);
+}
+void api_scene_filter(int filter) { scene_look_set_nearest(filter == BB_FILTER_NEAREST); }
+void api_scene_scale(int scale, std::uint32_t lines) { scene_look_set_scale(scale == BB_SCALE_NEAREST, lines); }
+void api_scene_colour_bits(int bits) { scene_look_set_colour_8bit(bits == 8); }
+void api_grading_filter(int filter) { scene_look_set_grading_nearest(filter == BB_FILTER_NEAREST); }
+void api_gbuffer_ambient(float level) { gx_gbuffer_ambient(level); }
+
+// Version 22: the cutaway (host/vertex_cutaway.h, host/scene_look.h).
+void api_view_cutaway(float tan_x, float tan_y, float near_z, float radius) {
+    const bool was = scene_look_cutaway(nullptr);
+    scene_look_set_cutaway(tan_x, tan_y, near_z, radius);
+    const bool on = scene_look_cutaway(nullptr);
+    if (on) host_log("plugin: cutaway within %.2f m of the view's axis nearer than %.2f m", static_cast<double>(radius), static_cast<double>(near_z));
+    else if (was) host_log("plugin: no cutaway");
+}
+
+// Version 23: the cutaway per pixel (host/pixel_cutaway.h, host/scene_look.h).
+void api_view_cutaway2(const BbCutaway* c) {
+    PixelCut p{};
+    if (c && c->radius > 0.0f) {
+        p.distance = c->distance;
+        p.sin_pitch = std::sin(c->pitch);
+        p.cos_pitch = std::cos(c->pitch);
+        p.radius = c->radius;
+        p.widen = c->widen;
+        p.height = c->height;
+        p.margin = c->margin;
+        p.feather = c->feather;
+    }
+    const bool was = scene_look_pixel_cut(nullptr);
+    scene_look_set_pixel_cut(p);
+    // Said when it turns on: a zoom sets it each frame.
+    if (scene_look_pixel_cut(nullptr) && !was)
+        host_log("plugin: cutaway per pixel within %.2f m (+%.2f a metre nearer) of the view's axis, %.2f m up and %.2f m in front "
+                 "of the point %.2f m off, faded over %.2f m",
+                 static_cast<double>(p.radius), static_cast<double>(p.widen), static_cast<double>(p.height),
+                 static_cast<double>(p.margin), static_cast<double>(p.distance), static_cast<double>(p.feather));
+    else if (was)
+        host_log("plugin: no cutaway per pixel");
+}
+
+// Version 24: the objects' cone (host/scene_look.h).
+void api_view_cutaway_objects(float start) {
+    const bool was = scene_look_object_cut() >= 0.0f;
+    scene_look_set_object_cut(start);
+    if (start >= 0.0f && start < 1.0f && !was)
+        host_log("plugin: the map's objects cut too, by the same cone from %.2f of the way to the camera", static_cast<double>(start));
+}
+
+// Version 26: the Camera Zoom presses for the plugin (engine/camera.h).
+int api_camera_zoom(int* steps, int* reset) {
+    bool r = false;
+    const int n = camera_zoom_take(&r);
+    if (steps) *steps = n;
+    if (reset) *reset = r ? 1 : 0;
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true)) host_log("plugin: the Camera Zoom keys zoom a plugin's view, not the game's camera");
+    return 0;
+}
+
+// Version 25: the PS1's dither over the finished picture (host/scene_look.h).
+void api_scene_dither(std::uint32_t bits) {
+    scene_look_set_dither(bits);
+    if (scene_look_dither()) host_log("plugin: the picture dithered to %u bits a channel before the HUD", scene_look_dither());
+    else host_log("plugin: the picture not dithered");
+}
+
+// A change the settings' listeners follow (the velocity map's patches, the
+// render size, the game's own anti-aliasing pass): the settings published
+// again, on the options' thread - nothing before the start, which reads them
+// itself.
+void republish_settings() {
+    if (g_early) return;
+    if (host_window_active())
+        host_options_post([] { host_opt_republish(); });
+    else
+        host_opt_republish();
+}
+
+// Version 27: the frame as it is drawn, and plugins' compute work in it
+// (host/render_hooks.h, host/upscale_pass.cpp).
+int api_frame_info(BbFrameInfo* out) { return render_frame_info(out); }
+
+int api_on_render(const char* name, std::uint32_t points, BbRenderFn fn, void* user) {
+    bool motion_changed = false;
+    if (render_hooks_add(name, points, fn, user, &motion_changed) != 0) return 1;
+    if (motion_changed) republish_settings();  // host_opt_motion_wanted follows
+    return 0;
+}
+
+// Who does the anti-aliasing (aa_claim, BbPluginInfo.flags' BB_PLUGIN_AA_*):
+// each plugin's claim by its name, and the one that holds over the plugins
+// that are on (render_api.h aa_resolve) - kept in g_aa, which upscaler_method
+// reads at every draw. Worked out again on the main thread: at each claim,
+// once the plugins are loaded, after their image phase, and at a live switch.
+std::mutex g_aa_mu;
+std::map<std::string, int> g_aa_claims;  // under g_aa_mu
+std::vector<std::string> g_aa_takers;    // the titles of the plugins on that take it over, in load order (under g_aa_mu)
+std::atomic<int> g_aa{kAaNone};
+
+const char* aa_name(int claim) { return claim == kAaTake ? "takes it over" : claim == kAaLeave ? "leaves it to bbhost" : "none"; }
+
+void aa_update() {
+    std::vector<int> claims;
+    std::vector<char> on;
+    std::vector<std::string> titles;
+    {
+        std::lock_guard<std::mutex> lk(g_aa_mu);
+        for (const Plugin& p : g_plugins) {
+            const auto it = g_aa_claims.find(p.name);
+            claims.push_back(it == g_aa_claims.end() ? kAaNone : it->second);
+            on.push_back(!p.visitor && !p.dormant);
+            titles.push_back(p.info && p.info->title && p.info->title[0] ? p.info->title : p.name);
+        }
+    }
+    std::unique_ptr<bool[]> on_a(new bool[on.size() + 1]);
+    for (std::size_t k = 0; k < on.size(); ++k) on_a[k] = on[k] != 0;
+    std::size_t first = 0;
+    const int held = render_api::aa_resolve(claims.data(), on_a.get(), claims.size(), &first);
+    std::vector<std::string> takers;
+    for (std::size_t k = 0; k < claims.size(); ++k) {
+        if (on[k] && claims[k] == kAaTake) takers.push_back(titles[k]);
+    }
+    bool changed;
+    {
+        std::lock_guard<std::mutex> lk(g_aa_mu);
+        changed = takers != g_aa_takers;
+        g_aa_takers = takers;
+    }
+    const int was = g_aa.exchange(held);
+    if (held != was || changed) {
+        if (held == kAaTake && takers.size() > 1) {
+            std::string all;
+            for (std::size_t k = 0; k < takers.size(); ++k) all += (k ? k + 1 == takers.size() ? " and " : ", " : "") + takers[k];
+            host_log("plugin: %s all take the anti-aliasing over: each runs its own; the menus name %s", all.c_str(), takers[0].c_str());
+        } else if (held == kAaTake) {
+            host_log("plugin: %s takes the anti-aliasing over: no jitter, TAA, FSR, DLSS or game anti-aliasing pass while it is on; the 3D at "
+                     "the Resolution",
+                     takers[0].c_str());
+        } else if (held == kAaLeave) {
+            host_log("plugin: the anti-aliasing is left to bbhost: TAA runs even beside a Vulkan layer that would keep it off");
+        } else if (was != kAaNone) {
+            host_log("plugin: the anti-aliasing is bbhost's again");
+        }
+    }
+    // The render size, the game's own size and its anti-aliasing pass follow.
+    if (held != was) republish_settings();
+}
+
+int api_aa_claim(const char* name, int claim) {
+    if (!name || !name[0] || claim < BB_AA_NONE || claim > BB_AA_TAKE || render_hooks_in_call()) return 1;
+    {
+        std::lock_guard<std::mutex> lk(g_aa_mu);
+        int& c = g_aa_claims[name];
+        if (c == claim) return 0;
+        c = claim;
+    }
+    host_log("plugin: %s: its anti-aliasing claim: %s", name, aa_name(claim));
+    aa_update();
+    return 0;
+}
+
+// Version 27: shader overrides (host/shader_overrides.h). Each plugin is an
+// owner of its own, in the order the plugins load (after the player's
+// folder); off while the plugin is (a visitor, a live switch off).
+static_assert(BB_SHADER_NONE == gpu::kOverrideNone && BB_SHADER_WAITING == gpu::kOverrideWaiting && BB_SHADER_TAKEN == gpu::kOverrideTaken &&
+                  BB_SHADER_REFUSED == gpu::kOverrideRefused && BB_SHADER_SHADOWED == gpu::kOverrideShadowed && BB_SHADER_OFF == gpu::kOverrideOff,
+              "shader_state's values are the overrides' states");
+static_assert(BB_SHADER_DATA_BYTES == gpu::kOverrideDataBytes, "a plugin's shader data");
+std::mutex g_shader_owner_mu;
+std::map<std::string, int> g_shader_owners;  // under g_shader_owner_mu: a plugin's name -> its owner
+int shader_owner(const char* name) {
+    if (!name) return 0;
+    std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+    const auto it = g_shader_owners.find(name);
+    return it == g_shader_owners.end() ? 0 : it->second;
+}
+
+int api_shader_override(const char* name, const char* shader, const char* hlsl) {
+    const int owner = shader_owner(name);
+    if (!owner || !shader) return 1;
+    const int r = gpu::overrides_set_text(owner, shader, hlsl);
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 32) {
+        host_log("plugin: %s: shader %s %s%s", name, shader, hlsl ? "replaced" : "given back to the game",
+                 r ? " - refused: no shader is named so, or the text is over 4 MiB" : "");
+    }
+    return r;
+}
+
+int api_shader_folder(const char* name, const char* dir) {
+    const int owner = shader_owner(name);
+    if (!owner) return -1;
+    const int n = gpu::overrides_add_folder(owner, dir);
+    if (dir && *dir) host_log("plugin: %s: shaders from %s: %d", name, dir, n);
+    return n;
+}
+
+int api_shader_state(const char* name, const char* shader, char* why, std::size_t n) {
+    const int owner = shader_owner(name);
+    std::string w;
+    const int state = owner && shader ? gpu::overrides_state(owner, shader, &w) : BB_SHADER_NONE;
+    if (why && n) {
+        const std::size_t k = std::min(n - 1, w.size());
+        std::memcpy(why, w.data(), k);
+        why[k] = '\0';
+    }
+    return state;
+}
+
+// Per thread, as game_file's: good until that thread's next call.
+thread_local std::string g_shader_source;
+int api_shader_source(const char* shader, const char** hlsl, std::size_t* size) {
+    if (!shader || !hlsl || !size) return 1;
+    // The game's first frames come before the renderer starts: nothing met
+    // yet, and nothing known to be off (gpu::overrides_started).
+    if (!gpu::overrides_started()) return 1;
+    if (const int r = gpu::hlsl_override_source(shader, g_shader_source)) return r;
+    *hlsl = g_shader_source.c_str();
+    *size = g_shader_source.size();
+    return 0;
+}
+
+int api_shader_data(const char* name, std::uint32_t offset, const void* data, std::uint32_t size) {
+    const int owner = shader_owner(name);
+    return owner ? gpu::overrides_data_write(owner, offset, data, size) : 1;
+}
+
+// Version 21: old-hardware sound (host/audio_crush.h).
+void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
+    audio_crush_set(rate_hz, bits, lowpass_hz);
+    if (!audio_crush_on()) host_log("plugin: the game's sound as it is");
+    else host_log("plugin: the game's sound held to %d Hz, %d bits, low-passed at %.0f Hz (0: off)", rate_hz, bits,
+                  static_cast<double>(lowpass_hz));
+}
+
+// Version 29: the world held still, the controller, and who else is in the
+// world.
+bool plugin_named(const char* name) {
+    if (!name || !name[0]) return false;
+    for (const Plugin& p : g_plugins) {
+        if (p.name == name && !p.visitor) return true;
+    }
+    return false;
+}
+
+int api_world_pause(const char* name, int paused) {
+    if (!g_image || !api_eboot_is_109() || !plugin_named(name)) return 1;
+    return world_pause_set(name, paused != 0) ? 0 : 1;
+}
+
+int api_world_step(const char* name, std::uint32_t updates) {
+    if (!plugin_named(name)) return 1;
+    return world_pause_step(name, updates) ? 0 : 1;
+}
+
+int api_pad(BbPad* out) {
+    if (!out || out->size < 8) return 1;
+    PluginPad pad;
+    host_plugin_pad(pad);
+    const auto axis = [](std::uint8_t v) {
+        return std::clamp((static_cast<float>(v) - static_cast<float>(kStickRest)) / 127.0f, -1.0f, 1.0f);
+    };
+    BbPad o{};
+    o.buttons = pad.buttons;
+    o.pressed = pad.pressed;
+    o.play = pad.play;
+    o.connected = pad.connected ? 1 : 0;
+    o.lx = axis(pad.lx);
+    o.ly = axis(pad.ly);
+    o.rx = axis(pad.rx);
+    o.ry = axis(pad.ry);
+    o.l2 = static_cast<float>(pad.l2) / 255.0f;
+    o.r2 = static_cast<float>(pad.r2) / 255.0f;
+    o.size = std::min<std::uint32_t>(out->size, sizeof(BbPad));
+    std::memcpy(out, &o, o.size);
+    return 0;
+}
+
+int api_pad_take(const char* name, std::uint32_t buttons, std::uint32_t axes) {
+    static_assert(BB_PAD_LEFT_STICK == kPadTakeLeftStick && BB_PAD_RIGHT_STICK == kPadTakeRightStick &&
+                      BB_PAD_TRIGGERS == kPadTakeTriggers,
+                  "pad_take's axes");
+    if (!plugin_named(name)) return 1;
+    host_plugin_pad_take(name, buttons, axes & (BB_PAD_LEFT_STICK | BB_PAD_RIGHT_STICK | BB_PAD_TRIGGERS));
+    return 0;
+}
+
+int api_input_take_as(const char* name, const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, int wheel, int motion) {
+    if ((n && !scancodes) || !plugin_named(name)) return 1;
+    host_plugin_input_take(name, scancodes, n, buttons, wheel != 0, motion != 0);
+    return 0;
+}
+
+int api_input_as(const char* name, BbInput* out) {
+    if (!out || !plugin_named(name)) return 1;
+    return input_read(name, out);
+}
+
+// Other players' characters in this world: the player set's entries after the
+// main player's (WorldChrMan +0x30: the local player, then up to four remote
+// ones, bbhost/engine/sprj/world_chr_man.hpp), each a character still there.
+std::uint32_t other_players() {
+    const std::uint64_t man = world_chr_man();
+    const std::uint64_t main = man ? rp(man + 0x60) : 0;
+    if (!main) return 0;
+    std::uint32_t cap = 0;
+    const std::uint64_t entries = rp(man + 0x38);
+    if (!entries || !rd(man + 0x30, &cap) || cap > 16) return 0;
+    std::uint32_t n = 0;
+    for (std::uint32_t k = 0; k < cap; ++k) {
+        const std::uint64_t ins = rp(entries + k * 0x38);
+        if (ins && ins != main && rp(ins)) ++n;
+    }
+    return n;
+}
+
+// The session's members besides the player: SprjSessionManager's route
+// configurations (+0xf0, one a member, 0x20 bytes each - the in-game update's
+// own "two or more" test at its start reads them) less one.
+std::uint32_t session_members(std::uint64_t sm) {
+    const std::uint64_t begin = rp(sm + 0xf8), end = rp(sm + 0x100);
+    if (!begin || end < begin || (end - begin) % 0x20 || (end - begin) > 0x20 * 16) return 0;
+    const std::uint32_t routes = static_cast<std::uint32_t>((end - begin) / 0x20);
+    return routes > 1 ? routes - 1 : 0;
+}
+
+// The picture's look over the area's own (engine/graphics_patch.h): one for
+// all plugins, the last call's, and its plugin, whose turning off takes it away.
+std::mutex g_look_mu;
+std::string g_look_owner;  // under g_look_mu
+
+float look_value(float v, float lo, float hi, float otherwise) { return std::isfinite(v) ? std::clamp(v, lo, hi) : otherwise; }
+
+int api_post_look(const char* name, const BbLook* look, std::uint32_t* available) {
+    static_assert(BB_LOOK_TONE == kLookTone && BB_LOOK_VIGNETTE == kLookVignette && BB_LOOK_DOF == kLookDof &&
+                      BB_LOOK_ABERRATION == kLookAberration && BB_LOOK_MOTION_BLUR == kLookMotionBlur && BB_LOOK_FOG == kLookFog &&
+                      BB_LOOK_DOF_RANGE == kLookDofRange,
+                  "post_look's groups");
+    if (!plugin_named(name) || (look && look->size < 8)) return 1;
+    GraphicsLook l;
+    if (look && look->set) {
+        BbLook b{};
+        std::memcpy(&b, look, std::min<std::size_t>(look->size, sizeof(BbLook)));
+        // A group the plugin's BbLook does not reach to the end of stays the area's.
+        const std::uint32_t size = look->size;
+        std::uint32_t set = b.set & kLookAll;
+        if (size < offsetof(BbLook, vignette)) set &= ~kLookTone;
+        if (size < offsetof(BbLook, dof)) set &= ~kLookVignette;
+        if (size < offsetof(BbLook, aberration)) set &= ~kLookDof;
+        if (size < offsetof(BbLook, motion_blur)) set &= ~kLookAberration;
+        if (size < offsetof(BbLook, fog_distance)) set &= ~kLookMotionBlur;
+        if (size < offsetof(BbLook, dof_near_end)) set &= ~kLookFog;
+        if (size < sizeof(BbLook)) set &= ~kLookDofRange;
+        l.set = set;
+        // Inside what the post effect's setters take (some assert outside it).
+        l.exposure = look_value(b.exposure, 0.0f, 16.0f, 1.0f);
+        l.gamma = look_value(b.gamma, 0.05f, 16.0f, 1.0f);
+        l.saturation = look_value(b.saturation, 0.0f, 16.0f, 1.0f);
+        l.brightness = look_value(b.brightness, 0.0f, 16.0f, 1.0f);
+        l.contrast = look_value(b.contrast, 0.0f, 16.0f, 1.0f);
+        l.vignette = look_value(b.vignette, 0.0f, 4.0f, 0.0f);
+        l.dof = b.dof != 0;
+        l.dof_focus = look_value(b.dof_focus, 0.01f, 10000.0f, 10.0f);
+        l.dof_aperture = look_value(b.dof_aperture, 0.5f, 64.0f, 5.6f);
+        l.dof_near_levels = std::clamp(b.dof_near_levels, 0, 7);
+        l.dof_far_levels = std::clamp(b.dof_far_levels, 0, 7);
+        l.aberration = b.aberration != 0;
+        for (int i = 0; i < 2; ++i) {
+            l.lateral[i] = look_value(b.lateral[i], -1.0f, 1.0f, 0.0f);
+            l.uniform[i] = look_value(b.uniform[i], -1.0f, 1.0f, 0.0f);
+        }
+        l.motion_blur = b.motion_blur != 0;
+        l.blur_time = look_value(b.blur_time, 0.0f, 100.0f, 0.0f);
+        l.blur_length = look_value(b.blur_length, 0.0f, 100.0f, 0.0f);
+        l.blur_scale = look_value(b.blur_scale, 0.0f, 100.0f, 0.0f);
+        // YEBIS's motion blur is built for 1 to 8 samples and draws with
+        // shaders that are not the blur's past that (engine/graphics_patch.cpp);
+        // 1 is its own 4 or 5. The look's apply keeps it to 7 where the area
+        // interleaves its samples.
+        l.blur_samples = std::clamp(b.blur_samples, 2, 8);
+        l.fog_distance = look_value(b.fog_distance, 0.01f, 100.0f, 1.0f);
+        l.fog_density = look_value(b.fog_density, 0.0f, 16.0f, 1.0f);
+        l.fog_contrast = look_value(b.fog_contrast, 0.0f, 16.0f, 1.0f);
+        l.fog_distance_offset = look_value(b.fog_distance_offset, -10000.0f, 10000.0f, 0.0f);
+        l.fog_height_offset = look_value(b.fog_height_offset, -10000.0f, 10000.0f, 0.0f);
+        l.dof_near_end = look_value(b.dof_near_end, 0.0f, 10000.0f, 0.0f);
+        l.dof_far_start = look_value(b.dof_far_start, 0.0f, 10000.0f, 10000.0f);
+        l.dof_near_fade = look_value(b.dof_near_fade, 0.0f, 10000.0f, 0.0f);
+        l.dof_far_fade = look_value(b.dof_far_fade, 0.0f, 10000.0f, 0.0f);
+    }
+    std::uint32_t was = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        static std::uint32_t groups = 0;
+        was = groups;
+        groups = l.set;
+        g_look_owner = l.set ? name : std::string();
+    }
+    graphics_look_set(l);
+    const std::uint32_t avail = graphics_look_available();
+    if (available) *available = avail;
+    if (was != l.set) host_log("plugin: %s's look over the area's: groups %x (%x can show now)", name, l.set, avail);
+    return 0;
+}
+
+// The plugin's look taken away as it is turned off.
+void drop_look(const std::string& name) {
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        if (g_look_owner != name) return;
+        g_look_owner.clear();
+    }
+    graphics_look_set(GraphicsLook{});
+    host_log("plugin: %s turned off; its look taken away", name.c_str());
+}
+
+// The plugin's panel (host/plugin_panel.h).
+int api_panel_show(const char* name, const BbPanel* panel) {
+    if (!plugin_named(name)) return 1;
+    if (!panel) {
+        plugin_panel_hide(name);
+        return 0;
+    }
+    if (panel->size < 8) return 1;
+    BbPanel b{};
+    std::memcpy(&b, panel, std::min<std::size_t>(panel->size, sizeof(BbPanel)));
+    PluginPanelShow how;
+    how.page = b.page ? b.page : "";
+    how.guide = b.guide ? b.guide : "";
+    how.guide_keys = b.guide_keys ? b.guide_keys : "";
+    how.defaults = (b.flags & BB_PANEL_DEFAULTS) != 0;
+    how.corner = (b.flags & BB_PANEL_CORNER) != 0;
+    if (b.pages) {
+        for (std::uint32_t i = 0; i < b.page_count; ++i) {
+            if (!b.pages[i]) return 1;
+            how.pages.emplace_back(b.pages[i]);
+        }
+    }
+    return plugin_panel_show(name, how) ? 0 : 1;
+}
+
+PluginOptionDesc option_desc(const BbOption& o);
+
+int api_panel_rows(const char* name, const char* page, const BbOption* rows, size_t n) {
+    if (!plugin_named(name) || !page || (n && !rows)) return 1;
+    std::vector<PluginOptionDesc> out;
+    out.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) out.push_back(option_desc(rows[i]));
+    return plugin_panel_rows(name, page, out) ? 0 : 1;
+}
+
+int api_panel_value(const char* name, const char* page, const char* key, const char* value) {
+    if (!plugin_named(name) || !page || !key) return 1;
+    return plugin_panel_value(name, page, key, value ? value : "") ? 0 : 1;
+}
+
+int api_panel_open(const char* name, const char* page) {
+    if (!plugin_named(name) || !page) return 1;
+    return plugin_panel_open(name, page) ? 0 : 1;
+}
+
+int api_panel_state(const char* name, BbPanelState* out) {
+    if (!out || out->size < 8 || !plugin_named(name)) return 1;
+    PluginPanelState st;
+    plugin_panel_state(name, st);
+    BbPanelState o{};
+    o.shown = st.shown ? 1 : 0;
+    o.closed = st.closed ? 1 : 0;
+    std::snprintf(o.page, sizeof(o.page), "%s", st.page.c_str());
+    o.size = std::min<std::uint32_t>(out->size, sizeof(BbPanelState));
+    std::memcpy(out, &o, o.size);
+    return 0;
+}
+
+int api_option_set(const char* name, const char* key, const char* value) {
+    if (!key || !value || !plugin_named(name)) return 1;
+    for (const Plugin& p : g_plugins) {
+        if (p.name != name || p.visitor) continue;
+        for (const BbOption* o = p.options; o && o->type != BB_OPT_END; ++o) {
+            if (o->key && std::strcmp(o->key, key) == 0 && (o->type & 0xffu) != BB_OPT_HEADING && (o->type & 0xffu) != BB_OPT_ACTION) {
+                plugins_set_option(name, key, value);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+int api_hud_hide(const char* name, int hidden) {
+    if (!plugin_named(name)) return 1;
+    const bool was = scene_look_hud_hidden(), was_shown = scene_look_hud_shown();
+    if (hidden < 0) scene_look_set_hud_shown(name, true);  // shown, whatever the game's HUD option says
+    else scene_look_set_hud_hidden(name, hidden != 0);     // left out, or let go (of either ask)
+    if (hidden == 0) scene_look_set_hud_shown(name, false);
+    if (was != scene_look_hud_hidden() || was_shown != scene_look_hud_shown())
+        host_log("plugin: the game's HUD %s (%s)",
+                 scene_look_hud_hidden() ? "left out of the picture"
+                 : scene_look_hud_shown() ? "shown, its own option held on"
+                                          : "as the game has it",
+                 name);
+    return 0;
+}
+
+// BbWorldState's flags from the game's own state: its world, loads,
+// cutscenes and menus, the plugins' hold and their views (world_state; the
+// in-game menus' interruptions, plugins_frame).
+std::uint32_t world_flags() {
+    std::uint32_t f = 0;
+    if (loading_in_world()) f |= BB_WORLD_IN;
+    if (loading_screen_up()) f |= BB_WORLD_LOADING;
+    if (loading_cutscene()) f |= BB_WORLD_CUTSCENE;
+    // A plugin's own menu in the game's dialog (engine/plugin_dialog.h) is not one of the game's.
+    if ((menu_pointer_in_menu() && !plugin_dialog::alone()) || debug_menu_open()) f |= BB_WORLD_MENU;
+    if (world_pause_held()) f |= BB_WORLD_PAUSED;
+    // A plugin's view drawn this flip or the last (view_hook).
+    if (const std::uint64_t moved = g_view_moved.load(std::memory_order_relaxed); moved && moved + 1 >= hle_video_flip_count())
+        f |= BB_WORLD_VIEW;
+    return f;
+}
+
+int api_world_state(BbWorldState* out) {
+    if (!out || out->size < 8 || !g_image || !api_eboot_is_109()) return 1;
+    BbWorldState w{};
+    w.flags = world_flags();
+    w.others = other_players();
+    // Who is on the way: the matchmaking room's other members - the earliest a
+    // player coming in shows, at the server's member-joined event - or the
+    // game's session's, whichever counts more.
+    std::uint32_t members = hle_np_room_others();
+    if (const std::uint64_t sm = rp(runtime_of(bb::SPRJ_SESSION_MANAGER_SINGLETON_PTR.bn(), 8))) {
+        std::int32_t role = 0;
+        if (rd(sm + 0x124, &role) && role >= BB_SESSION_NONE && role <= BB_SESSION_LEAVING) w.session = role;
+        members = std::max(members, session_members(sm));
+    }
+    if (w.session == BB_SESSION_JOINING || w.session == BB_SESSION_GUEST) w.flags |= BB_WORLD_VISITING;
+    if (w.session == BB_SESSION_HOSTING || w.session == BB_SESSION_HOST || w.others) w.flags |= BB_WORLD_OPEN;
+    w.arriving = members > w.others ? members - w.others : 0;
+    // Logged as who else is in the world changes (the menus, loads and cutscenes
+    // come and go too often to log each).
+    static BbWorldState logged{};
+    if (w.others != logged.others || w.arriving != logged.arriving || w.session != logged.session) {
+        host_log("plugin: world state: session %d, %u other player(s), %u arriving (flags %x)", w.session, w.others, w.arriving,
+                 w.flags);
+        logged = w;
+    }
+    w.size = std::min<std::uint32_t>(out->size, sizeof(BbWorldState));
+    std::memcpy(out, &w, w.size);
     return 0;
 }
 
@@ -1164,6 +1829,24 @@ const BbHostApi g_api = {
     &api_show_text,
     &api_on_scene_category,
     &api_draw_style,
+    &api_scene_snap, &api_scene_filter, &api_scene_scale, &api_scene_colour_bits, &api_grading_filter,
+    &api_gbuffer_ambient,
+    &api_on_view,
+    &api_audio_crush,
+    &api_view_cutaway,
+    &api_view_cutaway2,
+    &api_view_cutaway_objects,
+    &api_scene_dither,
+    &api_camera_zoom,
+    &api_frame_info,
+    &api_on_render,
+    &api_aa_claim,
+    &api_shader_override, &api_shader_folder, &api_shader_state, &api_shader_source, &api_shader_data,
+    &api_on_camera_target,
+    &api_world_pause, &api_world_step, &api_pad, &api_pad_take, &api_world_state, &api_hud_hide, &api_post_look,
+    &api_panel_show, &api_panel_state, &api_option_set, &api_input_take_as, &api_input_as,
+    &api_panel_rows, &api_panel_value, &api_panel_open,
+    &api_cutscene,
     &play_history_pause,
 };
 
@@ -1198,6 +1881,25 @@ std::string toml_value(const std::string& v) {
     return q + "\"";
 }
 
+// One BbOption as the menus keep it (copied, strings too): its type, flags,
+// texts and range; BB_OPT_WHEN's condition from `choices` (anything but a
+// CHOICE).
+PluginOptionDesc option_desc(const BbOption& o) {
+    PluginOptionDesc d;
+    d.type = o.type & 0xffu;
+    d.flags = o.type & ~0xffu;
+    d.live = (o.type & BB_OPT_LIVE) != 0;
+    d.key = o.key ? o.key : "";
+    d.label = o.label ? o.label : d.key;
+    d.help = o.help ? o.help : "";
+    d.def = o.def ? o.def : "";
+    d.choices = o.choices ? o.choices : "";
+    if ((o.type & BB_OPT_WHEN) && d.type != BB_OPT_CHOICE) d.when = d.choices;
+    d.min = o.min;
+    d.max = o.max;
+    return d;
+}
+
 PluginEntry entry_of(const std::string& file_name, const std::string& path, const BbPluginInfo* info, const BbOption* options) {
     PluginEntry e;
     e.file = file_name;
@@ -1212,17 +1914,16 @@ PluginEntry entry_of(const std::string& file_name, const std::string& path, cons
         e.description = info->description ? info->description : "";
     }
     if (e.title.empty()) e.title = e.name;
+    std::string group_when;  // the last heading's BB_OPT_WHEN
+    std::string group_page;  // the last heading's key, when it starts a panel page (BB_OPT_PANEL)
     for (const BbOption* o = options; o && o->type != BB_OPT_END; ++o) {
-        PluginOptionDesc d;
-        d.type = o->type & 0xffu;
-        d.live = (o->type & BB_OPT_LIVE) != 0;
-        d.key = o->key ? o->key : "";
-        d.label = o->label ? o->label : d.key;
-        d.help = o->help ? o->help : "";
-        d.def = o->def ? o->def : "";
-        d.choices = o->choices ? o->choices : "";
-        d.min = o->min;
-        d.max = o->max;
+        PluginOptionDesc d = option_desc(*o);
+        // A heading's condition covers the rows under it, up to the next heading.
+        if (d.type == BB_OPT_HEADING) group_when = d.when;
+        else if (d.when.empty()) d.when = group_when;
+        // A panel page: its heading and the rows under it, up to the next heading.
+        if (d.type == BB_OPT_HEADING) group_page = (o->type & BB_OPT_PANEL) && !d.key.empty() ? d.key : std::string();
+        d.page = group_page;
         e.options.push_back(std::move(d));
     }
     return e;
@@ -1277,7 +1978,24 @@ void plugins_load() {
     // that does not verify was changed after signing and is not loaded;
     // plugins.signed_only = true loads official plugins alone.
     const bool signed_only = config_value("plugins.signed_only") == "true";
+    // A photo_mode plugin - Nox-'s photo mode, carried on in his own
+    // repository on the plugin API made for his bbphoto - replaces bbphoto:
+    // while one is in the plugins folders and not switched off, bbphoto is not
+    // loaded - nor started, for a renamed copy found by its name - so the two
+    // never both answer L3 and P. [plugins] photo_mode = false loads bbphoto
+    // again.
+    const auto stem = [](const std::string& n) { return n.substr(0, n.rfind('.')); };
+    bool photo_mode_on = false;
+    if (config_switch("photo_mode") != 0) {
+        for (const auto& [name, path] : files) photo_mode_on = photo_mode_on || stem(name) == "photo_mode";
+    }
+    const auto replaced = [&](const std::string& plugin) {
+        if (!photo_mode_on || plugin != "bbphoto") return false;
+        host_log("plugin: bbphoto: not loaded - photo mode replaces it ([plugins] photo_mode = false loads bbphoto instead)");
+        return true;
+    };
     for (const auto& [name, path] : files) {
+        if (replaced(stem(name))) continue;
         bool official = false;
         if (const std::string sig = read_file(path + ".sig"); !sig.empty()) {
             if (!updater::signature_ok(read_file(path), sig, updater::release_key())) {
@@ -1309,6 +2027,10 @@ void plugins_load() {
             continue;
         }
         if (p.info && p.info->name && p.info->name[0]) p.name = p.info->name;
+        if (replaced(p.name)) {
+            close_lib(h);
+            continue;
+        }
         const std::uint32_t flags = p.info ? p.info->flags : 0;
         const int sw = config_switch(p.name);
         const bool off = sw == 0 || (sw < 0 && (flags & BB_PLUGIN_OPT_IN));
@@ -1319,6 +2041,9 @@ void plugins_load() {
         // turns it off.
         if (off && (flags & BB_PLUGIN_ADOPTS_RULES) && join_modded_worlds()) {
             p.visitor = true;
+        } else if (off && live_switch(flags)) {
+            // Off, and asks for nothing until the player turns it on in game.
+            p.dormant = true;
         } else if (off) {
             if (sw == 0) host_log("plugin: %s: off (plugins.%s = false)", p.name.c_str(), p.name.c_str());
             else host_log("plugin: %s: off until turned on ([plugins] %s = true)", p.name.c_str(), p.name.c_str());
@@ -1326,10 +2051,39 @@ void plugins_load() {
             continue;
         }
 
+        // Its render hooks (plugin API 27) are not called while it is off, and
+        // its flags' anti-aliasing claim is the one it starts with.
+        if (p.visitor || p.dormant) render_hooks_plugin_on(p.name, false);
+        if (const int aa = render_api::aa_of_flags(flags); aa != kAaNone) {
+            std::lock_guard<std::mutex> lk(g_aa_mu);
+            g_aa_claims[p.name] = aa;
+        }
+        // Its shader overrides' owner, before its init can ask for one: after
+        // the player's folder and the plugins loaded before it; off while it is.
+        {
+            static int owners = 0;
+            p.shader_owner = ++owners;
+            const char* data = hle_fs_data_root();
+            const bool plain = !std::strpbrk(p.name.c_str(), "/\\.:");
+            gpu::overrides_owner(p.shader_owner, "plugin " + p.name,
+                                 data && *data && plain ? std::string(data) + "/plugins/" + p.name : std::string(), !(p.visitor || p.dormant));
+            std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+            g_shader_owners[p.name] = p.shader_owner;
+        }
         if (p.init) {
             const int r = p.init(&g_api);
             if (r != 0) {
                 host_log("plugin: %s: init returned %d; unloaded", p.name.c_str(), r);
+                render_hooks_drop(p.name);  // what it registered goes with it
+                {
+                    std::lock_guard<std::mutex> lk(g_aa_mu);
+                    g_aa_claims.erase(p.name);
+                }
+                gpu::overrides_drop_owner(p.shader_owner);
+                {
+                    std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+                    g_shader_owners.erase(p.name);
+                }
                 close_lib(h);
                 continue;
             }
@@ -1341,12 +2095,27 @@ void plugins_load() {
         if (p.info) {
             host_log("plugin: %s %s loaded%s%s (%s)", p.name.c_str(), p.info->version ? p.info->version : "",
                      official ? ", official" : "",
-                     p.visitor ? ", off: only to play other players' worlds" : (flags & BB_PLUGIN_GAMEPLAY) ? ", changes the game" : "",
+                     p.visitor   ? ", off: only to play other players' worlds"
+                     : p.dormant ? ", off until turned on in game"
+                     : (flags & BB_PLUGIN_GAMEPLAY) ? ", changes the game"
+                                                    : "",
                      path.c_str());
         } else {
             host_log("plugin: %s loaded%s (%s)", p.name.c_str(), official ? ", official" : "", path.c_str());
         }
         g_plugins.push_back(p);
+    }
+    aa_update();
+    // A plugin with a panel (BB_OPT_PANEL pages): the game's menu art read now,
+    // on a thread of its own, not on the presenter's at the panel's first frame.
+    for (const Plugin& p : g_plugins) {
+        bool panel = false;
+        for (const BbOption* o = p.options; o && o->type != BB_OPT_END && !panel; ++o)
+            panel = (o->type & 0xffu) == BB_OPT_HEADING && (o->type & BB_OPT_PANEL) != 0;
+        if (panel) {
+            plugin_panel_preload();
+            break;
+        }
     }
     g_early = false;
 }
@@ -1354,6 +2123,7 @@ void plugins_load() {
 void plugins_image(ElfImage* image) {
     g_image = image;
     if (!g_plugins.empty() && api_eboot_is_109()) {
+        world_pause_install(image);  // plugin API 29's world_pause
         static const std::uint8_t prologue[17] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
                                                   0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28};
         if (api_hook2(0x18235e0, prologue, sizeof(prologue), &layout_request_hook, nullptr) != 0)
@@ -1370,6 +2140,16 @@ void plugins_image(ElfImage* image) {
             const int r = p.image(&g_api);
             if (r != 0) {
                 host_log("plugin: %s: image phase returned %d; unloaded", p.name.c_str(), r);
+                render_hooks_drop(p.name);
+                {
+                    std::lock_guard<std::mutex> lk(g_aa_mu);
+                    g_aa_claims.erase(p.name);
+                }
+                gpu::overrides_drop_owner(p.shader_owner);
+                {
+                    std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+                    g_shader_owners.erase(p.name);
+                }
                 close_lib(p.handle);
                 g_plugins.erase(g_plugins.begin() + static_cast<std::ptrdiff_t>(i));
                 continue;
@@ -1378,11 +2158,46 @@ void plugins_image(ElfImage* image) {
         ++i;
     }
     g_in_image = false;
+    aa_update();
 }
 
+void clash_check();
 void plugins_frame() {
     speffect_test_tick();  // BBHOST_SPEFFECT_TEST
     chr_watch_tick();      // BBHOST_CHR_WATCH
+    // A plugin's HUD shown (hud_hide with -1): the game's own HUD option held
+    // on, and the player's put back once none asks (before the early return,
+    // so a plugin turned off lets it go). A plugin's HUD left out while a
+    // plugin's page is up in the game's dialog: the option held off instead -
+    // the picture keeps the game's 2D for the page (host/render.cpp), and the
+    // HUD stays out of it.
+    player_hud_option_hold(scene_look_hud_shown()                         ? 1
+                           : scene_look_hud_hidden() && plugin_dialog::up() ? 0
+                                                                            : -1);
+    // A plugin's panel's sounds (the cursor, a change, a page, opening and
+    // closing): the game's own menu sounds, posted as its widgets post them.
+    {
+        int priority = 0;
+        const int id = plugin_panel_take_sound(&priority);
+        menu_sound_post(id, priority);
+    }
+    // A plugin's menu in the game's own dialog: opened, closed and followed
+    // on this thread (engine/plugin_dialog.h).
+    plugin_dialog::frame();
+    // The game's own interruptions close a plugin's centred menu: a loading
+    // screen coming up, a cutscene starting, the player's character dying.
+    if (g_image && api_eboot_is_109()) {
+        std::int64_t hp = -1;
+        if (!player_stat_get("hp", &hp)) hp = -1;
+        plugin_panel_world(world_flags(), hp);
+    }
+    // Plugins that clash (plugins_clash): told once in game, at the first
+    // frame and after a switch or setting changes.
+    static bool clash_first = true;
+    if (clash_first) {
+        clash_first = false;
+        clash_check();
+    }
     std::vector<FrameCallback> now;
     std::vector<WorldLoadCallback> loads;
     std::vector<MenuRequest> requests;
@@ -1407,13 +2222,34 @@ void plugins_frame() {
             }
             continue;
         }
-        const std::string raw = toml_value(r.value);
-        config_value_set(r.name + "." + r.key, raw);
-        config_set_values(config_user_file(), {{r.name, r.key, raw}});
+        if (r.key.empty()) {
+            // A live switch (plugins_set_enabled): the plugin on or off.
+            const bool on = r.value == "true";
+            for (Plugin& p : g_plugins) {
+                if (p.name != r.name) continue;
+                p.dormant = !on;
+                gpu::overrides_owner_on(p.shader_owner, on);  // its shader overrides with it
+            }
+            if (!on) {
+                world_pause_drop(r.name);  // and its hold on the world
+                scene_look_drop_hud(r.name.c_str());  // and on the HUD
+                drop_look(r.name);  // and its look
+                plugin_panel_hide(r.name);  // and its panel
+                host_plugin_take_drop(r.name.c_str());  // and the controls it takes
+            }
+            host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
+            if (render_hooks_plugin_on(r.name, on)) republish_settings();
+            aa_update();
+        } else if (r.kept) {
+            const std::string raw = toml_value(r.value);
+            config_value_set(r.name + "." + r.key, raw);
+            config_set_values(config_user_file(), {{r.name, r.key, raw}});
+        }
         for (const OptionCallback& c : options) {
             if (c.name == r.name) c.fn(r.key.c_str(), r.value.c_str(), c.user);
         }
     }
+    if (!requests.empty()) clash_check();
     if (!loads.empty()) {
         // A world load is a new main player (every load builds one) or the
         // player in another block (a warp that keeps it).
@@ -1428,6 +2264,7 @@ void plugins_frame() {
             for (const WorldLoadCallback& c : loads) c.fn(block, c.user);
         }
     }
+    host_plugin_pad_frame();  // the controller's presses since the last frame, the same for every reader (pad)
     for (const FrameCallback& c : now) c.fn(c.user);
 }
 
@@ -1477,6 +2314,7 @@ std::vector<PluginEntry> plugins_scan() {
         }
         e.official = official;
         e.bad_signature = bad;
+        e.aa = render_api::aa_of_flags(e.flags);
         const int sw = config_switch(e.name);
         e.enabled = !bad && (sw == 1 || (sw < 0 && !(e.flags & BB_PLUGIN_OPT_IN)));
         out.push_back(std::move(e));
@@ -1492,7 +2330,12 @@ std::vector<PluginEntry> plugins_catalog() {
         e.official = p.official;
         e.loaded = true;
         e.visitor = p.visitor;
-        e.enabled = !p.visitor;
+        e.enabled = !p.visitor && !p.dormant;
+        {
+            std::lock_guard<std::mutex> lk(g_aa_mu);
+            const auto it = g_aa_claims.find(p.name);
+            e.aa = it == g_aa_claims.end() ? kAaNone : it->second;
+        }
         out.push_back(std::move(e));
     }
     return out;
@@ -1501,7 +2344,15 @@ std::vector<PluginEntry> plugins_catalog() {
 void plugins_set_enabled(const std::string& name, bool on) {
     config_set_values(config_user_file(), {{"plugins", name, on ? "true" : "false"}});
     config_value_set("plugins." + name, on ? "true" : "false");
+    // In game, a live switch's plugin is told at once (plugins_frame).
+    for (const Plugin& p : g_plugins) {
+        if (p.name != name || !p.info || !live_switch(p.info->flags) || p.visitor) continue;
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        g_menu_requests.push_back({false, name, "", on ? "true" : "false"});
+    }
 }
+
+bool plugins_live_switch(const PluginEntry& p) { return p.loaded && live_switch(p.flags); }
 
 std::string plugins_option_value(const PluginEntry& p, const PluginOptionDesc& o) {
     const std::string v = config_value(p.name + "." + o.key);
@@ -1523,6 +2374,11 @@ void plugins_set_option(const std::string& name, const std::string& key, const s
 void plugins_run_action(const std::string& name, const std::string& action) {
     std::lock_guard<std::mutex> lk(g_frame_mu);
     g_menu_requests.push_back({true, name, action, ""});
+}
+
+void plugins_menu_option(const std::string& name, const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lk(g_frame_mu);
+    g_menu_requests.push_back({false, name, key, value, false});
 }
 
 namespace {
@@ -1613,9 +2469,68 @@ std::vector<std::string> rules_without(const std::string& rules, const std::vect
 }
 }  // namespace
 
+namespace {
+// The pairs, each by its plugins' names and their main switch (a BB_OPT_BOOL
+// key; "" for the plugin's on/off alone).
+struct Clash {
+    const char *a, *a_switch, *b, *b_switch, *text;
+};
+constexpr Clash kClashes[] = {
+    {"quake", "enabled", "iso", "enabled",
+     "Quake and Isometric don't work together: both take over the camera. Turn one of them off."},
+    // Hunter Cam beside either: Quake's first person and Isometric's view both
+    // replace its camera (under Isometric's view it gives the hunter back, as
+    // to any other camera's picture), and its facing fights Quake's movement.
+    {"quake", "enabled", "hunter_cam", "",
+     "Quake and Hunter Cam don't work together: both take over the camera. Turn one of them off."},
+    {"iso", "enabled", "hunter_cam", "",
+     "Isometric and Hunter Cam don't work together: both take over the camera. Turn one of them off."},
+};
+
+bool truthy(const std::string& v) { return v == "true" || v == "1" || v == "on" || v == "yes"; }
+
+// A plugin turned on, with its switch on, as `list` and the config say.
+bool entry_on(const std::vector<PluginEntry>& list, const char* name, const char* key) {
+    for (const PluginEntry& p : list) {
+        if (p.name != name || !p.enabled) continue;
+        if (!*key) return true;
+        for (const PluginOptionDesc& o : p.options)
+            if (o.key == key) return truthy(plugins_option_value(p, o));
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
+std::string plugins_clash(const std::vector<PluginEntry>& list, const std::string& name) {
+    // Every pair it is in that is on - Quake beside both Isometric and Hunter Cam has two - a line each.
+    std::string out;
+    for (const Clash& c : kClashes) {
+        if (name != c.a && name != c.b) continue;
+        if (entry_on(list, c.a, c.a_switch) && entry_on(list, c.b, c.b_switch)) out += (out.empty() ? "" : "\n") + std::string(c.text);
+    }
+    return out;
+}
+
+// In game: a banner the first time a pair is on together, and again only
+// after they have been apart.
+void clash_check() {
+    static std::vector<bool> was(sizeof(kClashes) / sizeof(kClashes[0]), false);
+    const std::vector<PluginEntry> list = plugins_catalog();
+    for (std::size_t i = 0; i < was.size(); ++i) {
+        const Clash& c = kClashes[i];
+        const bool now = entry_on(list, c.a, c.a_switch) && entry_on(list, c.b, c.b_switch);
+        if (now && !was[i]) {
+            host_log("plugin: %s and %s are both on: %s", c.a, c.b, c.text);
+            host_message_show(c.text, 8.0f);
+        }
+        was[i] = now;
+    }
+}
+
 bool plugins_active(const std::string& name) {
     for (const Plugin& p : g_plugins) {
-        if (p.name == name && !p.visitor) return true;
+        if (p.name == name && !p.visitor && !p.dormant) return true;
     }
     return false;
 }
@@ -1627,6 +2542,25 @@ std::string plugins_ruleset() {
         if (!g_visiting.empty()) return g_visiting;
     }
     return own_ruleset();
+}
+
+int plugins_aa_claim() { return g_aa.load(std::memory_order_relaxed); }
+
+std::string plugins_aa_owner() {
+    std::lock_guard<std::mutex> lk(g_aa_mu);
+    return g_aa_takers.empty() ? std::string() : g_aa_takers.front();
+}
+
+std::string plugins_aa_owner_scanned() {
+    // The files as the setup window found them (they do not change under it);
+    // each one's switch as the config holds it now - the Plugins tab changes it.
+    static const std::vector<PluginEntry> files = plugins_scan();
+    for (const PluginEntry& e : files) {
+        const int sw = config_switch(e.name);
+        const bool on = !e.bad_signature && (sw == 1 || (sw < 0 && !(e.flags & BB_PLUGIN_OPT_IN)));
+        if (on && render_api::aa_of_flags(e.flags) == kAaTake) return e.title;
+    }
+    return {};
 }
 
 std::string plugins_adopts() {

@@ -1,8 +1,12 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "host/plugin_ui.h"
+#include "host/launcher_ui.h"
 
 #include "bbhost_plugin.h"
 #include "core/config.h"
+#include "host/options.h"
+#include "host/japanese_labels.h"
+#include "host/plugin_panel.h"
 #include "host/updater.h"
 
 #include "imgui.h"
@@ -29,7 +33,7 @@ const char* choice_label(const std::string& value) {
         {"JP", "日本語 + 欧州オンライン"}, {"EU", "欧州"}
     };
     for (const auto& [key, label] : labels) if (value == key) return label;
-    return value.c_str();
+    return host_japanese_value(value.c_str());
 }
 
 std::vector<std::string> split(const std::string& s, char sep) {
@@ -92,7 +96,24 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
     const std::string label = o.label + (later ? "  （次回起動時）" : "");
     bool helped = false;  // the widget put its help after something of its own
     const std::string value = plugins_option_value(p, o);
-    const float width = 260 * scale;
+    const float width = 380 * scale;
+    // BB_OPT_WHEN: greyed out unless another of the plugin's options holds one of its values.
+    bool greyed = false;
+    if (const std::size_t eq = o.when.find('='); eq != std::string::npos) {
+        const std::string key = o.when.substr(0, eq);
+        const std::vector<std::string> want = split(o.when.substr(eq + 1), '|');
+        for (const PluginOptionDesc& other : p.options) {
+            if (other.key == key) greyed = std::find(want.begin(), want.end(), plugins_option_value(p, other)) == want.end();
+        }
+    }
+    ImGui::BeginDisabled(greyed);
+    // A number option's reset to its default (BbOption's default text).
+    const auto reset = [&](bool at_default) {
+        if (launcher_ui::reset_button("##reset", at_default)) {
+            plugins_set_option(p.name, o.key, o.def);
+            ui.edits.erase(id);
+        }
+    };
     switch (o.type) {
     case BB_OPT_HEADING:
         ImGui::SeparatorText(o.label.c_str());
@@ -111,6 +132,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
             plugins_set_option(p.name, o.key, std::to_string(v));
             ui.edits.erase(id);
         }
+        reset(v == std::atoi(o.def.c_str()));
         break;
     }
     case BB_OPT_FLOAT: {
@@ -128,6 +150,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
             plugins_set_option(p.name, o.key, t);
             ui.edits.erase(id);
         }
+        reset(std::fabs(v - static_cast<float>(std::atof(o.def.c_str()))) < 0.005f);
         break;
     }
     case BB_OPT_CHOICE: {
@@ -194,6 +217,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
     } else if (!o.help.empty() && !helped) {
         help(o.help);
     }
+    ImGui::EndDisabled();
     ImGui::PopID();
 }
 
@@ -201,12 +225,14 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
 
 void plugin_ui_refresh(PluginUi& ui) {
     ui.plugins = plugins_scan();
-    // In the game, which of them are running.
+    // In the game, which of them are running, and the anti-aliasing claim each
+    // holds now - one made by aa_claim as well as one its flags declare.
     for (const PluginEntry& loaded : plugins_catalog()) {
         for (PluginEntry& p : ui.plugins) {
             if (p.name != loaded.name) continue;
             p.loaded = !loaded.visitor;  // a visitor is not the player's plugin running
             p.visitor = loaded.visitor;
+            if (!loaded.visitor) p.aa = loaded.aa;
         }
     }
     std::sort(ui.plugins.begin(), ui.plugins.end(), [](const PluginEntry& a, const PluginEntry& b) {
@@ -283,7 +309,7 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
             ImGui::AlignTextToFramePadding();
             ImGui::TextDisabled("%s", p.version.c_str());
         }
-        if (p.official) badge("official", ImVec4(0.37f, 0.89f, 0.67f, 1.0f));
+        if (p.official) badge("公式", ImVec4(0.37f, 0.89f, 0.67f, 1.0f));
         else if (p.bad_signature) badge("署名が一致しないため読み込みません", ImVec4(0.95f, 0.35f, 0.40f, 1.0f));
         else badge("署名なし", ImVec4(0.65f, 0.66f, 0.78f, 1.0f));
         if (p.flags & BB_PLUGIN_GAMEPLAY) badge("ゲーム内容を変更", ImVec4(1.0f, 0.54f, 0.78f, 1.0f));
@@ -291,6 +317,24 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
         if (!p.description.empty()) {
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(p.description.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        // Plugin API 27's anti-aliasing claim (host/plugins.h): its flags', or in game the one it holds now.
+        if (p.aa == kAaTake) {
+            ImGui::PushTextWrapPos(0.0f);
+#if defined(_WIN32)
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), "Does the anti-aliasing itself: while it is on, bbhost's TAA, FSR and DLSS "
+                                                                  "and the game's own anti-aliasing are off, and Graphics > Upscaling says so.");
+#else
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), "Does the anti-aliasing itself: while it is on, bbhost's TAA and DLSS and "
+                                                                  "the game's own anti-aliasing are off, and Graphics > Upscaling says so.");
+#endif
+            ImGui::PopTextWrapPos();
+        }
+        // A plugin it does not work with, both on (host/plugins.h plugins_clash).
+        if (const std::string clash = plugins_clash(ui.plugins, p.name); !clash.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), "%s", clash.c_str());
             ImGui::PopTextWrapPos();
         }
         ImGui::Spacing();
@@ -304,15 +348,33 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
         if (p.visitor && !p.enabled) {
             ImGui::SameLine();
             ImGui::TextDisabled("無効 - 召喚時は他プレイヤーの %s ワールドに参加", p.title.c_str());
-        } else if (ui.in_game && p.enabled != p.loaded) {
+        } else if (ui.in_game && p.enabled != p.loaded && !plugins_live_switch(p)) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), p.enabled ? "次回起動時に有効" : "次回起動時に無効");
         }
-        if (!p.options.empty()) {
+        // A panel's pages (BB_OPT_PANEL) are the plugin's to show over the game.
+        const bool any = std::any_of(p.options.begin(), p.options.end(), [](const PluginOptionDesc& o) { return o.page.empty(); });
+        if (any) {
             ImGui::Spacing();
-            for (const PluginOptionDesc& o : p.options) option_row(ui, p, o, scale);
+            for (const PluginOptionDesc& o : p.options) {
+                if (o.page.empty()) option_row(ui, p, o, scale);
+            }
         } else {
-            ImGui::TextDisabled("設定項目はありません。");
+            ImGui::TextDisabled(p.options.empty() ? "設定項目はありません。" : "設定はゲーム上の専用パネルで変更できます。");
+        }
+        // The menus its table names (BB_OPT_MENU): each opened from here, in
+        // game, over the game as the game's own menus look.
+        if (ui.in_game && p.loaded && p.enabled) {
+            for (const PluginMenuEntry& m : plugin_panel_menus(p.name)) {
+                ImGui::Spacing();
+                if (ImGui::Button(("開く：" + m.name + "##menu-" + m.page).c_str())) {
+                    PluginPanelShow how;
+                    how.page = m.page;
+                    if (plugin_panel_show(p.name, how)) host_options_close();
+                }
+                ImGui::SetItemTooltip("この画面を閉じ、%s の %s を開きます。○ または Escape で閉じます。", p.title.c_str(),
+                                      m.name.c_str());
+            }
         }
     }
     ImGui::EndChild();
@@ -322,7 +384,11 @@ bool plugin_ui_wants_attention() {
     if (config_value("plugins.show_settings") == "true") return true;
     const std::vector<std::string> seen = seen_list();
     for (const PluginEntry& p : plugins_scan()) {
-        if (!p.enabled || p.options.empty()) continue;
+        // Only a plugin the player turned on: one on by default never opens
+        // the window - its settings wait on the Plugins tab and in game for
+        // whoever looks.
+        const std::string sw = config_value(("plugins." + p.name).c_str());
+        if (!p.enabled || p.options.empty() || (sw != "true" && sw != "1")) continue;
         if (std::find(seen.begin(), seen.end(), seen_key(p)) == seen.end()) return true;
     }
     return false;

@@ -1,7 +1,11 @@
 #include "guest_abi.h"
 #include "engine/graphics_patch.h"
+#include "engine/look_math.h"
 
 #include "core/elf.h"
+#include "core/legacy_cpu.h"
+#include "core/legacy_cpu_code.h"
+#include "decomp/insn.h"
 #include "core/memory.h"
 #include "core/thunk.h"
 #include "engine/addr.h"
@@ -10,16 +14,23 @@
 #include "engine/fmod_ring.h"
 #include "engine/sf_text_layout.h"
 #include "engine/frame_rate.h"
+#include "engine/font_handle_set.h"
 #include "engine/live_resolution.h"
+#include "engine/loading.h"
 #include "engine/menu_memory.h"
 #include "engine/sf_heap_probe.h"
 #include "hle/modules.h"
 #include "host/options.h"
+#include "host/plugins.h"
+#include "host/scene_look.h"
 #include "host/settings.h"
+#include "host/shader_patch.h"
+#include "host/upscaler.h"
 #include "host/window.h"
 #include "log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <climits>
 #include <cmath>
@@ -76,7 +87,8 @@ namespace {
 //     a jump to a stub that does the same copy with the amount ANDed with a
 //     mask the host owns: all ones for on, 0 for off. The code is written
 //     once, at load; turning it on or off is one store to the mask.
-//   - Motion blur and depth of field are shader patches (host/shader_patch.h).
+//   - Motion blur is a shader patch (host/shader_patch.h); depth of field is
+//     YEBIS's own switch, cleared in the block each view (kDofEnable below).
 //   - Bloom and vignette are two of the area's draw parameters, changed in the
 //     block the game hands YEBIS each frame - "Draw parameters" below.
 constexpr std::uint64_t kRenderView = 0x269e990;
@@ -91,14 +103,56 @@ const std::uint8_t kCaCopyBytes[] = {0x8b, 0x85, 0x90, 0xf5, 0xff, 0xff, 0x89, 0
 
 std::atomic<std::uint32_t>* g_ca_mask = nullptr;  // in the stub's page
 std::atomic<bool> g_ssao{true}, g_aa{true};
-// Bumped when the SSAO or AA setting changes: each renderer is given the
-// values once a generation (render_view_hook). 0: never changed - the game's.
+// Motion blur's flag (+0x2969) - what draws the velocity map, which an
+// upscaler's or frame generation's motion reads (host/upscale_pass.cpp) - on
+// for a renderer that can blur unless Performance mode takes it and nothing
+// needs the map; and the camera blur's switch (+0x2a10), which HD motion blur
+// turns on (engine/patch_manifest.cpp). Both as the start's manifests made
+// them until a setting changes.
+std::atomic<bool> g_velocity{true}, g_camera_blur{false};
+constexpr std::size_t kVelocityFlag = 0x2969, kCameraBlur = 0x2a10;
+// The resource setup makes the velocity map under either bit (`test ax, 0x420`
+// at 0x26c3d8f); the scene's main renderer has 0x400 alone.
+constexpr std::uint64_t kBlurCapability = 0x420;
+// Screen space reflections' switch (+0x2974): the patched resource setup sets
+// it as it makes the reflections' targets (engine/patch_manifest.cpp ssr), and
+// the scene renderer runs the pass each frame it is on. With the setting off
+// it is cleared every view - the targets stay until the next start.
+constexpr std::size_t kSsrFlag = 0x2974;
+std::atomic<bool> g_ssr_off{false};
+// The dynamic lights' shadows (+0x296e, the constructor's first flag; Kyo's
+// Disable Dynamic Light Shadows patch zeroed its immediate): with Dynamic
+// light shadows off cleared every view, on given back to the renderers it
+// was cleared on (the render thread alone).
+constexpr std::size_t kDynamicShadowFlag = 0x296e;
+std::atomic<bool> g_dyn_shadows_off{false};
+std::uint8_t* g_dyn_cleared[16] = {};
+// Bumped when the SSAO, AA, motion or HD motion blur settings change: each
+// renderer is given the values once a generation (render_view_hook). 0: never
+// changed - the game's.
 std::atomic<std::uint32_t> g_flags_gen{0};
-// The renderers given them, and the generation each was given (render_view_hook,
+// An upscaler that runs - TAA, FSR or DLSS - takes the AA's place: FXAA over
+// its picture, after the tone map, only softened it again. Whether one runs
+// changes with no setting changing - DLSS and FSR are known once the device is
+// up, and a failed evaluate stops them - so each view looks (render_view_hook)
+// and a change bumps g_aa_gen, which gives every renderer its AA flag again.
+// BBHOST_UPSCALE_GAME_AA=1 keeps the AA under FSR and DLSS, as before (TAA
+// alone took it), to compare.
+bool upscaler_takes_aa() {
+    static const bool game_aa = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE_GAME_AA");
+        return e && e[0] == '1';
+    }();
+    const int m = upscaler_method();
+    return game_aa ? m == kUpscaleTaa : m != 0;
+}
+std::atomic<std::uint32_t> g_aa_gen{0};
+std::atomic<bool> g_upscaler_took{false};  // what the last view saw (render_view_hook)
+// The renderers given them, and the generations each was given (render_view_hook,
 // the render thread alone).
 struct GivenRenderer {
     std::uint8_t* renderer;
-    std::uint32_t gen;
+    std::uint32_t gen, aa_gen;
 };
 GivenRenderer g_given[16] = {};
 unsigned g_given_next = 0;
@@ -143,11 +197,14 @@ std::atomic<bool> g_made_any{false};
 // FilmicContrast mostly moves the overall brightness, which the game's own
 // Brightness already does.
 //
-// Nor does motion blur's strength, though "Yebis-MotionBlurScale" (+0x1ec) is
-// right there: at half and at double the area's value the game never fades in
-// from its loading screen (twice at half, three times at double; the glare
-// that eases in as the world starts stays at its first value), while 0, 1x
-// and 1.4x load normally. Motion blur keeps its on/off setting.
+// Nor does motion blur's strength - and +0x1ec, once taken here for
+// "Yebis-MotionBlurScale", is not it: it is an int, the blur's sample count
+// (4 in Central Yharnam), the first integer the apply hands the blur's
+// parameters (ppfx_sub_fb38f0). Scaled there as a float, to half and to
+// double, the game never faded in from its loading screen (twice at half,
+// three times at double; the glare that eases in as the world starts stayed
+// at its first value), while 0, 1x and 1.4x loaded normally. Motion blur
+// keeps its on/off setting.
 constexpr std::uint64_t kYebisRecord = 0x25d4860;
 // push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x28; mov r13, r9
 const std::uint8_t kYebisRecordPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
@@ -155,9 +212,108 @@ const std::uint8_t kYebisRecordPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57,
 constexpr std::uint64_t kPostBlock = 0x59406e0;
 constexpr std::size_t kSaturation = 0xc8, kVignettePower = 0xd0, kGlareLuminance = 0xdc;
 constexpr std::size_t kYebisHeld = 0x2710;  // on the YEBIS object: the block was not refreshed
+// Depth of field's switch: the block's +0x1ac, the area's "Yebis-DepthOfField:
+// Enable", which the game copies in every view (0x25d541e). The flip pass
+// (0x25d5f80) hands it to YEBIS's own enable at 0x25d7a98 (ppfx_sub_fb2960:
+// the effect's +0x940) and skips the depth of field's parameters on 0 (the
+// je at 0x25d7bbc). With the enable 0, YEBIS's effective switch (+0xc4b, set
+// in sub_fdb120 from +0x940) stays 0 and the effect chain never calls its
+// depth of field (sub_fe6c60, from 0xfec146/0xfec519 only while +0xc4b is
+// set): no circle of confusion, downsample, aperture-filter levels or
+// composite - the single-level one (d3ca03f3+111fce32) the world's faint far
+// blur uses at 1080p, the multi-level ones (+6e2d87e3, +8fcc561d, +b9167b53:
+// a smaller picture, the cutscenes, a strong blur). A 1 the next view copies
+// in turns it back on, with its parameters fed again from that view.
+constexpr std::size_t kDofEnable = 0x1ac;
 std::uint8_t* g_post_block = nullptr;
 std::atomic<float> g_bloom{1.0f}, g_saturation{1.0f};
-std::atomic<bool> g_vignette{true};
+std::atomic<bool> g_vignette{true}, g_dof{true};
+
+// A plugin's look (plugin API 29's post_look, graphics_look_set): the fields
+// it writes in the block, each a 4-byte cell, as YEBIS's apply (sub_25d5f80)
+// hands them to the post effect's setters (decomp/yebis/ppfx_setters.cpp):
+//
+//   +0x50  auto exposure on; +0x54 its middle grey (0..1: what the eye
+//          adaptation brings the scene's luminance to;
+//          SetAutoExposureMiddleGray)
+//   +0x98  the exposure while auto exposure is off (with it on, the apply
+//          writes the adapted one there itself); +0x9c gamma (both
+//          SetTonemapParameters)
+//   +0xc8  saturation, +0xcc value ("Yebis-ColorS", "-ColorV"), +0x248
+//          contrast ("-Contrust"): colour-matrix multiplies, skipped at 1
+//   +0xd0  the vignette's power (ppfx_sub_fb3670, with +0xd4)
+//   +0xac  chromatic aberration on (1.0 where an area's lens has it -
+//          Central Yharnam's has not; SetChromaticAberrationEnable),
+//          +0xb4/+0xb8 its lateral and +0xbc/+0xc0 its uniform dispersion
+//   +0x1ac depth of field on (the cmp before the je at 0x25d7bbc), +0x188
+//          its auto focus (0: the focus distance below), +0x1b0 the focus
+//          distance, +0x1b4 the aperture (an f-number), +0x1d0 and +0x1d4 the
+//          blur's levels in front of and behind the focus
+//   +0x1dc motion blur on (SetMotionBlurEnable), +0x1e4 and +0x1e8 its two
+//          times, +0x1ec its sample count (an int, "NumBaseSamples"), +0x204
+//          its samples interleaved (a byte, "SampleInterleaved"), +0x350 what
+//          the apply multiplies +0x1e8 by into the camera blur's amount
+//
+// The sample count has a ceiling the post effect does not check. YEBIS builds
+// each motion blur technique for 1 to 8 samples only (sub_10183a0 loads
+// tech_MotionBlur*_S1..S8, eight 0x58-byte rows of a table, and the
+// techniques' tables lie back to back) and asserts fewer than 9 where the
+// count is set (SetRecursiveBlurBaseSamples, 0x1020770); its passes index the
+// tables by the count (0x1033e6e, 0x1034916) - past 8, rows of the next
+// technique's table, or past the last one - so a larger count draws with
+// shaders that are not the blur's: the picture stopped from 10 samples on, and
+// a float written there as a test once kept the game from fading in. 1 and
+// below are taken as YEBIS's own 4 or 5. Interleaved sampling makes the count
+// odd and its absence even (0x1034916, GetEffectiveRecursiveBlurBaseSamples at
+// 0x1031370), so 8 interleaved is 9: a look's count is kept to 2..8, and to 7
+// where the area interleaves.
+//
+// The areas' depth of field is not the lens above but the game's own table:
+// each view the apply (the loop at 0x25d9760) fills 2048 floats at the YEBIS
+// object's +0xd0, entry i the blur at device depth i/2047 (the last two at
+// depth 1), which CustomDofLutCopy.cpo copies to the texture the CoC pass
+// reads depth through. An entry is the lens's circle of confusion at that
+// depth (sub_fb2dc0 0 -> 3: the focus and aperture above), negative in front
+// of the focus - unless +0x2d4 (the custom near ramp on) puts a ramp over
+// +0x2dc..+0x2e0 m there, strength +0x2e4, or +0x2d8 (the custom far ramp on)
+// one past +0x2ec..+0x2f0 m, strength +0x2f4; then a negative entry times
+// +0x2e8, a positive one times +0x2f8, and 0 past +0x2fc m. Every main area
+// has both ramps on (its GPARAM's CustomDof), so the lens's numbers never
+// reach the table there. With Central Yharnam's own levels (+0x1d0 0 in
+// front, +0x1d4 1 behind) YEBIS composites by clamp(k * CoC + b) (111fce32),
+// which never blends a negative circle; with a look's 7 and 7 it takes its
+// multi-level path (6e2d87e3), whose near levels blur what is in front.
+constexpr std::size_t kDofCustomNear = 0x2d4, kDofCustomFar = 0x2d8, kDofNearScale = 0x2e8, kDofFarScale = 0x2f8,
+                      kDofCut = 0x2fc;
+// The ramps themselves (the debug menu's DofNearDepthStart, DofNearDepthEnd,
+// DofNear CocSize; DofFarDepthStart, DofFarDepthEnd, DofFar CocSize), and the
+// table's own switch, "CustomDof-Enable" (+0x2d0: the apply hands it to
+// sub_fb3600, and with it 0 YEBIS works the lens's circle out itself).
+constexpr std::size_t kDofCustom = 0x2d0, kDofNearStart = 0x2dc, kDofNearEnd = 0x2e0, kDofNearSize = 0x2e4, kDofFarStart = 0x2ec,
+                      kDofFarEnd = 0x2f0, kDofFarSize = 0x2f4;
+// BBHOST_DOF_COC_SCALE=k: a range's circles of confusion times k, to see
+// what a strength looks like at another size.
+const float g_dof_coc_scale = [] {
+    const char* e = std::getenv("BBHOST_DOF_COC_SCALE");
+    const float k = e && *e ? std::strtof(e, nullptr) : 1.0f;
+    return k > 0.0f && k < 1000.0f ? k : 1.0f;
+}();
+// A range's lens (apply_look says why): focused at 1 m, f/0.01.
+constexpr float kDofRangeFocus = 1.0f, kDofRangeAperture = 0.01f;
+constexpr std::size_t kDofTable = 0xd0;  // on the YEBIS object: 2048 floats
+constexpr std::size_t kAutoExposure = 0x50, kMiddleGrey = 0x54, kExposure = 0x98, kGamma = 0x9c, kValue = 0xcc,
+                      kContrast = 0x248;
+constexpr std::size_t kAberration = 0xac, kAberrationDispersion = 0xb4;
+// kDofOn is the setting's switch (kDofEnable): the look writes it after the
+// setting's Off has cleared it, so the look's depth of field wins either way.
+constexpr std::size_t kDofAuto = 0x188, kDofOn = kDofEnable, kDofFocus = 0x1b0, kDofAperture = 0x1b4, kDofNear = 0x1d0,
+                      kDofFar = 0x1d4;
+constexpr std::size_t kBlurOn = 0x1dc, kBlurTime = 0x1e4, kBlurLength = 0x1e8, kBlurSamples = 0x1ec, kBlurInterleaved = 0x204,
+                      kBlurScale = 0x350;
+std::mutex g_look_mu;
+GraphicsLook g_look;                       // under g_look_mu
+std::atomic<std::uint32_t> g_look_set{0};  // its groups: one load a view while there is none
+std::atomic<bool> g_look_logged{true};     // the area's own values logged since the look changed
 
 // Ambient occlusion strength. The SSAO bank (+0x5968) is blended the same way
 // (sub_1285500, into a 0x6c-byte block) and copied into the SSAO object the
@@ -373,6 +529,226 @@ void motion_blur_apply(bool on) {
     host_log("graphics: motion blur %s (its velocity pass %s)", on ? "on" : "off", on ? "runs" : "skipped at the graphics manager's switch");
 }
 
+// [Ssr] Fade To Viewer Param, the graphics manager's +0x7680: what the ssr
+// manifest writes into the manager's constructor (-10000 over -0.8), written
+// into the live manager when the manifest goes in while the game runs.
+constexpr std::size_t kSsrFadeToViewer = 0x7680;
+}  // namespace
+
+void graphics_ssr_live_in() {
+    std::uint64_t gm = 0;
+    if (g_velocity_slide)
+        std::memcpy(&gm, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_velocity_slide + (kGraphicsManagerOfBlur - kPreferredGuestSlide))), 8);
+    if (!gm) return;
+    const float fade = -10000.0f;
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(gm + kSsrFadeToViewer)), &fade, sizeof(fade));
+    host_log("graphics: screen space reflections' fade to viewer %g in the graphics manager", static_cast<double>(fade));
+}
+
+namespace {
+
+// Text scale. The menus map their font, MenuFont_01, through Scaleform's
+// FontMap::MapFont(map, name, new name, flags, scale) (0x40c240, called at
+// 0x235cd2d with the scale loaded from 0x4d2913c, 1.0 - what Kyo's "50% Text
+// scale" patch set to 0.5). MapFont keeps the scale in the map's entry for
+// the name, and the font manager reads it from there as a movie makes its
+// font handles. So the hook scales the argument as the font is mapped and
+// keeps the map; a change later rewrites the entry's scale (font_map_write),
+// which a menu window takes when it is made again and the HUD at a loading
+// screen or the title - the font handles a movie already made keep theirs.
+// The map's hash (0x278aa10 reads it): *(map + 0x10) -> {table}; the table
+// {count, size mask, entries[mask + 1]}, an entry 40 bytes - next (-2 empty),
+// hash, key String, then the value: name String, float scale (+0x20), flags.
+// A String is a pointer (low two bits flags) to {size, refs, UTF-8 at +0xc}.
+constexpr std::uint64_t kMapFont = 0x40c240;
+// push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x48
+const std::uint8_t kMapFontPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                         0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x48};
+constexpr std::uint64_t kMenuFontScale = 0x4d2913c;  // the scale MapFont is called with (no hook: written once)
+std::atomic<float> g_text_scale{1.0f};               // the setting, 0.5 to 1.0
+std::mutex g_font_map_mu;
+std::uint64_t g_font_map = 0, g_font_map_vtable = 0;  // the map that holds MenuFont_01 (under g_font_map_mu)
+float g_font_base = 1.0f;                             // the scale the game mapped it with (a patch's, if one wrote it)
+
+std::uint64_t guest_u64(std::uint64_t a) { return *reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(a)); }
+
+// The MenuFont_01 entry's scale set to the base times `k`, in the map the
+// hook kept - if that map is still one (its vtable). False if not found.
+bool font_map_write(float k) {
+    if (!g_font_map || guest_u64(g_font_map) != g_font_map_vtable) return false;
+    const std::uint64_t hash = guest_u64(g_font_map + 0x10), table = hash ? guest_u64(hash) : 0;
+    if (!table) return false;
+    const std::uint64_t mask = guest_u64(table + 8);
+    if (mask > 0xffff) return false;
+    for (std::uint64_t i = 0; i <= mask; ++i) {
+        const std::uint64_t e = table + 0x10 + i * 40;
+        if (static_cast<std::int64_t>(guest_u64(e)) == -2) continue;
+        const std::uint64_t key = guest_u64(e + 0x10) & ~3ull;
+        if (!key || (guest_u64(key) & 0x7fffffffffffffffull) != 11 ||
+            std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(key + 0xc)), "MenuFont_01", 11) != 0)
+            continue;
+        auto* scale = reinterpret_cast<float*>(static_cast<std::uintptr_t>(e + 0x20));
+        const float want = g_font_base * k;
+        if (*scale != want) {
+            host_log("graphics: text scale %g -> %g (MenuFont_01)", static_cast<double>(*scale), static_cast<double>(want));
+            *scale = want;
+        }
+        return true;
+    }
+    return false;
+}
+
+// A change while the game runs is written only with the font-handle set's
+// removal fixed as well (font_set_remove_hook, text_scale_install); without it
+// the setting takes effect at the next start.
+std::atomic<bool> g_text_scale_live{false};
+
+void text_scale_set(float k) {
+    k = std::clamp(k, 0.5f, 1.0f);
+    g_text_scale.store(k);
+    if (!g_text_scale_live.load()) return;
+    std::lock_guard<std::mutex> lk(g_font_map_mu);
+    if (g_font_map && !font_map_write(k)) host_log("graphics: text scale %g: MenuFont_01's mapping is gone", static_cast<double>(k));
+}
+
+// FontMap::MapFont's entry: the map in rdi, the name (UTF-16) in rsi, the
+// scale in xmm0.
+GUEST_ABI std::int64_t map_font_hook(std::uint64_t, const std::uint64_t* saved) {
+    const auto* name = reinterpret_cast<const char16_t*>(static_cast<std::uintptr_t>(saved[4]));
+    static const char16_t kName[] = u"MenuFont_01";
+    if (!name || !saved[5]) return 0;
+    for (std::size_t i = 0; i < sizeof(kName) / sizeof(kName[0]); ++i)
+        if (name[i] != kName[i]) return 0;  // stops at the first difference, a shorter name's end included
+    auto* scale = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(saved) - 136);  // xmm0
+    std::lock_guard<std::mutex> lk(g_font_map_mu);
+    g_font_base = *scale;
+    g_font_map = saved[5];
+    g_font_map_vtable = guest_u64(saved[5]);
+    const float k = g_text_scale.load();
+    *scale = g_font_base * k;
+    // A second mapping of the name keeps the first entry (MapFont adds only
+    // a new one): that entry gets the scale too.
+    font_map_write(k);
+    host_log("graphics: MenuFont_01 mapped at %g (the game's %g, text scale %g)", static_cast<double>(*scale),
+             static_cast<double>(g_font_base), static_cast<double>(k));
+    return 0;
+}
+
+// Scaleform's FontManager keeps the font handles its movie made in a set keyed
+// by font name and flags (CreatedFonts), and every removal from it goes
+// through one function, HashSet RemoveAlt (0x27d6a80: from the FontHandle
+// destructor 0x27d6ca0, RemoveFontHandle 0x4fbaa0 and FindOrCreateHandle
+// 0x4fbaf0). FindOrCreateHandle reuses a handle only at the scale the font map
+// asks for (the handle's +0x28); at another it makes a new handle with the
+// same font, name and flags and adds it at its chain's head (0x27d6250) - two
+// entries with one key. The stock game never maps a font at two scales; Text
+// scale changed while the game runs does (font_map_write): a movie made before
+// the change - the HUD's - makes MenuFont_01's new handle beside its old one.
+// RemoveAlt takes the first entry of the chain that is the handle OR has its
+// name and flags, so freeing the old handle unlinked the new one's entry and
+// left the freed handle's in the set, read by the next lookup: a crash at
+// 0x27d69f1 (sub_27d6980) as the Hunter's Dream's cutscene ended, 2 of 2 after
+// a live change. This hook removes the entry that holds the handle itself
+// (engine/font_handle_set.h), as RemoveAlt unlinks one, and leaves every other
+// call - a key no entry holds - to the game's RemoveAlt, so the stock game,
+// whose sets never hold two entries of one key, removes exactly as before.
+constexpr std::uint64_t kFontSetRemove = 0x27d6a80;
+// push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x18
+const std::uint8_t kFontSetRemovePrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                               0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
+
+// BBHOST_FONT_SET_TRACE=1 (a test): each removal through the hook that the
+// game's matching would have made differently - another entry of the chain
+// holding the handle's name and flags - logged with the set's count, and the
+// largest count such a set reached.
+bool font_trace_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_FONT_SET_TRACE");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+std::uint32_t font_handle_flags(std::uint64_t h) {
+    std::uint32_t f = 0, g = 0;
+    std::memcpy(&f, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(h + 0x18)), 4);
+    if (const std::uint64_t font = guest_u64(h + 0x30))
+        std::memcpy(&g, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(font + 0x18)), 4);
+    return f | g;
+}
+// The handle's own name (+0x20, a String: low two bits flags, UTF-8 at +0xc), or
+// null where the name is its font's (RemoveAlt asks the font then).
+const char* font_handle_name(std::uint64_t h) {
+    const std::uint64_t s = guest_u64(h + 0x20) & ~3ull;
+    if (!s || (guest_u64(s) & 0x7fffffffffffffffull) == 0) return nullptr;
+    return reinterpret_cast<const char*>(static_cast<std::uintptr_t>(s + 0xc));
+}
+bool font_names_same(const char* a, const char* b) {
+    for (;; ++a, ++b) {
+        const char x = static_cast<char>((*a >= 'A' && *a <= 'Z') ? *a + 32 : *a), y = static_cast<char>((*b >= 'A' && *b <= 'Z') ? *b + 32 : *b);
+        if (x != y) return false;
+        if (!x) return true;
+    }
+}
+void font_trace(std::uint64_t table, std::uint64_t handle) {
+    const std::uint64_t count = guest_u64(table), mask = guest_u64(table + 8);
+    if (mask > 0xffff) return;
+    const char* name = font_handle_name(handle);
+    const std::uint32_t flags = font_handle_flags(handle);
+    int same = 0;
+    for (std::uint64_t i = 0; i <= mask; ++i) {
+        const std::uint64_t e = table + 16 + i * 32;
+        const std::uint64_t h = guest_u64(e + 16);
+        if (static_cast<std::int64_t>(guest_u64(e)) == -2 || h == handle || !name) continue;
+        const char* other = font_handle_name(h);
+        if (other && ((font_handle_flags(h) ^ flags) & 0x313) == 0 && font_names_same(name, other)) ++same;
+    }
+    static std::atomic<std::uint64_t> most{0};
+    static std::atomic<int> logs{0};
+    if (!same) return;
+    std::uint64_t was = most.load();
+    while (count > was && !most.compare_exchange_weak(was, count)) {
+    }
+    if (logs.fetch_add(1) < 64)
+        host_log("graphics: font set: %s's handle 0x%llx removed by itself, %d more of its name in the set (%llu handles; the most "
+                 "such a set held %llu)",
+                 name ? name : "?", static_cast<unsigned long long>(handle), same, static_cast<unsigned long long>(count),
+                 static_cast<unsigned long long>(most.load()));
+}
+
+// HashSet RemoveAlt's entry: the set in rdi (its table pointer first), a
+// pointer to the FontHandle* in rsi. Returns what RemoveAlt returns (1:
+// removed) when it removed the entry itself.
+GUEST_ABI std::int64_t font_set_remove_hook(std::uint64_t, const std::uint64_t* saved) {
+    const std::uint64_t set = saved[5], key = saved[4];
+    const std::uint64_t table = set ? guest_u64(set) : 0, handle = key ? guest_u64(key) : 0;
+    if (!table || !handle) return 0;
+    if (font_trace_on()) font_trace(table, handle);
+    if (!font_set_remove_handle(reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(table)), handle)) return 0;
+    const_cast<std::uint64_t*>(saved)[-1] = 1;
+    return 1;
+}
+
+}  // namespace
+
+namespace {
+
+// Motion blur's velocity switch (motion_blur_apply): the setting's, unless a
+// plugin's look sets motion blur on or off (graphics_look_set). Called from
+// the settings' thread and the look's, one at a time.
+std::atomic<bool> g_blur_setting{true};
+std::atomic<int> g_blur_look{-1};
+void blur_update() {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    static bool was = true;  // the constructor's own
+    const int look = g_blur_look.load(std::memory_order_relaxed);
+    const bool want = look >= 0 ? look != 0 : g_blur_setting.load(std::memory_order_relaxed);
+    if (want != was) {
+        was = want;
+        motion_blur_apply(want);
+    }
+}
+
 // The settings' listener (host_settings_listen, from live_install): told each
 // change once, on the thread that made it (the store calls its listeners one
 // at a time), it keeps the values the hooks below apply - the hooks read these
@@ -389,24 +765,46 @@ void settings_changed(const HostSettings& hs) {
     // first view when the file asks for other than the game's own
     // (render_view_hook); never while they are the game's.
     static bool ssao_was = true, aa_was = true;
-    if (hs.ssao != ssao_was || hs.anti_alias != aa_was) {
-        ssao_was = hs.ssao;
-        aa_was = hs.anti_alias;
-        g_ssao.store(hs.ssao);
-        g_aa.store(hs.anti_alias);
+    // The velocity map and the camera blur as the start's manifests left them
+    // (performance-mode, hd-motion-blur), followed once one of these changes.
+    static const bool velocity_start = host_opt_motion_wanted() || !hs.performance_mode, camera_blur_start = hs.hd_motion_blur;
+    static bool velocity_was = velocity_start, camera_blur_was = camera_blur_start;
+    const bool velocity = host_opt_motion_wanted() || !hs.performance_mode;
+    // A plugin's 3D brought up nearest (host/scene_look.h, the Bloodborne PS1's):
+    // the AA (FXAA, after YEBIS's copy at the output size) would smooth its
+    // pixels again, so it is off while it is.
+    // Performance mode clears both (its patch's constructor writes until
+    // 2026-11-05), and with it on or off while the game runs they follow.
+    // A plugin's own anti-aliasing takes the AA's place (plugin API 27,
+    // host/plugins.h: aa_claim's BB_AA_TAKE), and so does an upscaler that runs
+    // (upscaler_takes_aa, applied each view).
+    const bool aa = hs.anti_alias && !scene_look_scale() && !hs.performance_mode && plugins_aa_claim() != kAaTake;
+    const bool ssao = hs.ssao && !hs.performance_mode;
+    if (ssao != ssao_was || aa != aa_was || velocity != velocity_was || hs.hd_motion_blur != camera_blur_was) {
+        ssao_was = ssao;
+        aa_was = aa;
+        velocity_was = velocity;
+        camera_blur_was = hs.hd_motion_blur;
+        g_ssao.store(ssao);
+        g_aa.store(aa);
+        g_velocity.store(velocity);
+        g_camera_blur.store(hs.hd_motion_blur);
         g_flags_gen.fetch_add(1, std::memory_order_release);
     }
-    static bool blur_was = true;
-    if (hs.motion_blur != blur_was) {
-        blur_was = hs.motion_blur;
-        motion_blur_apply(hs.motion_blur);
-    }
+    g_ssr_off.store(!hs.ssr, std::memory_order_relaxed);
+    text_scale_set(hs.text_scale);
+    g_dyn_shadows_off.store(!hs.dynamic_shadows || hs.performance_mode, std::memory_order_relaxed);
+    // Performance mode's blur off (its velocity map kept for the upscaler).
+    // Rebuilt motion vectors hold what the blur cannot read: it goes too.
+    g_blur_setting.store(hs.motion_blur && !hs.performance_mode && !host_opt_motion_rebuilt_bits());
+    blur_update();
     set_chromatic_aberration(hs.chromatic_aberration && !hs.performance_mode);
     g_bloom.store(hs.bloom);
     g_saturation.store(hs.saturation);
     g_fog.store(hs.fog);
     g_ao_strength.store(hs.ao_strength);
     g_vignette.store(hs.vignette);
+    g_dof.store(hs.depth_of_field);
     g_motion_blur.store(hs.motion_blur);
     if (!g_lod_bias_env) g_lod_bias.store(hs.lod_bias);
     g_shadow_scale.store(hs.shadow_scale > 1.0f ? hs.shadow_scale
@@ -553,9 +951,328 @@ void log_glare(float glare, float power, float bloom, bool vignette) {
     l.skipped = skipped;
 }
 
+int yebis_dof_ready();  // below, beside the slide they read
+int yebis_dof_on();
+
+// A plugin's look over this view's block (graphics_look_set), after the
+// settings: the area's numbers times its factors, or its own where it sets
+// them.
+void apply_look(std::uint8_t* b) {
+    GraphicsLook l;
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        l = g_look;
+    }
+    const auto getf = [b](std::size_t at) {
+        float v = 0;
+        std::memcpy(&v, b + at, 4);
+        return v;
+    };
+    const auto geti = [b](std::size_t at) {
+        std::int32_t v = 0;
+        std::memcpy(&v, b + at, 4);
+        return v;
+    };
+    const auto setf = [b](std::size_t at, float v) { std::memcpy(b + at, &v, 4); };
+    const auto seti = [b](std::size_t at, std::int32_t v) { std::memcpy(b + at, &v, 4); };
+    if (!g_look_logged.exchange(true)) {
+        host_log("graphics: a look over the area's exposure %g (auto %d, middle grey %g), gamma %g, saturation %g, value %g, "
+                 "contrast %g, vignette %g; aberration %g (%g %g, %g %g); depth of field %d (auto focus %d, focus %g, aperture "
+                 "%g, levels %d %d; its table %d, custom near %d (%g..%g m, size %g) far %d (%g..%g m, size %g), scales %g %g, "
+                 "cut past %g m; the post effect's part %d, on %d); motion blur %d (%g %g, %d samples%s, scale %g)",
+                 getf(kExposure), geti(kAutoExposure), getf(kMiddleGrey), getf(kGamma), getf(kSaturation), getf(kValue),
+                 getf(kContrast), getf(kVignettePower), getf(kAberration), getf(kAberrationDispersion),
+                 getf(kAberrationDispersion + 4), getf(kAberrationDispersion + 8), getf(kAberrationDispersion + 12),
+                 geti(kDofOn), geti(kDofAuto), getf(kDofFocus), getf(kDofAperture), geti(kDofNear), geti(kDofFar),
+                 geti(kDofCustom), geti(kDofCustomNear), getf(kDofNearStart), getf(kDofNearEnd), getf(kDofNearSize),
+                 geti(kDofCustomFar), getf(kDofFarStart), getf(kDofFarEnd), getf(kDofFarSize), getf(kDofNearScale),
+                 getf(kDofFarScale), getf(kDofCut), yebis_dof_ready(), yebis_dof_on(), geti(kBlurOn), getf(kBlurTime),
+                 getf(kBlurLength), geti(kBlurSamples), b[kBlurInterleaved] ? ", interleaved" : "", getf(kBlurScale));
+    }
+    if (l.set & kLookTone) {
+        // The exposure: the adapted one's target with auto exposure on (the
+        // middle grey, which SetAutoExposureMiddleGray keeps inside 0..1),
+        // the fixed one with it off.
+        if (geti(kAutoExposure) != 0)
+            setf(kMiddleGrey, std::clamp(getf(kMiddleGrey) * l.exposure, 0.001f, 0.999f));
+        else
+            setf(kExposure, getf(kExposure) * l.exposure);
+        setf(kGamma, getf(kGamma) * l.gamma);
+        setf(kSaturation, getf(kSaturation) * l.saturation);
+        setf(kValue, getf(kValue) * l.brightness);
+        setf(kContrast, getf(kContrast) * l.contrast);
+    }
+    if (l.set & kLookVignette) setf(kVignettePower, l.vignette);
+    if (l.set & kLookAberration) {
+        setf(kAberration, l.aberration ? 1.0f : 0.0f);
+        setf(kAberrationDispersion, l.lateral[0]);
+        setf(kAberrationDispersion + 4, l.lateral[1]);
+        setf(kAberrationDispersion + 8, l.uniform[0]);
+        setf(kAberrationDispersion + 12, l.uniform[1]);
+    }
+    if (l.set & kLookDof) {
+        seti(kDofOn, l.dof ? 1 : 0);
+        if (l.dof) {
+            seti(kDofAuto, 0);
+            setf(kDofFocus, l.dof_focus);
+            setf(kDofAperture, l.dof_aperture);
+            seti(kDofNear, l.dof_near_levels);
+            seti(kDofFar, l.dof_far_levels);
+            // The table from the lens instead of the area's ramps, every
+            // entry kept (nothing cut by distance) and as the lens gives it:
+            // negative in front of the focus, which the multi-level path's
+            // near levels blur at any focus distance (0 without blur in
+            // front), positive behind it (0 without blur behind). Turned to
+            // count as what is behind, the front went to the far side's
+            // levels, which YEBIS counts by the circle at the far end
+            // (0x1068b60) - none from a focus of about 50 m on, and no front
+            // blur with them. The block is the area's again at the next view
+            // without the look.
+            seti(kDofCustomNear, 0);
+            seti(kDofCustomFar, 0);
+            setf(kDofNearScale, l.dof_near_levels > 0 ? 1.0f : 0.0f);
+            setf(kDofFarScale, l.dof_far_levels > 0 ? 1.0f : 0.0f);
+            setf(kDofCut, 1.0e9f);
+            if (l.set & kLookDofRange) {
+                // By distance instead: the game's own ramps, placed where the
+                // look says, the near one always on so that the lens never
+                // reaches the table - sharp between them, each side's blur as
+                // strong as its levels (engine/look_math.h).
+                const look_math::DofRange r = look_math::dof_range(l.dof_near_end, l.dof_far_start, l.dof_near_fade,
+                                                                   l.dof_far_fade, l.dof_near_levels, l.dof_far_levels,
+                                                                   g_dof_coc_scale);
+                seti(kDofCustom, 1);
+                seti(kDofCustomNear, r.near_on);
+                setf(kDofNearStart, r.near_start);
+                setf(kDofNearEnd, r.near_end);
+                setf(kDofNearSize, r.near_size);
+                setf(kDofNearScale, r.near_scale);
+                seti(kDofCustomFar, r.far_on);
+                setf(kDofFarStart, r.far_start);
+                setf(kDofFarEnd, r.far_end);
+                setf(kDofFarSize, r.far_size);
+                setf(kDofFarScale, r.far_scale);
+                setf(kDofCut, r.cut);
+                seti(kDofNear, r.near_levels);
+                seti(kDofFar, r.far_levels);
+                // The lens only counts the levels here: YEBIS draws a side
+                // with as many levels as the lens's circle at that side's end
+                // of the view reaches (0x1068b60; behind, the circle at the
+                // far clip from the focus and the aperture), while the table
+                // sets each pixel's blur. Focused at the far end of the sharp
+                // range at f/5.6, that circle reached no level and nothing
+                // behind was blurred; focused near and wide open it reaches
+                // every level on both sides, so the counts above are the
+                // levels drawn.
+                setf(kDofFocus, kDofRangeFocus);
+                setf(kDofAperture, kDofRangeAperture);
+            }
+        }
+    }
+    if (l.set & kLookMotionBlur) {
+        seti(kBlurOn, l.motion_blur ? 1 : 0);
+        if (l.motion_blur) {
+            setf(kBlurTime, l.blur_time);
+            setf(kBlurLength, l.blur_length);
+            seti(kBlurSamples, look_math::blur_samples(l.blur_samples, b[kBlurInterleaved] != 0));
+            setf(kBlurScale, l.blur_scale);
+        }
+    }
+}
+
+// BBHOST_DOF_TABLE_LOG=1: the depth of field's table as the last view's apply
+// filled it (the YEBIS object's +0xd0), a hash and its range each time it
+// changes - the area's table before a look's depth of field and after it is
+// byte for byte the same.
+void log_dof_table(const std::uint8_t* yebis) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_DOF_TABLE_LOG");
+        return e && e[0] == '1';
+    }();
+    if (!on) return;
+    std::uint64_t h = 1469598103934665603ull;
+    float lo = 0, hi = 0;
+    int neg = 0, pos = 0;
+    for (int i = 0; i < 2048; ++i) {
+        std::uint32_t u = 0;
+        std::memcpy(&u, yebis + kDofTable + i * 4, 4);
+        h = (h ^ u) * 1099511628211ull;
+        float v = 0;
+        std::memcpy(&v, &u, 4);
+        lo = i ? std::min(lo, v) : v;
+        hi = i ? std::max(hi, v) : v;
+        neg += v < 0.0f;
+        pos += v > 0.0f;
+    }
+    static std::uint64_t last = 0;
+    if (h == last) return;
+    last = h;
+    float at[6] = {};
+    const int idx[6] = {1024, 1945, 2013, 2037, 2045, 2047};  // ~0.1, 1, 3, 10, 50 m and depth 1
+    for (int i = 0; i < 6; ++i) std::memcpy(&at[i], yebis + kDofTable + idx[i] * 4, 4);
+    host_log("graphics: the depth of field's table %016llx: %d entries < 0, %d > 0, %g..%g; at 1024 %g, 1945 %g, 2013 %g, 2037 %g, "
+             "2045 %g, 2047 %g",
+             static_cast<unsigned long long>(h), neg, pos, static_cast<double>(lo), static_cast<double>(hi), static_cast<double>(at[0]),
+             static_cast<double>(at[1]), static_cast<double>(at[2]), static_cast<double>(at[3]), static_cast<double>(at[4]),
+             static_cast<double>(at[5]));
+}
+
+// Depth of field's blend at the 1080-line look, at any Resolution. YEBIS
+// blends a level's blurred image in by t = clamp(k * CoC + b): for the first
+// level k = s / (1.25 r0 - 0.25 r0) and b = -0.25 r0 / (1.25 r0 - 0.25 r0) =
+// -0.250125 (sub_1055af0, from the level's radius r0 in pixels and s, the
+// circle of confusion's size in pixels, which grows with the height: k is
+// 0.291 at 360 lines, 0.874 at 1080, 1.747 at 2160). The circle is the same
+// share of the picture at every size, and a level's blur is a fixed number
+// of pixels in a target a fixed share of the picture's size, so on the screen
+// it is a smaller blur the larger the picture: the look stays the same only if
+// t grows with the height. k * CoC does, b does not - so the areas' faint far
+// blur faded below 1080 lines (none at 640x360, two thirds of it at 720p) and
+// came out up to 18% stronger above (1440p; t clamps at 1 by 2160p). With b
+// times height / 1080, t = (height / 1080) * its 1080-line value for every
+// circle: the 1080-line look at every size.
+// Where: CDepthOfField's aperture-filter levels (sub_1068b60, called only from
+// its ApplyDepthOfField right after sub_1055af0 writes the levels' factors
+// afresh), each level's two (k, b) pairs - behind the focus at +0xd0/+0xd4,
+// in front at +0xd8/+0xdc of the level's 0x108 bytes, the array at the
+// object's +0x470, the count at +0xc0 - which the level choice and the
+// composites' constants read after it. Once a call, from values written that
+// call: nothing compounds. Only the world's view: the source's height (its
+// +0x54) is the picture's - a menu's preview keeps its look - and no Remo
+// cutscene runs (a cutscene's blur stays as YEBIS draws it), and only on a
+// side drawn with one level (below). Nothing at 1080 lines, and with Depth of
+// field off YEBIS never calls the function. With an upscaler the height is
+// the picture's, the one YEBIS works at: the blend is the native size's, and
+// what the upscaler's picture lacks before the blur is the upscaler's.
+constexpr std::uint64_t kDofLevels = 0x1068b60;
+// push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x148
+const std::uint8_t kDofLevelsPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                           0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x48, 0x01, 0x00, 0x00};
+constexpr std::size_t kDofLevelCount = 0xc0, kDofLevelArray = 0x470, kDofLevelSize = 0x108;
+constexpr std::size_t kDofLevelFarB = 0xd4, kDofLevelNearB = 0xdc, kGpuTextureHeight = 0x54;
+
+// BBHOST_DOF_1080_LOOK=0 (a test): the blend as YEBIS has it at every size.
+const bool g_dof_1080_look = [] {
+    const char* e = std::getenv("BBHOST_DOF_1080_LOOK");
+    return !(e && e[0] == '0');
+}();
+
+// BBHOST_DOF_TRACE=1 (a test): the levels YEBIS drew each side with at its
+// last call (in front, behind) and what it counted them from - the lens's
+// circle at infinity (+0x1b0, as a share of the picture), its focus, the
+// view's clip distances and each level's threshold, the circle at which it
+// starts (-b/k of its pair, unscaled) - said each time they change.
+constexpr std::size_t kDofObjNearClip = 0x15c, kDofObjFarClip = 0x160, kDofObjFocus = 0x17c, kDofObjCoc = 0x1b0,
+                      kDofObjCaps = 0x1c4, kDofObjCounted = 0x1d8, kDofObjDrawn = 0x1e0, kDofLevelFarK = 0xd0,
+                      kDofLevelNearK = 0xd8;
+const bool g_dof_trace = [] {
+    const char* e = std::getenv("BBHOST_DOF_TRACE");
+    return e && e[0] == '1';
+}();
+
+void trace_dof_levels(std::uint64_t dof) {
+    const auto* o = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(dof));
+    float near_clip = 0, far_clip = 0, focus = 0, coc = 0;
+    std::int32_t caps[4] = {}, counted[2] = {}, drawn[2] = {}, n = 0;
+    std::uint64_t levels = 0;
+    std::memcpy(&near_clip, o + kDofObjNearClip, 4);
+    std::memcpy(&far_clip, o + kDofObjFarClip, 4);
+    std::memcpy(&focus, o + kDofObjFocus, 4);
+    std::memcpy(&coc, o + kDofObjCoc, 4);
+    std::memcpy(caps, o + kDofObjCaps, 16);
+    std::memcpy(counted, o + kDofObjCounted, 8);
+    std::memcpy(drawn, o + kDofObjDrawn, 8);
+    std::memcpy(&n, o + kDofLevelCount, 4);
+    std::memcpy(&levels, o + kDofLevelArray, 8);
+    char far_at[128] = "", near_at[128] = "";
+    int fl = 0, nl = 0;
+    for (std::int32_t i = 0; levels && i < n && i < 8 && coc != 0.0f; ++i) {
+        const auto* l = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(levels + static_cast<std::uint64_t>(i) * kDofLevelSize));
+        float kb[4] = {};
+        std::memcpy(kb, l + kDofLevelFarK, 8);
+        std::memcpy(kb + 2, l + kDofLevelNearK, 8);
+        if (fl < 120) fl += std::snprintf(far_at + fl, sizeof(far_at) - fl, " %.3g", kb[0] != 0.0f ? -kb[1] * coc / kb[0] : 0.0f);
+        if (nl < 120) nl += std::snprintf(near_at + nl, sizeof(near_at) - nl, " %.3g", kb[2] != 0.0f ? -kb[3] * coc / kb[2] : 0.0f);
+    }
+    std::uint64_t key = 1469598103934665603ull;
+    for (const std::uint8_t* p : {o + kDofObjNearClip, o + kDofObjFarClip, o + kDofObjFocus, o + kDofObjCoc})
+        for (int i = 0; i < 4; ++i) key = (key ^ p[i]) * 1099511628211ull;
+    for (std::int32_t v : {caps[0], caps[1], caps[2], caps[3], counted[0], counted[1], drawn[0], drawn[1], n})
+        key = (key ^ static_cast<std::uint32_t>(v)) * 1099511628211ull;
+    static std::atomic<std::uint64_t> last{0};
+    static std::atomic<int> lines{0};
+    if (last.exchange(key, std::memory_order_relaxed) == key || lines.fetch_add(1, std::memory_order_relaxed) >= 400) return;
+    host_log("graphics: depth of field's levels: %d in front, %d behind (counted %d, %d; caps %d %d %d %d) - the lens's circle "
+             "at infinity %g, focus %g m, clip %g..%g m; the levels start behind at%s, in front at%s",
+             drawn[0], drawn[1], counted[0], counted[1], caps[0], caps[1], caps[2], caps[3], coc, focus, near_clip, far_clip,
+             far_at, near_at);
+}
+
+GUEST_ABI std::int64_t dof_levels_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (g_dof_trace && saved[5]) trace_dof_levels(saved[5]);
+    if (!g_dof_1080_look) return 0;
+    // A cutscene's blur as YEBIS draws it: said once each time one starts.
+    static std::atomic<bool> in_cutscene{false};
+    const bool cutscene = loading_cutscene();
+    if (in_cutscene.exchange(cutscene, std::memory_order_relaxed) != cutscene && cutscene) {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 8)
+            host_log("graphics: a cutscene plays: its depth of field's blend left as YEBIS has it at this size");
+    }
+    if (cutscene) return 0;
+    const std::uint64_t dof = saved[5], src = saved[4];
+    if (!dof || !src) return 0;
+    std::uint32_t height = 0;
+    std::memcpy(&height, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src + kGpuTextureHeight)), 4);
+    unsigned picture_h = 0;
+    live_resolution_current(nullptr, &picture_h);
+    if (height != picture_h || height < 64 || height > 16384 || height == 1080) return 0;
+    std::int32_t n = 0;
+    std::uint64_t levels = 0;
+    std::memcpy(&n, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(dof + kDofLevelCount)), 4);
+    std::memcpy(&levels, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(dof + kDofLevelArray)), 8);
+    if (n <= 0 || n > 16 || !levels || !g_post_block) return 0;
+    // Only a side the view draws with one level (the block's level counts,
+    // the areas' own far blur: near 0, far 1). With more, a circle that grows
+    // with the picture moves on to the next level, twice as large, which keeps
+    // the look by itself - a look's lens (photo mode's 7 and 7) and the
+    // cutscenes' come out at 0.92-1.00x of 1080p's at 2160p as YEBIS has them,
+    // and larger offsets would hold the circle back on the smaller levels
+    // (0.64x).
+    std::int32_t near_levels = 0, far_levels = 0;
+    std::memcpy(&near_levels, g_post_block + kDofNear, 4);
+    std::memcpy(&far_levels, g_post_block + kDofFar, 4);
+    const bool far_one = far_levels == 1, near_one = near_levels == 1;
+    if (!far_one && !near_one) return 0;
+    const float f = static_cast<float>(height) / 1080.0f;
+    float b0 = 0;
+    for (std::int32_t i = 0; i < n; ++i) {
+        auto* l = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(levels + static_cast<std::uint64_t>(i) * kDofLevelSize));
+        float far_b = 0, near_b = 0;
+        std::memcpy(&far_b, l + kDofLevelFarB, 4);
+        std::memcpy(&near_b, l + kDofLevelNearB, 4);
+        if (i == 0) b0 = far_one ? far_b : near_b;
+        if (far_one) far_b *= f;
+        if (near_one) near_b *= f;
+        std::memcpy(l + kDofLevelFarB, &far_b, 4);
+        std::memcpy(l + kDofLevelNearB, &near_b, 4);
+    }
+    static std::atomic<std::uint64_t> logged{0};
+    static std::atomic<int> lines{0};
+    std::uint32_t bb = 0;
+    std::memcpy(&bb, &b0, 4);
+    const std::uint64_t key = (static_cast<std::uint64_t>(height) << 40) ^ (static_cast<std::uint64_t>(far_one * 2 + near_one) << 32) ^ bb;
+    if (logged.exchange(key, std::memory_order_relaxed) != key && lines.fetch_add(1, std::memory_order_relaxed) < 16)
+        host_log("graphics: depth of field's blend at the 1080-line look: the picture %u lines high, the %s side%s drawn with one "
+                 "level, its first offset %g given, %g used",
+                 height, far_one && near_one ? "far and near" : far_one ? "far" : "near", far_one && near_one ? "s" : "", b0, b0 * f);
+    return 0;
+}
+
 // sub_25d4860's entry: the YEBIS object in rdi.
 GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* saved) {
     const auto* yebis = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5]));
+    if (yebis) log_dof_table(yebis);
     if (!g_post_block || !yebis || yebis[kYebisHeld]) return 0;
     const float bloom = g_bloom.load(std::memory_order_relaxed);
     const bool vignette = g_vignette.load(std::memory_order_relaxed);
@@ -580,9 +1297,15 @@ GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* sav
         power = 0.0f;
         std::memcpy(g_post_block + kVignettePower, &power, 4);
     }
+    // Depth of field off: YEBIS's own switch, every view (kDofEnable).
+    if (!g_dof.load(std::memory_order_relaxed)) {
+        const std::int32_t off = 0;
+        std::memcpy(g_post_block + kDofEnable, &off, 4);
+    }
     for (int i = 0; i < g_post_poke.n; ++i) {
         std::memcpy(g_post_block + g_post_poke.off[i], &g_post_poke.value[i], 4);
     }
+    if (g_look_set.load(std::memory_order_acquire)) apply_look(g_post_block);
     return 0;
 }
 
@@ -622,6 +1345,25 @@ const BankLookup kBanks[12] = {
     {0x59c0, 0x1274bd0, 0x2ad0, 0x2b38, 0x2b74, 0x1f0}, {0x59c8, 0x127dad0, 0x2ad8, 0x2b40, 0x2b78, 0x1c0},
 };
 std::uint64_t g_slide = 0;
+
+// YEBIS's post effect (s_pSinglePostEffect) and its +0x140 byte: depth of
+// field's part made at its initialisation. Without it the effect's setters
+// keep the pass off whatever they are handed (sub_fd2a90 writes its enable
+// byte, +0x940, only while it is set).
+constexpr std::uint64_t kSinglePostEffect = 0x5865ed0;
+constexpr std::size_t kEffectDofReady = 0x140, kEffectDofOn = 0x940;
+std::uint64_t yebis_effect() {
+    std::uint64_t effect = 0;
+    if (g_slide)
+        std::memcpy(&effect, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_slide + (kSinglePostEffect - kPreferredGuestSlide))), 8);
+    return effect;
+}
+int yebis_effect_byte(std::size_t at) {  // -1 before the effect is made
+    const std::uint64_t effect = yebis_effect();
+    return effect ? *reinterpret_cast<const volatile std::uint8_t*>(static_cast<std::uintptr_t>(effect + at)) : -1;
+}
+int yebis_dof_ready() { return yebis_effect_byte(kEffectDofReady) > 0 ? 1 : yebis_effect_byte(kEffectDofReady); }
+int yebis_dof_on() { return yebis_effect_byte(kEffectDofOn); }  // as the last view's apply left it
 
 // BBHOST_DRAWPARAM_POKE=<bank>:<offset>:<float>:<expect>: write that float
 // into both entries a view asks that bank for, every view - to see whether a
@@ -789,7 +1531,13 @@ void drawparam_probe(const std::uint8_t* mgr, const std::uint8_t* r) {
 // written.
 GUEST_ABI std::int64_t fog_upload_hook(std::uint64_t, const std::uint64_t* saved) {
     const float k = g_fog.load(std::memory_order_relaxed);
-    if (k == 1.0f && g_fog_test.n == 0) return 0;
+    GraphicsLook look;
+    if (g_look_set.load(std::memory_order_acquire) & kLookFog) {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        look = g_look;
+    }
+    const bool look_fog = look.set & kLookFog;
+    if (k == 1.0f && g_fog_test.n == 0 && !look_fog) return 0;
     std::uint64_t gm = 0, fm = 0;
     std::memcpy(&gm, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_slide + (kGraphicsManager - kPreferredGuestSlide))), 8);
     if (gm) std::memcpy(&fm, reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(gm)) + kFogManager, 8);
@@ -805,6 +1553,21 @@ GUEST_ABI std::int64_t fog_upload_hook(std::uint64_t, const std::uint64_t* saved
     for (std::uint32_t i = 0; i < count; ++i) {
         float* b = blocks + i * (kFogBlock / 4);
         for (int o : kFogOpacity) b[o] *= k;
+        if (look_fog) {
+            // A plugin's look (post_look): the distance (1/Dist at [1] and
+            // [10]), the density (the three opacities), the contrast ([7], the
+            // colour's, and [19], the height colour's) and the offsets
+            // (DistOffset [9], HeightOffset [13]).
+            if (look.fog_distance > 0.0f) {
+                b[1] /= look.fog_distance;
+                b[10] /= look.fog_distance;
+            }
+            for (int o : kFogOpacity) b[o] *= look.fog_density;
+            b[7] *= look.fog_contrast;
+            b[19] *= look.fog_contrast;
+            b[9] += look.fog_distance_offset;
+            b[13] += look.fog_height_offset;
+        }
         for (int t = 0; t < g_fog_test.n; ++t) {
             float& v = b[g_fog_test.index[t]];
             v = g_fog_test.add[t] ? v + g_fog_test.mul[t] : v * g_fog_test.mul[t];
@@ -856,6 +1619,7 @@ void* alloc_exec_near(std::uint64_t at) {
 // call: host ran the target itself, around its own work). For a jump the
 // stack is as at a function's entry (a tail call).
 bool install_jump_hook(ElfImage* image, std::uint64_t at, std::uint64_t target, void* host) {
+    if (legacy_cpu_meets(at, 5)) return false;  // a rewritten site there (core/legacy_cpu.h): not a call
     auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
     std::int32_t rel = 0;
     std::memcpy(&rel, p + 1, 4);
@@ -1034,6 +1798,47 @@ const std::uint64_t* g_rend_man = nullptr;
 // Written when the setting changes (or the render manager's settings are
 // made again), not held every frame: the debug menu's LodLvBias changes it in
 // between and keeps it.
+// BBHOST_ONEPASS=1 (a probe): the debug menu's "OnePass CubeShadow" (the
+// graphics manager's +0x78b3, copied each frame into the light shadow
+// manager's +0x190 at 0x26aff57) held on, and the light shadow manager's
+// object and vtable logged once.
+void onepass_probe_tick() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_ONEPASS");
+        return e && e[0] == '1';
+    }();
+    if (!on || !g_velocity_slide) return;
+    // BBHOST_ONEPASS_AT=<s>: on only from that many seconds after the first frame (an A/B in one run).
+    static const double at_s = [] {
+        const char* e = std::getenv("BBHOST_ONEPASS_AT");
+        return e ? std::atof(e) : 0.0;
+    }();
+    static const auto t0 = std::chrono::steady_clock::now();
+    if (at_s > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < at_s) return;
+    std::uint64_t gm = 0;
+    std::memcpy(&gm, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_velocity_slide + (kGraphicsManager - kPreferredGuestSlide))), 8);
+    if (!gm) return;
+    auto* g8 = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(gm));
+    g8[0x78b3] = 1;
+    static int logged = 0;
+    std::uint64_t lsm = 0;
+    std::memcpy(&lsm, g8 + 0x5878, 8);
+    if (lsm && logged < 2 && ++logged) {
+        const auto* q = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(lsm));
+        const std::uint64_t base = g_velocity_slide - kPreferredGuestSlide;
+        std::string words;
+        for (int k = 0; k < 64; ++k) {
+            char b[40];
+            const std::uint64_t v = q[k];
+            const bool code = v > base && v - base < 0x5400000;
+            std::snprintf(b, sizeof b, " %x:%llx%s", k * 8, static_cast<unsigned long long>(code ? v - base : v), code ? "*" : "");
+            words += b;
+        }
+        host_log("graphics: onepass probe: light shadow manager 0x%llx, +0x190 = %u;%s", static_cast<unsigned long long>(lsm),
+                 reinterpret_cast<const std::uint8_t*>(q)[0x190], words.c_str());
+    }
+}
+
 void lod_bias_tick() {
     if (!g_rend_man || !*g_rend_man) return;
     const int want = g_lod_bias.load(std::memory_order_relaxed);
@@ -1154,6 +1959,7 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     g_scene_view_flip.store(hle_video_flip_count() + 1, std::memory_order_relaxed);
     camera_tick();
     lod_bias_tick();
+    onepass_probe_tick();
     if (g_task_steal) task_steal_tick();
     if (g_graphics_manager) light_grid_render_size_tick();
     drawparam_probe(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5])),
@@ -1176,7 +1982,14 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     // "Enable SSAO" and "Enable AntiAliasing" (the same bytes) keep what they
     // set. Held every view until 2026-10-14, the PC graphics settings off
     // included, which turned the debug menu's switches back on.
-    const std::uint32_t gen = g_flags_gen.load(std::memory_order_acquire);
+    // (An upscaler starting or stopping: the AA flag given again.)
+    const bool took = upscaler_takes_aa();
+    if (g_upscaler_took.exchange(took, std::memory_order_relaxed) != took) {
+        g_aa_gen.fetch_add(1, std::memory_order_release);
+        host_log("graphics: the game's anti-aliasing %s", took ? "off: an upscaler runs and does the anti-aliasing itself"
+                                                               : "as its setting says: no upscaler runs");
+    }
+    const std::uint32_t gen = g_flags_gen.load(std::memory_order_acquire), aa_gen = g_aa_gen.load(std::memory_order_acquire);
     if (g_made_any.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lk(g_made_mu);
         for (const std::uint64_t c : g_made) {
@@ -1188,25 +2001,62 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
         g_made_any.store(false, std::memory_order_relaxed);
     }
     auto* r = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(saved[0]));
-    if (r && gen) {
+    // Screen space reflections off: every view, as a rebuild of the targets
+    // (a Resolution change) sets the switch again.
+    if (r && g_ssr_off.load(std::memory_order_relaxed)) r[kSsrFlag] = 0;
+    if (r) {
+        const bool off = g_dyn_shadows_off.load(std::memory_order_relaxed);
+        std::uint8_t** slot = nullptr;
+        for (std::uint8_t*& c : g_dyn_cleared) slot = c == r ? &c : !slot && !c ? &c : slot;
+        if (off) {
+            r[kDynamicShadowFlag] = 0;
+            if (slot && !*slot) *slot = r;
+        } else if (slot && *slot == r) {
+            r[kDynamicShadowFlag] = 1;
+            *slot = nullptr;
+        }
+    }
+    // The velocity map, while an upscaler or frame generation takes motion
+    // from it: on every view, whatever turned it off in between - the debug
+    // menu's sgScene motion blur switch is the same byte. The upscaler learns
+    // which meshes move from its draws (host/upscale_pass.cpp's capture).
+    if (r && host_opt_motion_wanted()) {
+        std::uint64_t caps = 0;
+        std::memcpy(&caps, r + kCapabilities, sizeof(caps));
+        if ((caps & kBlurCapability) && !r[kVelocityFlag]) r[kVelocityFlag] = 1;
+    }
+    if (r && (gen || aa_gen)) {
         GivenRenderer* g = nullptr;
         for (GivenRenderer& c : g_given) g = c.renderer == r ? &c : g;
-        if (!g || g->gen != gen) {
-            if (!g) g = &g_given[g_given_next++ % 16];
-            g->renderer = r;
-            g->gen = gen;
-            std::uint64_t caps = 0;
-            std::memcpy(&caps, r + kCapabilities, sizeof(caps));
+        if (!g) {
+            g = &g_given[g_given_next++ % 16];
+            *g = GivenRenderer{r, ~0u, ~0u};
+        }
+        std::uint64_t caps = 0;
+        std::memcpy(&caps, r + kCapabilities, sizeof(caps));
+        const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && !took && (caps & kAaCapability);
+        if (gen && g->gen != gen) {
             const std::uint8_t ssao = g_ssao.load(std::memory_order_relaxed) && (caps & kSsaoCapability);
-            const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && (caps & kAaCapability);
+            const std::uint8_t velocity = g_velocity.load(std::memory_order_relaxed) && (caps & kBlurCapability);
+            const std::uint8_t camera_blur = g_camera_blur.load(std::memory_order_relaxed) && (caps & kBlurCapability);
             static std::atomic<int> logs{0};
             if (logs.fetch_add(1) < 24) {
-                host_log("graphics: renderer %p (capabilities 0x%llx): SSAO %u -> %u, AA %u -> %u", static_cast<void*>(r),
-                         static_cast<unsigned long long>(caps), r[kSsaoFlag], ssao, r[kAaFlag], aa);
+                host_log("graphics: renderer %p (capabilities 0x%llx): SSAO %u -> %u, AA %u -> %u, velocity map %u -> %u, camera blur %u -> %u",
+                         static_cast<void*>(r), static_cast<unsigned long long>(caps), r[kSsaoFlag], ssao, r[kAaFlag], aa, r[kVelocityFlag],
+                         velocity, r[kCameraBlur], camera_blur);
             }
             r[kSsaoFlag] = ssao;
             r[kAaFlag] = aa;
+            r[kVelocityFlag] = velocity;
+            r[kCameraBlur] = camera_blur;
+        } else if (g->aa_gen != aa_gen) {
+            // An upscaler started or stopped, no setting changed since this
+            // renderer's last flags (or none ever did - the rest the game's):
+            // its AA flag alone.
+            r[kAaFlag] = aa;
         }
+        g->gen = gen;
+        g->aa_gen = aa_gen;
     }
     return 0;  // and the view renders as it would
 }
@@ -1226,14 +2076,45 @@ namespace {
 // `exec`/`m`: the bytes the stub runs in place of the displaced prologue when
 // it cannot run them verbatim (a rip-relative lea rewritten as a movabs of the
 // slid address); null runs the prologue itself.
+// Whether the bytes hold an instruction core/legacy_cpu.h rewrites.
+bool has_legacy_insn(const std::uint8_t* code, std::size_t n) {
+    for (std::size_t i = 0; i < n;) {
+        LegacyInsn li;
+        if (legacy_decode(code + i, n - i, &li)) return true;
+        const X86Insn x = x86_decode(code + i, n - i);
+        if (!x.len) return false;
+        i += x.len;
+    }
+    return false;
+}
+
 bool install_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n,
                            void* host, std::uint64_t id = 0, const std::uint8_t* exec = nullptr, std::size_t m = 0,
                            bool keep_rax = false, bool site = false) {
     auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
-    if (n < 14 || std::memcmp(p, prologue, n) != 0) return false;
+    // The bytes as the game has them (a site rewritten for an older processor,
+    // core/legacy_cpu.h, compares as its own instruction), and none of those
+    // sites cut in two by the hook's jump.
+    std::uint8_t have[256];
+    if (n < 14 || n > sizeof(have)) return false;
+    legacy_cpu_original(at, n, have);
+    if (std::memcmp(have, prologue, n) != 0) return false;
+    if (legacy_cpu_meets(at, n) < 0) {
+        host_log("hook: 0x%llx's %zu bytes cut a site rewritten for this processor; not hooked",
+                 static_cast<unsigned long long>(at - image->mem.slide + kPreferredGuestSlide), n);
+        return false;
+    }
     if (!exec) {
         exec = prologue;
         m = n;
+    }
+    // Displaced instructions the processor lacks run as their routines in the stub.
+    std::uint8_t expanded[512];
+    if (legacy_cpu_on() && has_legacy_insn(exec, m)) {
+        const std::size_t k = legacy_relocate(exec, m, at, expanded, 0, sizeof(expanded));
+        if (!k) return false;
+        exec = expanded;
+        m = k;
     }
 #if defined(_WIN32)
     void* page = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -1246,6 +2127,7 @@ bool install_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t
     if (!placed || !guest_protect_rwx(&image->mem, lo, hi - lo)) return false;
     auto* stub = static_cast<std::uint8_t*>(page);
     thunk_emit_prologue_stub(stub, id, thunk_wrap(host), at + n, exec, m, keep_rax, site);
+    legacy_cpu_release(at, n, "a hook");
     const std::uint64_t dest = reinterpret_cast<std::uint64_t>(stub);
     p[0] = 0xff;
     p[1] = 0x25;  // jmp [rip+0]
@@ -1291,10 +2173,16 @@ void live_install(ElfImage* image) {
     if (!install_prologue_hook(image, at(kYebisRecord), kYebisRecordPrologue, sizeof(kYebisRecordPrologue),
                                reinterpret_cast<void*>(&yebis_record_hook))) {
         host_log("graphics: refused, 0x%llx is not the YEBIS record's prologue (or no room for its hook); "
-                 "bloom and vignette stay as the area has them",
+                 "bloom, vignette and depth of field stay as the area has them",
                  static_cast<unsigned long long>(kYebisRecord));
     } else {
         g_post_block = static_cast<std::uint8_t*>(guest_ptr(image->mem, at(kPostBlock)));
+    }
+    if (!install_prologue_hook(image, at(kDofLevels), kDofLevelsPrologue, sizeof(kDofLevelsPrologue),
+                               reinterpret_cast<void*>(&dof_levels_hook))) {
+        host_log("graphics: refused, 0x%llx is not the depth of field levels' prologue (or no room for its hook); its blend "
+                 "stays as the size has it",
+                 static_cast<unsigned long long>(kDofLevels));
     }
     if (!install_prologue_hook(image, at(kSsaoDraw), kSsaoDrawPrologue, sizeof(kSsaoDrawPrologue),
                                reinterpret_cast<void*>(&ssao_draw_hook))) {
@@ -1489,13 +2377,17 @@ void ui_stage_pin(ElfImage* image) {
 
 void resolution_patch(ElfImage* image, bool live) {
     int w = 0, h = 0;
-    if (!host_opt_resolution(&w, &h) || (w == 1920 && h == 1080)) {
+    // The game's size: the Resolution, or the window's with a smaller
+    // Resolution (the 3D then drawn at the Resolution, render_scale.cpp).
+    if (!host_opt_output_size(&w, &h) || (w == 1920 && h == 1080)) {
         // What it shipped with: nothing to write - but the words change
         // under a live resolution change, so the stage readers are pinned.
         if (live) ui_stage_pin(image);
         return;
     }
-    if (w < 256 || h < 144 || w > 7680 || h > 4320) {
+    // Up to the Resolution setting's widest and tallest entries: three 16:9
+    // 4K screens (11520x2160) and 8K (7680x4320).
+    if (w < 256 || h < 144 || w > 11520 || h > 4320) {
         host_log("graphics: %dx%d is outside the range this will write", w, h);
         return;
     }
@@ -1562,8 +2454,77 @@ std::string graphics_glare_report() {
     return buf;
 }
 
+std::uint32_t graphics_look_available() {
+    const HostSettings& hs = host_settings_ref();
+    std::uint32_t a = kLookAll;
+    if (hs.performance_mode || yebis_dof_ready() == 0) a &= ~(kLookDof | kLookDofRange);
+    if (hs.performance_mode) a &= ~kLookMotionBlur;
+    if (host_opt_motion_rebuilt_bits()) a &= ~kLookMotionBlur;  // what the blur cannot read
+    return a;
+}
+
+void graphics_look_set(const GraphicsLook& look) {
+    const std::uint32_t avail = graphics_look_available();
+    GraphicsLook l = look;
+    l.set &= kLookAll;
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        g_look = l;
+    }
+    g_look_logged.store(l.set == 0);
+    g_look_set.store(l.set, std::memory_order_release);
+    // Motion blur on or off whatever its setting says: its shader patches
+    // (host/shader_patch.h) and the blur's velocity switch, where it can show
+    // at all. Depth of field needs nothing here: apply_look writes the
+    // block's enable after the setting's Off has cleared it (kDofOn).
+    const int blur = (l.set & kLookMotionBlur) && (avail & kLookMotionBlur) ? (l.motion_blur ? 1 : 0) : -1;
+    shader_patch_look(blur);
+    g_blur_look.store(blur, std::memory_order_relaxed);
+    blur_update();
+}
+
+// Text scale: the hook on FontMap::MapFont (map_font_hook, above).
+void text_scale_install(ElfImage* image) {
+    const std::uint64_t at = image->mem.slide + (kMapFont - kPreferredGuestSlide);
+    if (install_prologue_hook(image, at, kMapFontPrologue, sizeof(kMapFontPrologue), reinterpret_cast<void*>(&map_font_hook))) {
+        // Live only with the font-handle set's removal fixed: a change while
+        // the game runs makes a second MenuFont_01 handle in the movies made
+        // before it (font_set_remove_hook).
+        const std::uint64_t rm = image->mem.slide + (kFontSetRemove - kPreferredGuestSlide);
+        const bool live = install_prologue_hook(image, rm, kFontSetRemovePrologue, sizeof(kFontSetRemovePrologue),
+                                                reinterpret_cast<void*>(&font_set_remove_hook));
+        g_text_scale_live.store(live);
+        if (live)
+            host_log("graphics: text scale %g, live (MenuFont_01's mapping hooked; Scaleform's font-handle set removes the handle it is "
+                     "given)",
+                     static_cast<double>(g_text_scale.load()));
+        else
+            host_log("graphics: text scale %g, at each start: 0x%llx is not Scaleform's font-handle removal, which a change while the "
+                     "game runs needs",
+                     static_cast<double>(g_text_scale.load()), static_cast<unsigned long long>(kFontSetRemove));
+        return;
+    }
+    // No hook: the constant MapFont is called with, read once - the setting
+    // applies at the next start.
+    const float want = g_text_scale.load();
+    host_log("graphics: refused, 0x%llx is not Scaleform's FontMap::MapFont prologue; text scale %g at the next start",
+             static_cast<unsigned long long>(kMapFont), static_cast<double>(want));
+    if (want == 1.0f) return;
+    const std::uint64_t c = image->mem.slide + (kMenuFontScale - kPreferredGuestSlide);
+    auto* p = static_cast<float*>(guest_ptr(image->mem, c));
+    if (*p != 1.0f) {
+        host_log("graphics: text scale %g left as %g (a patch wrote it, or another eboot)", static_cast<double>(want),
+                 static_cast<double>(*p));
+        return;
+    }
+    guest_protect_rwx(&image->mem, c & ~0xfffull, 0x1000);
+    *p = want;
+    guest_protect_rx(&image->mem, c & ~0xfffull, 0x1000);
+}
+
 void graphics_patch_install(ElfImage* image) {
     resolution_patch(image, live_resolution_install(image));
+    text_scale_install(image);
     menu_memory_install(image);
     frame_rate_install(image);
     camera_install(image);

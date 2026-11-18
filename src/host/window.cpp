@@ -1,4 +1,5 @@
 #include "host/window.h"
+#include "host/plugin_panel.h"
 #include "core/host_clock.h"
 #include "core/portable.h"
 
@@ -10,6 +11,7 @@
 #include "engine/option_menu.h"
 #include "hle/modules.h"
 #include "host/bindings.h"
+#include "host/framegen.h"
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/overlay.h"
@@ -20,6 +22,7 @@
 #include "host/audio.h"
 #include "host/foreign_hooks.h"
 #include "host/gpu.h"
+#include "host/slow_calls.h"
 #include "log.h"
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -34,6 +37,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -43,12 +47,20 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
+#if defined(_WIN32)
+// VK_EXT_full_screen_exclusive's structure and query (exclusive_policy) are
+// Windows' own, in the header that takes <windows.h>'s types.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <vulkan/vulkan_win32.h>
+#endif
 #endif
 
 // The swapchain's extent (width << 32 | height) for host_window_pixels; 0 before one.
 static std::atomic<std::uint64_t> g_window_pixels{0};
 // Told the window's pixel size when it changes (host_window_on_pixels).
 static std::atomic<void (*)(int, int)> g_on_pixels{nullptr};
+void note_window_display();  // the window's display's size, for any thread (host_window_display_now)
 
 namespace {
 
@@ -87,27 +99,74 @@ std::atomic<bool> g_mouse_relative_applied{false};
 // keys, mouse buttons, wheel and motion it takes from the game while the
 // mouse turns the camera, and its own reads of them - the keys as the last pad
 // update saw them, and the motion, wheel and presses since it last read.
+// Each plugin's take is its own (host_plugin_input_take's owner, "" for the
+// plugins that do not name themselves) and the game loses what any of them
+// takes: g_take_key and the atomics below are the takes added up.
+struct TakeSlot {
+    std::vector<std::uint16_t> keys;
+    std::uint32_t mouse = 0;
+    bool wheel = false, motion = false;
+    std::uint32_t pad = 0, axes = 0;  // plugin API 29's pad_take
+    bool empty() const { return keys.empty() && !mouse && !wheel && !motion && !pad && !axes; }
+};
 std::mutex g_take_mu;
+std::map<std::string, TakeSlot> g_take_slots;  // under g_take_mu: by owner
 bool g_take_key[512] = {};                     // under g_take_mu
+// Keys a take left out while it goes on taking others (under g_take_mu): given
+// back at once, held or not - Quake's movement keys on a ladder. A key held as
+// a take ends altogether stays taken until let go instead.
+bool g_take_give_key[512] = {};
 std::uint8_t g_plugin_keys[512] = {};          // under g_take_mu
 std::atomic<bool> g_take_any_key{false};
 std::atomic<std::uint32_t> g_take_buttons{0};
 std::atomic<bool> g_take_wheel{false}, g_take_motion{false};
-float g_plugin_dx = 0.0f, g_plugin_dy = 0.0f, g_plugin_wheel = 0.0f;  // under g_mouse_mu
-std::uint32_t g_plugin_pressed = 0;                                   // under g_mouse_mu
+// Plugin API 29: the controller as a plugin reads it (host_plugin_pad), a test's
+// taps beside it, the presses latched for the reader, and what it takes.
+std::mutex g_ppad_mu;
+PluginPad g_ppad;                   // under g_ppad_mu: the controller at the last pad update
+PluginPad g_ppad_test;              // under g_ppad_mu: a test's taps at the last pad read
+std::uint32_t g_ppad_prev = 0;      // under g_ppad_mu: what was held, for the presses
+std::uint32_t g_ppad_pressed = 0;   // under g_ppad_mu: went down since the frame began
+std::uint32_t g_ppad_frame = 0;     // under g_ppad_mu: the frame's presses (host_plugin_pad_frame)
+std::atomic<std::uint32_t> g_ppad_take_buttons{0}, g_ppad_take_axes{0};  // the owners' takes added up
+// Buttons a take left out while it goes on taking others: given back at once
+// (g_take_give_key's for the controller), at the next pad update.
+std::atomic<std::uint32_t> g_ppad_give{0};
+static void ppad_latch_locked() {
+    const std::uint32_t held = g_ppad.buttons | g_ppad_test.buttons;
+    g_ppad_pressed |= held & ~g_ppad_prev;
+    g_ppad_prev = held;
+}
+// The plugins' reads of the mouse (plugin API 13's input, 29's input_as): each
+// reader's presses, motion and wheel since its own last read - "" input's, the
+// plugins that do not name themselves - so one reading never takes them from
+// another (photo mode's every frame from the Quake plugin's mouse look).
+struct PluginReads {
+    float dx = 0.0f, dy = 0.0f, wheel = 0.0f;
+    std::uint32_t pressed = 0;
+};
+std::map<std::string, PluginReads> g_plugin_reads = {{"", PluginReads{}}};  // under g_mouse_mu
 // BBHOST_IME_TEST: opens the text box once at startup and again on F11.
 std::atomic<bool> g_ime_test_reopen{true};
 
-// The options screen's two display settings (host/options.h). Both can be set
+// The options screen's display settings (host/options.h). All can be set
 // before the presenter exists, so they are wishes the swapchain reads, not
 // calls into it.
-std::atomic<bool> g_want_fullscreen{false};
+// Window mode (host_window_set_mode): 0 windowed, 1 borderless, 2 fullscreen,
+// and the size Fullscreen's display mode is to be nearest.
+std::atomic<int> g_want_mode{0};
+std::atomic<int> g_mode_w{0}, g_mode_h{0};
+// Stay borderless: Borderless never made exclusive (exclusive_policy).
+std::atomic<bool> g_want_stay_borderless{false};
 std::atomic<bool> g_want_vsync{true};
 // When the presenting thread last finished a present, and how many it has
 // finished: with V-Sync on that instant is a display vblank, which is the
 // phase the flip clock steers towards.
 std::atomic<std::uint64_t> g_present_last_ns{0}, g_present_serial{0};
 std::atomic<bool> g_swap_dirty{false};
+// The presenting thread's id (host_thread_id), for the focus lines to ask the
+// slow-call registry what it is in (presenter_in_call); 0 before it runs.
+std::atomic<std::uint32_t> g_present_tid{0};
 
 // Text entry state (host_text_entry_*). SDL text input is toggled from the
 // pump (main thread) when `want` changes.
@@ -297,6 +356,7 @@ struct Presenter {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;          // the renderer's: under host_gpu_lock
     VkQueue present_queue = VK_NULL_HANDLE;  // this thread's own, when the device has one
+    void* fg_queues[3] = {};                 // frame generation's three (host/gpu.h), null without them
     std::uint32_t family = 0;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
@@ -318,6 +378,13 @@ struct Presenter {
     VkFence acquire_fence = VK_NULL_HANDLE;
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     bool latest_ready = false;  // the device has FIFO_LATEST_READY enabled (gpu.cpp)
+    // The device has VK_EXT_full_screen_exclusive on (gpu.cpp, Windows): the
+    // swapchain can say whether the driver may make the window exclusive
+    // fullscreen (exclusive_policy).
+    bool full_screen_exclusive = false;
+#if defined(_WIN32)
+    PFN_vkGetPhysicalDeviceSurfacePresentModes2EXT present_modes2 = nullptr;  // that extension's mode query
+#endif
     bool gpu_wait = false;      // sleep on the frame's fence before presenting (present_gpu_wait_default)
     std::uint64_t present_value = 0;  // the last own-queue copy's value on host_gpu_present_timeline()
     std::mutex mu;
@@ -434,6 +501,84 @@ const char* present_mode_name(VkPresentModeKHR m) {
     }
 }
 
+// Whether the driver may take the window as exclusive fullscreen, said as the
+// swapchain is made (Windows, VK_EXT_full_screen_exclusive). Borderless (the
+// window mode) is a window at the desktop's size (SDL's fullscreen with no
+// display mode of its own), and a swapchain that says nothing gets the
+// driver's DEFAULT, which on Windows lets NVIDIA's and AMD's drivers take a
+// window that covers the screen as exclusive fullscreen - with the switches
+// into and out of it that come with that. Stay borderless (the setting)
+// says DISALLOWED there: the window stays a window. Everything else says
+// nothing, as before the setting - Fullscreen, which sets the display's own
+// mode, among it. Off Windows there is no such extension and nothing to say.
+// On NVIDIA's driver (610.60, an RTX 3070 Ti laptop over Remote Desktop,
+// 2026-11-07) the first swapchain that disallows it loads d3d12.dll inside
+// vkCreateSwapchainKHR - the driver presents through DXGI from then on (the
+// `present: Windows' graphics modules` line) - where a start with the default
+// kept the driver's own path: presents returned in 0.3 ms against 5.5 ms.
+struct ExclusivePolicy {
+#if defined(_WIN32)
+    VkSurfaceFullScreenExclusiveInfoEXT info{VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT};
+#endif
+    bool chained = false;   // `info` goes on the swapchain and on its present modes' query
+    const char* text = "";  // for the `present: mode` line
+};
+ExclusivePolicy exclusive_policy() {
+    ExclusivePolicy p;
+#if defined(_WIN32)
+    const bool stay = g_want_mode.load() == 1 && g_want_stay_borderless.load();
+    if (stay && g_vk.full_screen_exclusive) {
+        p.info.fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+        p.chained = true;
+        p.text = ", exclusive fullscreen disallowed (Stay borderless)";
+    } else if (g_vk.full_screen_exclusive) {
+        p.text = ", the driver decides on exclusive fullscreen";
+    } else {
+        p.text = stay ? ", the driver decides on exclusive fullscreen (no VK_EXT_full_screen_exclusive: Stay borderless "
+                        "cannot disallow it)"
+                      : ", the driver decides on exclusive fullscreen (no VK_EXT_full_screen_exclusive)";
+    }
+#endif
+    return p;
+}
+
+// The present modes the surface offers a swapchain with `policy`: with it
+// chained, VK_EXT_full_screen_exclusive's own query, since a driver may offer
+// other modes to a window it may not make exclusive; else the plain one.
+std::vector<VkPresentModeKHR> surface_present_modes(const ExclusivePolicy& policy) {
+    std::vector<VkPresentModeKHR> modes;
+    std::uint32_t n = 0;
+#if defined(_WIN32)
+    if (policy.chained && g_vk.present_modes2) {
+        VkPhysicalDeviceSurfaceInfo2KHR si{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR};
+        si.pNext = &policy.info;
+        si.surface = g_vk.surface;
+        VkResult r = g_vk.present_modes2(g_vk.phys, &si, &n, nullptr);
+        if (r == VK_SUCCESS && n) {
+            modes.resize(n);
+            r = g_vk.present_modes2(g_vk.phys, &si, &n, modes.data());
+            if (r == VK_SUCCESS || r == VK_INCOMPLETE) {
+                modes.resize(n);
+                return modes;
+            }
+        }
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 4)
+            host_log("present: vkGetPhysicalDeviceSurfacePresentModes2EXT gave %d (%u modes); the surface's modes are asked without the policy",
+                     static_cast<int>(r), n);
+        modes.clear();
+        n = 0;
+    }
+#else
+    (void)policy;
+#endif
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, nullptr);
+    modes.resize(n);
+    if (n) vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, modes.data());
+    modes.resize(n);
+    return modes;
+}
+
 // The present mode for the V-Sync setting, from what the surface offers.
 // V-Sync on: MAILBOX (the newest finished frame goes up at the next refresh, no
 // tearing, no queue of frames behind the display), else FIFO_LATEST_READY (the
@@ -443,12 +588,9 @@ const char* present_mode_name(VkPresentModeKHR m) {
 // FIFO is the only mode a surface must support, so it is what is left.
 // BBHOST_PRESENT_MODE=fifo|mailbox|latest|immediate|relaxed asks for one
 // (FIFO when the surface lacks it); =old is the choice before this one (FIFO
-// with V-Sync; MAILBOX, else IMMEDIATE, without).
-VkPresentModeKHR choose_present_mode(bool vsync, std::string& why) {
-    std::uint32_t nmodes = 0;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, nullptr);
-    std::vector<VkPresentModeKHR> modes(nmodes);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, modes.data());
+// with V-Sync; MAILBOX, else IMMEDIATE, without). `modes` are the surface's
+// (surface_present_modes).
+VkPresentModeKHR choose_present_mode(bool vsync, const std::vector<VkPresentModeKHR>& modes, std::string& why) {
     const auto offered = [&](VkPresentModeKHR m) {
 #if defined(VK_KHR_present_mode_fifo_latest_ready)
         if (m == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR && !g_vk.latest_ready) return false;  // the device's extension is off
@@ -511,6 +653,18 @@ bool surface_empty() {
     VkSurfaceCapabilitiesKHR caps{};
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps) != VK_SUCCESS) return false;
     return caps.currentExtent.width == 0 || caps.currentExtent.height == 0;
+}
+
+// AMD's frame generation swapchain ended before a whole-device wait of ours:
+// its threads submitting to its queues meanwhile would break vkDeviceWaitIdle's
+// rule (every queue kept from other threads) as bb-submit's submissions broke
+// AMD's. Its own drain runs under the submission thread's queue lock
+// (framegen_destroy_swapchain); the swapchain is made again after. Under the
+// renderer's lock, like its other callers.
+void framegen_end_for_idle() {
+    if (!framegen_active()) return;
+    framegen_destroy_swapchain(g_vk.device);
+    g_vk.swapchain = VK_NULL_HANDLE;
 }
 
 bool vk_create_swapchain() {
@@ -597,16 +751,55 @@ bool vk_create_swapchain() {
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     std::string why;
     const bool vsync = g_want_vsync.load();
-    sci.presentMode = choose_present_mode(vsync, why);
+    // Stay borderless's say on exclusive fullscreen, and the modes the
+    // surface offers with it.
+    const ExclusivePolicy policy = exclusive_policy();
+    const std::vector<VkPresentModeKHR> modes = surface_present_modes(policy);
+    sci.presentMode = choose_present_mode(vsync, modes, why);
     sci.clipped = VK_TRUE;
     sci.oldSwapchain = old;
+#if defined(_WIN32)
+    if (policy.chained) sci.pNext = &policy.info;
+#endif
     // Windows' graphics modules before and after: a driver that presents
     // through DXGI (a D3D12 queue of its own copying our images into a DXGI
     // swapchain) loads d3d12.dll inside vkCreateSwapchainKHR, as happened in
     // shadPS4 on the Radeon 8060S (ReShade's log there, 2026-10-07).
     [[maybe_unused]] const std::string modules_before = host_graphics_modules();
-    if (vkCreateSwapchainKHR(g_vk.device, &sci, nullptr, &g_vk.swapchain) != VK_SUCCESS) {
-        host_log("vulkan: swapchain creation failed");
+    // Frame generation: AMD's swapchain in place of ours (host/framegen.h),
+    // made afresh each time - the one before it gone first - and presenting on
+    // this thread's queue, the one vkQueuePresentKHR is called on below.
+    if (framegen_active()) {
+        framegen_destroy_swapchain(g_vk.device);
+        old = VK_NULL_HANDLE;
+        sci.oldSwapchain = VK_NULL_HANDLE;
+    } else if (old && framegen_wanted()) {
+        // Frame generation switched on: AMD's swapchain takes no old one, and
+        // the surface holds one at a time - ours goes first, its last present done.
+        {
+            static constexpr slow_calls::Site kFgSwitchIdleSite{slow_calls::kQueueIdle, "our swapchain going for frame generation's"};
+            // The presenter's own queue is this thread's alone; the renderer's
+            // (a device with one queue) is the submission thread's too.
+            const VkQueue q = g_vk.present_queue ? g_vk.present_queue : g_vk.queue;
+            const bool shared = q == g_vk.queue;
+            if (shared) host_gpu_queue_lock();
+            slow_calls::Scope timed(kFgSwitchIdleSite);
+            vkQueueWaitIdle(q);
+            if (shared) host_gpu_queue_unlock();
+        }
+        vkDestroySwapchainKHR(g_vk.device, old, nullptr);
+        old = VK_NULL_HANDLE;
+        sci.oldSwapchain = VK_NULL_HANDLE;
+    }
+    // AMD's swapchain is made from this create info too: framegen_create_swapchain
+    // copies it whole into AMD's ffxCreateContextDescFrameGenerationSwapChainVK
+    // (its createInfo), pNext and all, so Stay borderless's word on
+    // exclusive fullscreen (chained above) goes to the swapchain AMD makes.
+    const bool fg = framegen_wanted() &&
+                    framegen_create_swapchain(g_vk.phys, g_vk.device, sci, g_vk.present_queue ? g_vk.present_queue : g_vk.queue,
+                                              g_vk.family, g_vk.fg_queues, &g_vk.swapchain);
+    if (!fg && vkCreateSwapchainKHR(g_vk.device, &sci, nullptr, &g_vk.swapchain) != VK_SUCCESS) {
+        host_log("vulkan: swapchain creation failed%s", policy.text);
         return false;
     }
     [[maybe_unused]] const std::string modules_after = host_graphics_modules();
@@ -629,16 +822,13 @@ bool vk_create_swapchain() {
                 default: return "other";
             }
         };
-        std::uint32_t nmodes = 0;
-        vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, nullptr);
-        std::vector<VkPresentModeKHR> modes(nmodes);
-        if (nmodes) vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, modes.data());
         std::string have;
         for (VkPresentModeKHR m : modes) have += std::string(have.empty() ? "" : " ") + mode_name(m);
         const std::string chosen = why.empty() ? std::string() : " (" + why + ")";
-        host_log("present: mode %s%s (the surface has: %s), %s, %s, %u images, usage 0x%x%s", mode_name(sci.presentMode),
+        host_log("present: mode %s%s (the surface has: %s), %s%s%s, %s, %u images, usage 0x%x%s", mode_name(sci.presentMode),
                  chosen.c_str(), have.c_str(),
-                 g_want_fullscreen.load() ? "fullscreen" : "windowed",
+                 g_want_mode.load() == 2 ? "fullscreen" : g_want_mode.load() == 1 ? "borderless" : "windowed", policy.text,
+                 fg && policy.chained ? " - in AMD's frame generation swapchain's create info" : "",
                  sci.imageFormat == VK_FORMAT_R8G8B8A8_UNORM   ? "R8G8B8A8"
                  : sci.imageFormat == VK_FORMAT_B8G8R8A8_UNORM ? "B8G8R8A8"
                                                                : "another format",
@@ -654,9 +844,10 @@ bool vk_create_swapchain() {
     g_swap_w.store(g_vk.extent.width, std::memory_order_relaxed);
     g_swap_h.store(g_vk.extent.height, std::memory_order_relaxed);
     std::uint32_t n = 0;
-    vkGetSwapchainImagesKHR(g_vk.device, g_vk.swapchain, &n, nullptr);
+    const auto get_images = framegen_active() ? framegen_get_images : vkGetSwapchainImagesKHR;
+    get_images(g_vk.device, g_vk.swapchain, &n, nullptr);
     g_vk.images.resize(n);
-    vkGetSwapchainImagesKHR(g_vk.device, g_vk.swapchain, &n, g_vk.images.data());
+    get_images(g_vk.device, g_vk.swapchain, &n, g_vk.images.data());
     for (VkImageView v : g_vk.views) {
         if (v) vkDestroyImageView(g_vk.device, v, nullptr);
     }
@@ -704,8 +895,16 @@ bool vk_start() {
     g_vk.device = static_cast<VkDevice>(h.device);
     g_vk.queue = static_cast<VkQueue>(h.queue);
     g_vk.present_queue = static_cast<VkQueue>(h.present_queue);
+    for (int i = 0; i < 3; ++i) g_vk.fg_queues[i] = h.fg_queues[i];
     g_vk.family = h.family;
     g_vk.latest_ready = h.fifo_latest_ready;
+    g_vk.full_screen_exclusive = h.full_screen_exclusive;
+#if defined(_WIN32)
+    if (g_vk.full_screen_exclusive) {
+        g_vk.present_modes2 = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModes2EXT>(
+            vkGetInstanceProcAddr(g_vk.instance, "vkGetPhysicalDeviceSurfacePresentModes2EXT"));
+    }
+#endif
     if (!SDL_Vulkan_CreateSurface(g_window, g_vk.instance, nullptr, &g_vk.surface)) {
         host_log("vulkan: surface creation failed: %s", SDL_GetError());
         return false;
@@ -820,6 +1019,37 @@ void host_fps_frame_start() {
 
 namespace {
 
+// The presenter's driver calls, for the slow-call registry (host/slow_calls.h).
+constexpr slow_calls::Site kLastCopySite{slow_calls::kWaitFences, "the last copy"};
+constexpr slow_calls::Site kRebuildIdleSite{slow_calls::kDeviceIdle, "a swapchain rebuild"};
+constexpr slow_calls::Site kAcquireSite{slow_calls::kAcquireImage, "the presenter"};
+constexpr slow_calls::Site kAcquireAgainSite{slow_calls::kAcquireImage, "after a rebuild"};
+constexpr slow_calls::Site kAcquiredSite{slow_calls::kWaitFences, "the acquired image"};
+constexpr slow_calls::Site kOwnCopySite{slow_calls::kQueueSubmit, "the copy, on the presenter's queue"};
+constexpr slow_calls::Site kCopySite{slow_calls::kQueueSubmit, "the copy"};
+constexpr slow_calls::Site kCopyGpuSite{slow_calls::kWaitFences, "the copy on the GPU"};
+constexpr slow_calls::Site kPresentSite{slow_calls::kQueuePresent, "present"};
+
+// What the presenting thread is in, for the window's focus lines: " (the
+// presenter 2.71 s into vkWaitForFences, the acquired image)" once it has been
+// in one timed call for 100 ms or more, else nothing. A display that stops
+// handing the swapchain's images back keeps the presenter seconds in its wait
+// for one; whether a focus change came while it waited - and may have ended
+// the wait - or after it was over is then in the log.
+std::string presenter_in_call() {
+    slow_calls::ThreadCall c;
+    if (!slow_calls::thread_in_call(g_present_tid.load(std::memory_order_relaxed), 100'000'000ull, &c)) return {};
+    char buf[192];
+    if (c.ns >= 1'000'000'000ull) {
+        std::snprintf(buf, sizeof(buf), " (the presenter %.2f s into %s, %s)", static_cast<double>(c.ns) / 1e9,
+                      slow_calls::call_name(c.call), c.where);
+    } else {
+        std::snprintf(buf, sizeof(buf), " (the presenter %.0f ms into %s, %s)", static_cast<double>(c.ns) / 1e6,
+                      slow_calls::call_name(c.call), c.where);
+    }
+    return buf;
+}
+
 // Which step of a present this thread is on, for the hang watchdog: a present
 // that never comes back stops the flips, and everything behind them.
 std::atomic<const char*> g_present_step{"idle"};
@@ -873,7 +1103,10 @@ bool vk_present() {
     // next vblank, and holding the GPU lock across that stalls the command
     // processor - the game's own thread - for most of a frame.
     present_step("waiting for the last present");
-    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    {
+        slow_calls::Scope timed(kLastCopySite);
+        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    }
     host_gpu_busy_present_done();  // the last blit's two timestamps, before this one rewrites them
     // While the window is minimized nothing is acquired or presented (the
     // game's flips do not wait for this thread), and once it is back the
@@ -889,12 +1122,17 @@ bool vk_present() {
         host_log("present: the window is back; the swapchain is made again");
         g_swap_dirty.store(true);
     }
-    // A V-Sync change has no surface event behind it, so the options screen
-    // asks for the rebuild the acquire would otherwise never be told to do.
+    // A V-Sync change has no surface event behind it, nor has Stay
+    // borderless's, so the options screen asks for the rebuild the acquire
+    // would otherwise never be told to do.
     if (g_swap_dirty.exchange(false)) {
         host_gpu_lock();
+        framegen_end_for_idle();
         host_gpu_queue_lock();
-        vkDeviceWaitIdle(g_vk.device);
+        {
+            slow_calls::Scope timed(kRebuildIdleSite);
+            vkDeviceWaitIdle(g_vk.device);
+        }
         host_gpu_queue_unlock();
         vk_create_swapchain();
         host_gpu_unlock();
@@ -902,7 +1140,10 @@ bool vk_present() {
     present_step("acquiring an image");
     // The image is ours once the acquire's fence signals (or, the old way, once
     // the GPU has waited on its semaphore: BBHOST_PRESENT_ACQUIRE_FENCE=0).
-    const bool by_fence = g_acquire_fence && g_vk.acquire_fence;
+    // AMD's frame generation swapchain is acquired as its sample does, with a
+    // semaphore.
+    const bool by_fence = g_acquire_fence && g_vk.acquire_fence && !framegen_active();
+    const auto acquire = framegen_active() ? framegen_acquire : vkAcquireNextImageKHR;
     const VkSemaphore acquire_sem = by_fence ? VK_NULL_HANDLE : g_vk.acquire_sem;
     const VkFence acquire_fence = by_fence ? g_vk.acquire_fence : VK_NULL_HANDLE;
     if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
@@ -913,7 +1154,11 @@ bool vk_present() {
     // waiting on its flips (two runs frozen 20 s into the title, "acquiring an
     // image (43.4 s)"). Past 100 ms this frame is not presented; the game goes
     // on and the next frame tries again.
-    VkResult r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
+    VkResult r;
+    {
+        slow_calls::Scope timed(kAcquireSite);
+        r = acquire(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
+    }
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4) host_log("present: no swapchain image within 100 ms (the window is not being shown?); frame not presented");
@@ -930,8 +1175,12 @@ bool vk_present() {
     }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         host_gpu_lock();
+        framegen_end_for_idle();
         host_gpu_queue_lock();
-        vkDeviceWaitIdle(g_vk.device);
+        {
+            slow_calls::Scope timed(kRebuildIdleSite);
+            vkDeviceWaitIdle(g_vk.device);
+        }
         host_gpu_queue_unlock();
         const bool remade = vk_create_swapchain();
         host_gpu_unlock();
@@ -939,7 +1188,9 @@ bool vk_present() {
             return false;
         }
         if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
-        r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, UINT64_MAX, acquire_sem, acquire_fence, &idx);
+        slow_calls::Scope timed(kAcquireAgainSite);
+        r = (framegen_active() ? framegen_acquire : vkAcquireNextImageKHR)(g_vk.device, g_vk.swapchain, UINT64_MAX, acquire_sem,
+                                                                               acquire_fence, &idx);
         if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS;  // ours all the same: not presenting it would keep it for ever
     }
     if (r != VK_SUCCESS) {
@@ -950,9 +1201,9 @@ bool vk_present() {
         // that is a vblank away; this thread sleeps through it, and the
         // renderer's queue never waits for the display.
         present_step("waiting for the acquired image");
-        const auto t0 = std::chrono::steady_clock::now();
+        slow_calls::Scope timed(kAcquiredSite, 0, true);  // its clock reads the figure's too
         vkWaitForFences(g_vk.device, 1, &g_vk.acquire_fence, VK_TRUE, UINT64_MAX);
-        g_pstats.acquire_wait_us += us(t0, std::chrono::steady_clock::now());
+        g_pstats.acquire_wait_us += timed.end() / 1000;
     }
     // The frame: the newest the game has flipped, taken now - after the waits
     // above, which last a GPU frame when the GPU is behind - not before them.
@@ -1004,6 +1255,7 @@ bool vk_present() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_vk.cmd, &bi);
     host_gpu_busy_present_begin(g_vk.cmd);  // the busy meter's first timestamp (host/gpu_busy.cpp)
+    host_gpu_present_markers(g_vk.cmd, false);  // the device-loss markers, while they are on (host/gpu_markers.h)
     // The picture's rectangle (fit_picture); what it does not cover is black.
     VkRect2D area{{0, 0}, g_vk.extent};
     if (display_w && display_h) {
@@ -1077,6 +1329,9 @@ bool vk_present() {
                 // The menus (F9, F10) over everything else (host/ingame_menu.h).
                 const bool menu = ingame_menu_record_in_pass(g_vk.cmd, g_vk.extent);
                 present_pass_end(g_vk.cmd, g_vk.images[idx]);
+                if (have && framegen_active())
+                    framegen_frame(g_vk.cmd, display_va, shown.offset, shown.extent, static_cast<std::int32_t>(src.x),
+                                   static_cast<std::int32_t>(src.y), src.w, src.h, false);
                 recorded = true;
                 wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
                 ++g_pstats.one_pass;
@@ -1122,20 +1377,26 @@ bool vk_present() {
         // Blit the game's display buffer; dark red (cycling with the buffer
         // index) when the renderer has not produced it yet.
         void* const storage_view = g_vk.storage && idx < g_vk.views.size() ? static_cast<void*>(g_vk.views[idx]) : nullptr;
+        bool by_fsr = false;  // a picture smaller than its rectangle, upscaled by FSR 1 (host/fsr.cpp)
         if (!display_va || !host_gpu_blit_display(g_vk.cmd, display_va, g_vk.images[idx], shown.offset.x, shown.offset.y,
-                                                  shown.extent.width, shown.extent.height, src_w, src_h, src_x, src_y, storage_view)) {
+                                                  shown.extent.width, shown.extent.height, src_w, src_h, src_x, src_y, storage_view,
+                                                  &by_fsr)) {
             VkClearColorValue color{{0.06f + 0.04f * (buffer_index % 3), 0.0f, 0.02f, 1.0f}};
             VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdClearColorImage(g_vk.cmd, g_vk.images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
             ++g_pstats.clears;
         } else {
             ++g_pstats.blits;
+            if (framegen_active())
+                framegen_frame(g_vk.cmd, display_va, shown.offset, shown.extent, static_cast<std::int32_t>(src_x),
+                               static_cast<std::int32_t>(src_y), src_w, src_h, by_fsr);
         }
         // The host overlay goes over the game's frame: the pointer now, the text
-        // box and the options screen later. Drawing needs
+        // box and the options screen later; then the menus, a plugin's in-game
+        // menu among them (up while F10 is closed). Drawing needs
         // the image as a colour attachment rather than a transfer destination.
         bool as_colour = false;  // the image was moved to the colour-attachment layout, whether or not the overlay then drew
-        if (idx < g_vk.views.size() && g_vk.views[idx] && (!host_overlay_empty() || ingame_menu_open())) {
+        if (idx < g_vk.views.size() && g_vk.views[idx] && (!host_overlay_empty() || ingame_menu_open() || plugin_panel_overlay_shown())) {
             VkImageMemoryBarrier to_colour = to_dst;
             to_colour.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             to_colour.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1166,6 +1427,7 @@ bool vk_present() {
                              as_colour ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_present);
     }
+    host_gpu_present_markers(g_vk.cmd, true);
     host_gpu_busy_present_end(g_vk.cmd);  // counted as on its way from here: it is always submitted below
     vkEndCommandBuffer(g_vk.cmd);
     const auto t_recorded = std::chrono::steady_clock::now();
@@ -1216,7 +1478,11 @@ bool vk_present() {
         own.pCommandBuffers = &g_vk.cmd;
         own.signalSemaphoreCount = 2;
         own.pSignalSemaphores = signals;
-        const VkResult sr = vkQueueSubmit(g_vk.present_queue, 1, &own, g_vk.fence);
+        VkResult sr;
+        {
+            slow_calls::Scope timed(kOwnCopySite);
+            sr = vkQueueSubmit(g_vk.present_queue, 1, &own, g_vk.fence);
+        }
         if (sr != VK_SUCCESS) {
             // Nothing waits for a copy that never went in (present_reads_wait).
             VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
@@ -1238,7 +1504,10 @@ bool vk_present() {
         host_gpu_wait_submitted(ticket);
     } else {
         host_gpu_queue_lock();
-        vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
+        {
+            slow_calls::Scope timed(kCopySite);
+            vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
+        }
         host_gpu_queue_unlock();
         host_gpu_unlock();
         locked = false;
@@ -1248,6 +1517,7 @@ bool vk_present() {
     // (BBHOST_PRESENT_GPU_WAIT). Bounded: a lost device signals nothing.
     if (g_vk.gpu_wait) {
         present_step("waiting for the frame on the GPU");
+        slow_calls::Scope timed(kCopyGpuSite);
         vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, 1000000000ull);
     }
     const auto t_gpu_done = std::chrono::steady_clock::now();
@@ -1275,7 +1545,11 @@ bool vk_present() {
     pi.pSwapchains = &g_vk.swapchain;
     pi.pImageIndices = &idx;
     present_step("presenting");
-    const VkResult pr = vkQueuePresentKHR(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
+    VkResult pr;
+    {
+        slow_calls::Scope timed(kPresentSite);
+        pr = (framegen_active() ? framegen_present : vkQueuePresentKHR)(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
+    }
     if (queue_held) host_gpu_queue_unlock();
     if (locked) {
         host_gpu_unlock();
@@ -1396,6 +1670,25 @@ std::uint8_t axis_to_u8(std::int16_t v) {
     return static_cast<std::uint8_t>(a < 0 ? 0 : (a > 255 ? 255 : a));
 }
 
+// A stick's two axes through its deadzones (Controls: host/settings.h
+// stick_inner, stick_outer), radially, so a diagonal keeps its direction:
+// inside `inner` of the full travel at rest, from `outer` out all the way,
+// the travel between spread over the whole range. 0 and 1 leave it as it is.
+void stick_deadzone(std::int16_t ax, std::int16_t ay, float inner, float outer, std::uint8_t* x, std::uint8_t* y) {
+    if (inner <= 0.0f && outer >= 1.0f) {
+        *x = axis_to_u8(ax);
+        *y = axis_to_u8(ay);
+        return;
+    }
+    const float fx = std::max(static_cast<float>(ax) / 32767.0f, -1.0f), fy = std::max(static_cast<float>(ay) / 32767.0f, -1.0f);
+    const float m = std::min(std::sqrt(fx * fx + fy * fy), 1.0f);
+    float k = 0.0f;
+    if (m > inner) k = std::min((m - inner) / std::max(outer - inner, 0.01f), 1.0f) / m;
+    const auto back = [](float f) { return static_cast<std::int16_t>(std::clamp(f, -1.0f, 1.0f) * 32767.0f); };
+    *x = axis_to_u8(back(fx * k));
+    *y = axis_to_u8(back(fy * k));
+}
+
 // A test harness's keys (the request "keys FILE", BBHOST_TEST_REQUESTS in
 // hle/video.cpp): FILE's lines "<ms> +<key>" and "<ms> -<key>" in SDL's key
 // names, played from the request on and read at this thread's pump (every
@@ -1446,6 +1739,18 @@ bool script_keys_step() {
     return true;
 }
 
+// The controller's sixteen bindable buttons as SDL names them, in PadInput's
+// order; the triggers are axes (INVALID here).
+SDL_GamepadButton pad_sdl_button(int input) {
+    static constexpr SDL_GamepadButton kButtons[kPadInputs] = {
+        SDL_GAMEPAD_BUTTON_SOUTH,       SDL_GAMEPAD_BUTTON_EAST,        SDL_GAMEPAD_BUTTON_WEST,       SDL_GAMEPAD_BUTTON_NORTH,
+        SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_BUTTON_INVALID,
+        SDL_GAMEPAD_BUTTON_LEFT_STICK,  SDL_GAMEPAD_BUTTON_RIGHT_STICK, SDL_GAMEPAD_BUTTON_START,       SDL_GAMEPAD_BUTTON_TOUCHPAD,
+        SDL_GAMEPAD_BUTTON_DPAD_UP,     SDL_GAMEPAD_BUTTON_DPAD_DOWN,   SDL_GAMEPAD_BUTTON_DPAD_LEFT,  SDL_GAMEPAD_BUTTON_DPAD_RIGHT};
+    return input >= 0 && input < kPadInputs ? kButtons[input] : SDL_GAMEPAD_BUTTON_INVALID;
+}
+
+
 void update_pad() {
     // Before anything that returns early, so a script keeps its own time.
     const bool scripted = script_keys_step();
@@ -1491,9 +1796,23 @@ void update_pad() {
         std::lock_guard<std::mutex> lock(g_text_mu);
         typing = g_text_want;
     }
-    if (host_options_open() || ingame_menu_open() || binding || typing) {
+    // And so is a plugin's centred menu (host/plugin_panel.h): the game and
+    // the plugins read nothing while it is up; what is still held as it
+    // closes stays out of both until let go (below).
+    const bool menu_modal = plugin_panel_exclusive();
+    static bool was_menu_modal = false;
+    const bool menu_closed_now = was_menu_modal && !menu_modal;
+    was_menu_modal = menu_modal;
+    if (host_options_open() || ingame_menu_open() || binding || typing || menu_modal) {
         p.connected = true;
         g_key_strong.store(false, std::memory_order_relaxed);
+        {
+            // A plugin reads the controller let go while these have it.
+            std::lock_guard<std::mutex> lock(g_ppad_mu);
+            g_ppad = PluginPad{};
+            g_ppad.connected = !g_pads.empty();
+            ppad_latch_locked();
+        }
         std::lock_guard<std::mutex> lock(g_pad_mu);
         g_pad = p;
         return;
@@ -1512,45 +1831,108 @@ void update_pad() {
     // Each pad's buttons are or-ed together, and each stick axis and trigger
     // is whichever pad pushes it furthest, so two pads never fight.
     bool touch_done = false, back_held = false;
+    // A plugin's view of the controller, before what it takes from the game
+    // (plugin API 29: host_plugin_pad, host_plugin_pad_take).
+    PluginPad ctl;
+    const std::uint32_t take_buttons = g_ppad_take_buttons.load(std::memory_order_relaxed);
+    // A plugin's panel up (host/plugin_panel.h): the buttons and keys it moves
+    // by are its own - neither the game nor the plugins' pad and input read them.
+    // In the game's own dialog (engine/plugin_dialog.h) they are the game's,
+    // and still not the plugins' (L1 turns a page, it does not also slow
+    // photo mode's camera); a centred one there leaves the plugins nothing.
+    const bool panel = plugin_panel_overlay_shown();
+    const bool panel_plugins = plugin_panel_shown();
+    const bool native_centred = plugin_panel_native_centred();
+    // The buttons the game's dialog moves by reach the game whatever a plugin
+    // takes (photo mode takes them all while its camera flies).
+    const std::uint32_t dialog_buttons = plugin_panel_dialog_buttons();
+    // A button or key the panel had stays its own until let go: the Circle or
+    // Escape that closes it must not then press anything (end photo mode,
+    // open the game's menu).
+    static std::uint32_t panel_held_pad = 0, plugin_held_pad = 0;
+    if (menu_closed_now) panel_held_pad = ~0u;  // every button held as a centred menu closes: the menu's until let go
+    // The same for a button a plugin takes (pad_take): one held as the take
+    // ends - the L3 or Cross that ends a photo mode - stays the plugin's until
+    // let go, so the game never sees it go down. One a take leaves out while
+    // it goes on taking others is the game's at once (g_ppad_give).
+    static std::uint32_t taken_held_pad = 0;
+    taken_held_pad &= ~g_ppad_give.exchange(0, std::memory_order_relaxed);
+    std::uint32_t held_now = 0;
+    const std::uint32_t take_axes = g_ppad_take_axes.load(std::memory_order_relaxed);
     for (SDL_Gamepad* g_gamepad : g_pads) {
         p.connected = true;
-        auto btn = [&](SDL_GamepadButton b, std::uint32_t bit) {
-            if (static_cast<int>(b) != end_button && SDL_GetGamepadButton(g_gamepad, b)) {
-                p.buttons |= bit;
-            }
-        };
-        btn(SDL_GAMEPAD_BUTTON_SOUTH, kCross);
-        btn(SDL_GAMEPAD_BUTTON_EAST, kCircle);
-        btn(SDL_GAMEPAD_BUTTON_WEST, kSquare);
-        btn(SDL_GAMEPAD_BUTTON_NORTH, kTriangle);
-        btn(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, kL1);
-        btn(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, kR1);
-        btn(SDL_GAMEPAD_BUTTON_LEFT_STICK, kL3);
-        btn(SDL_GAMEPAD_BUTTON_RIGHT_STICK, kR3);
-        btn(SDL_GAMEPAD_BUTTON_START, kOptions);
+        ctl.connected = true;
+        // The sixteen buttons, the triggers past a quarter of their travel, each
+        // giving in play the press it is bound to (host/bindings.h host_pad_*):
+        // a rebound one's play press goes to play_buttons, which a menu takes
+        // out again, and its menu press to menu_buttons, which a menu puts in,
+        // so in a menu every button is itself - but for the menu's OK and
+        // Back, which follow Interact and Dodge (host_pad_menu_bit).
+        bool held[kPadInputs] = {};
+        for (int i = 0; i < kPadInputs; ++i) {
+            const SDL_GamepadButton b = pad_sdl_button(i);
+            held[i] = b != SDL_GAMEPAD_BUTTON_INVALID && static_cast<int>(b) != end_button && SDL_GetGamepadButton(g_gamepad, b);
+        }
         back_held |= SDL_GetGamepadButton(g_gamepad, SDL_GAMEPAD_BUTTON_BACK);  // below, after the touchpad's own fingers
-        btn(SDL_GAMEPAD_BUTTON_TOUCHPAD, kTouchPad);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_UP, kUp);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_DOWN, kDown);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_LEFT, kLeft);
-        btn(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, kRight);
         const auto further = [](std::uint8_t have, std::uint8_t v) {
             return std::abs(static_cast<int>(v) - kStickRest) > std::abs(static_cast<int>(have) - kStickRest) ? v : have;
         };
-        p.lx = further(p.lx, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX)));
-        p.ly = further(p.ly, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTY)));
-        p.rx = further(p.rx, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTX)));
-        p.ry = further(p.ry, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY)));
-        const std::int16_t lt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
-        const std::int16_t rt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
-        p.l2 = std::max(p.l2, static_cast<std::uint8_t>(lt / 128));
-        p.r2 = std::max(p.r2, static_cast<std::uint8_t>(rt / 128));
-        if (lt > 8000) {
-            p.buttons |= kL2;
+        const HostSettings& hs = host_settings_ref();
+        std::uint8_t lx = 0, ly = 0, rx = 0, ry = 0;
+        stick_deadzone(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX), SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTY),
+                       hs.stick_inner[0], hs.stick_outer[0], &lx, &ly);
+        stick_deadzone(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTX), SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY),
+                       hs.stick_inner[1], hs.stick_outer[1], &rx, &ry);
+        ctl.lx = further(ctl.lx, lx);
+        ctl.ly = further(ctl.ly, ly);
+        ctl.rx = further(ctl.rx, rx);
+        ctl.ry = further(ctl.ry, ry);
+        // A stick a plugin takes stays centred for the game.
+        if (!(take_axes & kPadTakeLeftStick)) {
+            p.lx = further(p.lx, lx);
+            p.ly = further(p.ly, ly);
         }
-        if (rt > 8000) {
-            p.buttons |= kR2;
+        if (!(take_axes & kPadTakeRightStick)) {
+            p.rx = further(p.rx, rx);
+            p.ry = further(p.ry, ry);
         }
+        std::int16_t lt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+        std::int16_t rt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+        held[kPadL2] = lt > 8000;
+        held[kPadR2] = rt > 8000;
+        ctl.l2 = std::max(ctl.l2, static_cast<std::uint8_t>(std::max<int>(lt, 0) / 128));
+        ctl.r2 = std::max(ctl.r2, static_cast<std::uint8_t>(std::max<int>(rt, 0) / 128));
+        if (take_axes & kPadTakeTriggers) lt = rt = 0;
+        // The plugin reads every button; one it takes presses nothing in the game.
+        for (int i = 0; i < kPadInputs; ++i) {
+            if (!held[i]) continue;
+            const std::uint32_t bit = host_pad_input_bit(i);
+            held_now |= bit;
+            if ((panel && (bit & kPanelPadButtons)) || (panel_held_pad & bit)) {
+                held[i] = false;
+                continue;
+            }
+            if (!native_centred && !((panel_plugins && (bit & kPanelPadButtons)) || (plugin_held_pad & bit))) {
+                ctl.buttons |= bit;
+                ctl.play |= host_pad_play_bit(i);
+            }
+            if ((take_buttons | taken_held_pad) & ~dialog_buttons & bit) held[i] = false;
+        }
+        for (int i = 0; i < kPadInputs; ++i) {
+            if (!held[i]) continue;
+            const std::uint32_t play = host_pad_play_bit(i), menu = host_pad_menu_bit(i);
+            p.buttons |= play;
+            if (play != menu) {
+                p.play_buttons |= play;
+                p.menu_buttons |= menu;
+            }
+            // A button bound to L2 or R2 pulls that trigger all the way.
+            if (play == kL2 && i != kPadL2) p.l2 = 255;
+            if (play == kR2 && i != kPadR2) p.r2 = 255;
+        }
+        // The triggers' travel, while they are themselves in play.
+        if (host_pad_play_bit(kPadL2) == kL2) p.l2 = std::max(p.l2, static_cast<std::uint8_t>(lt / 128));
+        if (host_pad_play_bit(kPadR2) == kR2) p.r2 = std::max(p.r2, static_cast<std::uint8_t>(rt / 128));
         // The touchpad, for the DualShock 4 and DualSense that have one. SDL
         // reports fingers normalised; the pad reports them in the surface's
         // own pixels, which is the space scePadGetControllerInformation told
@@ -1592,6 +1974,10 @@ void update_pad() {
     // reads the side from the finger. Its own stable id, so holding it is one
     // touch and it can be held with the key.
     if (back_held) {
+        ctl.buttons |= kTouchPad;
+        ctl.play |= kTouchPad;
+    }
+    if (back_held && !(take_buttons & kTouchPad)) {
         p.buttons |= kTouchPad;
         if (p.touch_count < 2) {
             PadState::Touch& t = p.touch[p.touch_count++];
@@ -1601,6 +1987,10 @@ void update_pad() {
             t.down = true;
         }
     }
+    panel_held_pad = ((panel ? kPanelPadButtons : 0u) | panel_held_pad) & held_now;
+    plugin_held_pad = ((panel_plugins ? kPanelPadButtons : 0u) | plugin_held_pad) & held_now;
+    if (native_centred) ctl.lx = ctl.ly = ctl.rx = ctl.ry = 128, ctl.l2 = ctl.r2 = 0;
+    taken_held_pad = (take_buttons | taken_held_pad) & held_now;
     // The keyboard, DS3-shaped and rebindable (host/bindings.h): each action
     // held sets its pad bit or stick direction.
     //
@@ -1618,35 +2008,70 @@ void update_pad() {
     // The key that ended a text entry stays out of the pad until released.
     const int end_key = g_text_end_key.load(std::memory_order_relaxed);
     if (end_key >= 0 && !(keys && end_key < nkeys && keys[end_key])) g_text_end_key.store(-1, std::memory_order_relaxed);
+    // The panel's keys while it is up, and any of them still held since.
+    static bool panel_held_key[SDL_SCANCODE_COUNT] = {}, plugin_held_key[SDL_SCANCODE_COUNT] = {};
+    if (menu_closed_now) {
+        for (bool& k : panel_held_key) k = true;  // every key held as a centred menu closes: the menu's until let go
+    }
+    bool panel_keys = false;
+    for (int i = 0; i < SDL_SCANCODE_COUNT; ++i) {
+        const bool down_now = keys && i < nkeys && keys[i];
+        panel_held_key[i] = down_now && ((panel && plugin_panel_key(i)) || panel_held_key[i]);
+        panel_keys = panel_keys || panel_held_key[i];
+        // The plugins' read: not the dialog's keys while one is up, nor any key under a centred one in the game's dialog.
+        const bool dialog_key = panel ? plugin_panel_key(i) : plugin_panel_native_key(i);
+        plugin_held_key[i] = down_now && ((panel_plugins && (dialog_key || native_centred)) || plugin_held_key[i] || panel_held_key[i]);
+    }
     if (keys && (SDL_GetKeyboardFocus() == g_window || scripted)) {
         auto down = [&](SDL_Scancode sc) { return sc < nkeys && keys[sc] && static_cast<int>(sc) != g_text_end_key.load(std::memory_order_relaxed); };
-        if (down(SDL_SCANCODE_UP)) p.menu_buttons |= kUp;
-        if (down(SDL_SCANCODE_DOWN)) p.menu_buttons |= kDown;
-        if (down(SDL_SCANCODE_LEFT)) p.menu_buttons |= kLeft;
-        if (down(SDL_SCANCODE_RIGHT)) p.menu_buttons |= kRight;
+        // The panel's keys are the panel's while it is up, and until let go.
+        const auto menu_down = [&](SDL_Scancode sc) { return down(sc) && !panel_held_key[sc]; };
+        if (menu_down(SDL_SCANCODE_UP)) p.menu_buttons |= kUp;
+        if (menu_down(SDL_SCANCODE_DOWN)) p.menu_buttons |= kDown;
+        if (menu_down(SDL_SCANCODE_LEFT)) p.menu_buttons |= kLeft;
+        if (menu_down(SDL_SCANCODE_RIGHT)) p.menu_buttons |= kRight;
         // OK and Return are whichever buttons the game's region decides and
         // returns with (engine/menu_pointer.h).
-        if (down(SDL_SCANCODE_RETURN) || down(SDL_SCANCODE_KP_ENTER)) p.menu_buttons |= menu_confirm_button();
+        if (menu_down(SDL_SCANCODE_RETURN) || menu_down(SDL_SCANCODE_KP_ENTER)) p.menu_buttons |= menu_confirm_button();
         if (down(SDL_SCANCODE_BACKSPACE)) p.menu_buttons |= menu_back_button();
-        if (down(SDL_SCANCODE_ESCAPE)) p.menu_buttons |= kOptions;
+        // (In a plugin's page in the game's dialog Escape goes back, as Backspace does.)
+        if (menu_down(SDL_SCANCODE_ESCAPE)) p.menu_buttons |= dialog_buttons ? menu_back_button() : kOptions;
         if (p.menu_buttons) p.connected = true;
         // A plugin's own read of the keys, and the ones it takes from the game
         // while the mouse turns the camera.
         const bool take = g_take_any_key.load(std::memory_order_relaxed) &&
-                          g_mouse_relative_applied.load(std::memory_order_relaxed);
+                          (g_mouse_relative_applied.load(std::memory_order_relaxed) || panel);
+        // A key a plugin takes stays its own until let go, even once the take
+        // ends (the Escape that ends a photo mode must not open the game's
+        // menu) - but for one a take leaves out while it goes on taking
+        // others, which is the game's at once (g_take_give_key).
+        static bool taken_held_key[SDL_SCANCODE_COUNT] = {};
+        bool taken_keys = false;
         {
             std::lock_guard<std::mutex> lock(g_take_mu);
-            for (int i = 0; i < 512; ++i) g_plugin_keys[i] = i < nkeys && keys[i] ? 1 : 0;
+            for (int i = 0; i < SDL_SCANCODE_COUNT; ++i) {
+                const bool down_now = i < nkeys && keys[i];
+                const bool give = i < 512 && g_take_give_key[i];
+                if (i < 512) g_take_give_key[i] = false;
+                taken_held_key[i] = down_now && ((take && i < 512 && g_take_key[i]) || (taken_held_key[i] && !give));
+                taken_keys = taken_keys || taken_held_key[i];
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_take_mu);
+            for (int i = 0; i < 512; ++i) g_plugin_keys[i] = i < nkeys && keys[i] && !(i < SDL_SCANCODE_COUNT && plugin_held_key[i]) ? 1 : 0;
         }
         bool held[kBindCount];
         const int masked_key = g_text_end_key.load(std::memory_order_relaxed);
-        if (((masked_key >= 0 && masked_key < nkeys) || take) && nkeys <= SDL_SCANCODE_COUNT) {
+        if (((masked_key >= 0 && masked_key < nkeys) || taken_keys || panel_keys) && nkeys <= SDL_SCANCODE_COUNT) {
             bool masked[SDL_SCANCODE_COUNT];
             std::memcpy(masked, keys, static_cast<std::size_t>(nkeys) * sizeof(bool));
             if (masked_key >= 0 && masked_key < nkeys) masked[masked_key] = false;
-            if (take) {
-                std::lock_guard<std::mutex> lock(g_take_mu);
-                for (int i = 0; i < nkeys && i < 512; ++i) masked[i] = masked[i] && !g_take_key[i];
+            if (taken_keys) {
+                for (int i = 0; i < nkeys; ++i) masked[i] = masked[i] && !taken_held_key[i];
+            }
+            if (panel_keys) {
+                for (int i = 0; i < nkeys; ++i) masked[i] = masked[i] && !panel_held_key[i];
             }
             host_bindings_keys_held(masked, nkeys, held);
         } else {
@@ -1677,6 +2102,11 @@ void update_pad() {
     }
     if (!g_pads.empty() || g_window) {
         p.connected = true;  // a window means a player is present
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_ppad_mu);
+        g_ppad = ctl;
+        ppad_latch_locked();
     }
     std::lock_guard<std::mutex> lock(g_pad_mu);
     g_pad = p;
@@ -1721,21 +2151,120 @@ bool host_test_keys_play(const char* path) {
 }
 
 
-void host_window_set_fullscreen(bool on) {
 #if defined(BBHOST_HAVE_SDL3)
-    if (g_want_fullscreen.exchange(on) == on) {
+namespace {
+// Borderless is SDL's fullscreen with no display mode of its own: the desktop's,
+// unchanged. Fullscreen is exclusive: the display set to the mode nearest the
+// resolution, at the desktop's refresh rate - or the desktop's own mode when
+// the display has none that large (a resolution above the display's, drawn
+// and scaled down).
+void apply_window_mode(int mode) {
+    if (mode == 2) {
+        const SDL_DisplayID d = SDL_GetDisplayForWindow(g_window);
+        const SDL_DisplayMode* desk = d ? SDL_GetDesktopDisplayMode(d) : nullptr;
+        SDL_DisplayMode m{};
+        const int w = g_mode_w.load(), h = g_mode_h.load();
+        if (desk && w > 0 && h > 0 && SDL_GetClosestFullscreenDisplayMode(d, w, h, desk->refresh_rate, false, &m)) {
+            SDL_SetWindowFullscreenMode(g_window, &m);
+            host_log("window: fullscreen, %dx%d at %.2f Hz", m.w, m.h, m.refresh_rate);
+        } else {
+            SDL_SetWindowFullscreenMode(g_window, desk);
+            host_log("window: fullscreen at the desktop's mode (none is %dx%d or larger)", w, h);
+        }
+    } else {
+        SDL_SetWindowFullscreenMode(g_window, nullptr);
+        host_log("window: %s", mode == 1 ? "borderless" : "windowed");
+    }
+    SDL_SetWindowFullscreen(g_window, mode != 0);
+}
+}  // namespace
+#endif
+
+
+#if defined(BBHOST_HAVE_SDL3)
+int host_pad_input_of_event(const SDL_Event& e) {
+    if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        for (int i = 0; i < kPadInputs; ++i) {
+            if (pad_sdl_button(i) == e.gbutton.button) return i;
+        }
+    } else if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && e.gaxis.value > 8000) {
+        if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) return kPadL2;
+        if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) return kPadR2;
+    }
+    return -1;
+}
+#endif
+
+void host_window_set_mode(int mode, int width, int height) {
+#if defined(BBHOST_HAVE_SDL3)
+    // Both sizes stored either way: a new resolution moves Fullscreen's mode.
+    bool resized = false;
+    if (width > 0 && height > 0) {
+        resized = g_mode_w.exchange(width) != width;
+        resized = (g_mode_h.exchange(height) != height) || resized;
+    }
+    const int was = g_want_mode.exchange(mode);
+    if (was == mode && !(mode == 2 && resized)) {
         return;
     }
     if (g_window) {
-        SDL_SetWindowFullscreen(g_window, on);
-        host_log("window: %s", on ? "fullscreen" : "windowed");
+        apply_window_mode(mode);
+#if defined(_WIN32)
+        // With Stay borderless on, the swapchain says something in Borderless alone
+        // (exclusive_policy): made again when the mode goes to or from it,
+        // whether or not the window's size changes with it.
+        if (g_want_stay_borderless.load() && (was == 1) != (mode == 1)) g_swap_dirty.store(true);
+#endif
+    }
+#else
+    (void)mode;
+    (void)width;
+    (void)height;
+#endif
+}
+
+void host_window_set_stay_borderless(bool on) {
+#if defined(BBHOST_HAVE_SDL3)
+    if (g_want_stay_borderless.exchange(on) == on) {
+        return;
+    }
+    if (g_window) {
+#if defined(_WIN32)
+        // Only Borderless's swapchain changes (exclusive_policy).
+        const bool borderless = g_want_mode.load() == 1;
+        if (borderless) g_swap_dirty.store(true);
+        host_log("window: stay borderless %s%s", on ? "on" : "off", borderless ? "; the swapchain is made again" : ", for Borderless");
+#else
+        host_log("window: stay borderless %s (it applies on Windows; nothing changes here)", on ? "on" : "off");
+#endif
     }
 #else
     (void)on;
 #endif
 }
 
+namespace {
+// Set as the window shell starts (host_window_start): from then on SDL's
+// video is the window thread's, and host_desktop_refresh_hz - which brings
+// it up and down - is not asked from any other thread. The primary
+// display's desktop rate as the window shell started, which a display that
+// does not say its rate falls back to.
+std::atomic<bool> g_shell_started{false};
+std::atomic<float> g_desktop_hz_at_start{0.0f};
+}  // namespace
+
+float host_display_refresh_hz() {
+    if (const float hz = host_window_refresh_hz(); hz > 0.0f) return hz;
+    // Before the window shell, on the thread that starts it (the frame rate
+    // is chosen as the game's code is patched); after, from any thread - the
+    // game's main loop asks when Display-Limited is chosen while it runs, and
+    // frame generation's half-refresh limit each frame.
+    if (!g_shell_started.load(std::memory_order_acquire)) return host_desktop_refresh_hz();
+    return g_desktop_hz_at_start.load(std::memory_order_relaxed);
+}
+
 float host_window_refresh_hz() {
+    if (const float t = host_test_refresh_hz(); t > 0.0f) return t;  // BBHOST_TEST_REFRESH_HZ (core/portable.h)
 #if defined(BBHOST_HAVE_SDL3)
     if (!g_active.load() || !g_window) return 0.0f;
     // Cached: the flip clock asks once a second, and this walks SDL's display
@@ -1764,6 +2293,12 @@ std::uint64_t host_present_last_ns(std::uint64_t* serial) {
 #else
     *serial = 0;
     return 0;
+#endif
+}
+
+void host_window_recreate_swapchain() {
+#if defined(BBHOST_HAVE_SDL3)
+    g_swap_dirty.store(true);
 #endif
 }
 
@@ -1797,6 +2332,7 @@ bool window_start_impl(int width, int height, const char* title);
 // Windows 11 laptop, every run), while the game ran on without it; the
 // caller is the thread that pumps it (run_guest_start).
 bool host_window_start(int width, int height, const char* title) {
+    g_shell_started.store(true, std::memory_order_release);  // host_display_refresh_hz
 #if defined(BBHOST_HAVE_SDL3) && defined(_WIN32)
     return window_start_impl(width, height, title);
 #elif defined(BBHOST_HAVE_SDL3)
@@ -1849,18 +2385,25 @@ bool window_start_impl(int width, int height, const char* title) {
         host_log("SDL_Init failed: %s", SDL_GetError());
         return false;
     }
-    // The options are read before the window exists, so a saved Fullscreen
-    // is only a wish until here (host_window_set_fullscreen).
-    const bool fullscreen = g_want_fullscreen.load();
+    // What a display that does not say its rate stands for from now on
+    // (host_display_refresh_hz): the primary display's, where the window opens.
+    if (const SDL_DisplayID id = SDL_GetPrimaryDisplay()) {
+        if (const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(id)) g_desktop_hz_at_start.store(m->refresh_rate, std::memory_order_relaxed);
+    }
+    // The options are read before the window exists, so a saved Borderless
+    // or Fullscreen is only a wish until here (host_window_set_mode). Both
+    // start as the desktop's fullscreen; Fullscreen then takes its own mode.
+    const int mode = g_want_mode.load();
     g_window = SDL_CreateWindow(title, width, height,
-                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (fullscreen ? SDL_WINDOW_FULLSCREEN : 0));
-    if (g_window && fullscreen) host_log("window: fullscreen");
+                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | (mode != 0 ? SDL_WINDOW_FULLSCREEN : 0));
+    if (g_window && mode != 0) apply_window_mode(mode);
     if (!g_window) {
         host_log("SDL_CreateWindow failed: %s", SDL_GetError());
         SDL_Quit();
         return false;
     }
     g_window_made.store(true);
+    note_window_display();
     // BBHOST_NO_GAMEPAD=1: ignore controllers, so a test run on a virtual
     // display takes input only from its own script and not from a controller
     // plugged into the machine it runs on (pads_ignored).
@@ -2013,6 +2556,15 @@ bool host_window_pump() {
                 // resize - a tiling window manager's, its fullscreen toggle -
                 // rebuilds it here rather than waiting to be told.
                 g_swap_dirty.store(true);
+                note_window_display();
+                break;
+            // Moved onto another display, or a display's mode changed: the
+            // game's back buffer follows the window's display
+            // (engine/live_resolution.cpp, at its next quiet point).
+            case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+            case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+            case SDL_EVENT_DISPLAY_DESKTOP_MODE_CHANGED:
+                note_window_display();
                 break;
             case SDL_EVENT_MOUSE_MOTION: {
                 // A mouse that is touched, not one that twitches by a pixel.
@@ -2030,8 +2582,10 @@ bool host_window_pump() {
                     if (!g_take_motion.load(std::memory_order_relaxed)) {
                         mouse_camera::add(mouse_camera::g_counts, e.motion.xrel, e.motion.yrel);
                     }
-                    g_plugin_dx += e.motion.xrel;
-                    g_plugin_dy += e.motion.yrel;
+                    for (auto& [reader, r] : g_plugin_reads) {
+                        r.dx += e.motion.xrel;
+                        r.dy += e.motion.yrel;
+                    }
                 }
                 if (!g_mouse_relative.load(std::memory_order_relaxed)) {
                     mouse_moved_locked(e.motion.x, e.motion.y);
@@ -2060,7 +2614,7 @@ bool host_window_pump() {
                 if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
                     g_mouse.buttons |= bit;
                     g_mouse.pressed |= bit;
-                    g_plugin_pressed |= bit;
+                    for (auto& [reader, r] : g_plugin_reads) r.pressed |= bit;
                 } else {
                     g_mouse.buttons &= ~bit;
                     g_mouse.released |= bit;
@@ -2078,7 +2632,7 @@ bool host_window_pump() {
                 }
                 std::lock_guard<std::mutex> lock(g_mouse_mu);
                 g_mouse.wheel += e.wheel.y;
-                g_plugin_wheel += e.wheel.y;
+                for (auto& [reader, r] : g_plugin_reads) r.wheel += e.wheel.y;
                 g_mouse_last_motion = std::chrono::steady_clock::now();
                 break;
             }
@@ -2090,10 +2644,13 @@ bool host_window_pump() {
             // Keyboard focus decides whether SDL delivers input at all: no
             // keys without it, and the controller's events are dropped too
             // (SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS is off), so a game
-            // that ignores every input may be a window that lost focus.
+            // that ignores every input may be a window that lost focus. And
+            // what the presenter is in, when it has been in one call 100 ms
+            // or more (presenter_in_call).
             case SDL_EVENT_WINDOW_FOCUS_GAINED:
             case SDL_EVENT_WINDOW_FOCUS_LOST: {
-                host_log("window: keyboard focus %s", e.type == SDL_EVENT_WINDOW_FOCUS_GAINED ? "gained" : "lost");
+                host_log("window: keyboard focus %s%s", e.type == SDL_EVENT_WINDOW_FOCUS_GAINED ? "gained" : "lost",
+                         presenter_in_call().c_str());
                 // SDL restarted text input with the focus, and the IME with it.
                 std::lock_guard<std::mutex> lock(g_text_mu);
                 if (e.type == SDL_EVENT_WINDOW_FOCUS_GAINED && g_text_on) ime_off_for_ascii_locked();
@@ -2110,12 +2667,13 @@ bool host_window_pump() {
                 // deciding which button is which: a player with only a
                 // controller in hand is never left in a box that only a
                 // keyboard can close. A press, so the button that opened the
-                // box - still held when it appears - does not close it.
+                // box - still held when it appears - does not close it. The
+                // buttons are the menu's, which follow Interact and Dodge
+                // (host_pad_menu_bit).
                 std::lock_guard<std::mutex> lock(g_text_mu);
                 if (!g_text_on || ingame_menu_open()) break;
-                const std::uint32_t bit = e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH  ? kCross
-                                          : e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST ? kCircle
-                                                                                         : 0u;
+                const int input = host_pad_input_of_event(e);
+                const std::uint32_t bit = input >= 0 ? host_pad_menu_bit(input) : 0u;
                 if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START || (bit && bit == menu_confirm_button())) {
                     g_text_result = 1;
                 } else if (bit && bit == menu_back_button()) {
@@ -2182,7 +2740,7 @@ bool host_window_pump() {
     const bool fps_on = host_settings_ref().fps_counter;
     g_fps_on.store(fps_on, std::memory_order_relaxed);
     if (fps_on) {
-        static int shown = 0;
+        static int shown = 0, shown_total = 0;  // the game's frames; with frame generation's, 0 without it
         static std::uint64_t shown_at = 0;
         // Beside it, how busy our work kept the GPU (host/gpu_busy.cpp) over
         // the last three refreshes, about a second. Task Manager's GPU column
@@ -2196,6 +2754,10 @@ bool host_window_pump() {
             double fps = g_fps_avg.load(std::memory_order_relaxed);
             if (last && now > last + 500'000'000) fps = std::min(fps, 1e9 / static_cast<double>(now - last));
             shown = last ? static_cast<int>(fps + 0.5) : 0;
+            // With frame generation, beside it in brackets what is on screen:
+            // the game's frames and the ones generated between them.
+            // (None until AMD's swapchain has been measured: framegen_shown_per_frame 0.)
+            shown_total = last && framegen_active() ? static_cast<int>(fps * framegen_shown_per_frame() + 0.5) : 0;
             shown_at = now;
             const GpuBusy b = host_gpu_busy();
             if (b.on && busy_was[0].on) {
@@ -2221,11 +2783,16 @@ bool host_window_pump() {
             std::lock_guard<std::mutex> ml(g_mouse_mu);
             dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
         }
-        char text[48];
-        if (gpu_pct >= 0) {
-            std::snprintf(text, sizeof(text), "%d FPS  GPU %d%%", shown, gpu_pct);
+        char rate[24], text[48];
+        if (shown_total > 0) {
+            std::snprintf(rate, sizeof(rate), "%d (%d) FPS", shown, shown_total);
         } else {
-            std::snprintf(text, sizeof(text), "%d FPS", shown);
+            std::snprintf(rate, sizeof(rate), "%d FPS", shown);
+        }
+        if (gpu_pct >= 0) {
+            std::snprintf(text, sizeof(text), "%s  GPU %d%%", rate, gpu_pct);
+        } else {
+            std::snprintf(text, sizeof(text), "%s", rate);
         }
         const float scale = 0.8f, w = host_overlay_text_width(scale, text);
         const float x = dw - w - 20.0f, y = 14.0f;
@@ -2242,16 +2809,17 @@ bool host_window_pump() {
         // counts as shared GPU memory, so the two read beside Task Manager's
         // dedicated and shared columns (docs/running.md). Read once a second;
         // the cache from the video memory census, run here every 30 s (2-3 ms
-        // under the renderer's lock).
+        // under the renderer's lock) - when that lock is free: this thread
+        // never waits for it, and tries again the next second.
         static char text[96] = "";
         static std::uint64_t read_at = 0, census_at = 0;
         const std::uint64_t now = host_clock_monotonic_ns();
         if (!read_at || now - read_at >= 1'000'000'000ull) {
             read_at = now;
-            const bool census = !census_at || now - census_at >= 30'000'000'000ull;
+            bool census = !census_at || now - census_at >= 30'000'000'000ull;
             if (census) {
-                census_at = now;
-                host_gpu_memory_census_refresh();
+                census = host_gpu_memory_census_refresh();
+                if (census) census_at = now;
             }
             GpuMemoryGlance m;
             text[0] = '\0';
@@ -2334,7 +2902,11 @@ bool host_window_pump() {
                 dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
                 dh = g_display_h ? static_cast<float>(g_display_h) : 1080.0f;
             }
-            const float scale = 1.25f, w = host_overlay_text_width(scale, text.c_str());
+            // A line wider than the display (a long one at a low resolution,
+            // 960x600 on the Steam Deck) is drawn smaller, to fit.
+            const float room = dw - 64.0f, full = host_overlay_text_width(1.25f, text.c_str());
+            const float scale = full > room && full > 0.0f ? std::max(0.5f, 1.25f * room / full) : 1.25f;
+            const float w = host_overlay_text_width(scale, text.c_str());
             const float x = (dw - w) * 0.5f, y = dh * 0.22f;
             const auto a = [&](std::uint32_t rgba) {
                 return (rgba & 0xffffff00u) | static_cast<std::uint32_t>(static_cast<float>(rgba & 0xffu) * alpha);
@@ -2446,6 +3018,18 @@ bool host_window_pump() {
             if (host_input_device() == InputDevice::Pad) {
                 help = menu_confirm_button() == kCross ? "× / A: 決定   ○ / B: 取消   キーボードで入力"
                                                        : "○ / B: 決定   × / A: 取消   キーボードで入力";
+                // Interact or Dodge moved: the buttons they are on now.
+                int ok = -1, back = -1;
+                for (int i = 0; i < kPadInputs; ++i) {
+                    if (host_pad_menu_bit(i) == menu_confirm_button()) ok = i;
+                    if (host_pad_menu_bit(i) == menu_back_button()) back = i;
+                }
+                if (host_pad_input_bit(ok) != menu_confirm_button() || host_pad_input_bit(back) != menu_back_button()) {
+                    static char moved[96];
+                    std::snprintf(moved, sizeof moved, "%s accepts    %s cancels    Type on a keyboard",
+                                  host_pad_input_name(ok), host_pad_input_name(back));
+                    help = moved;
+                }
             }
             host_overlay_text(bx + 20.0f, by + bh - 30.0f, 0.62f, 0x9a9a9aff, help);
         }
@@ -2613,6 +3197,7 @@ std::thread g_present_thread;
 void present_thread_main() {
     host_thread_set_name("bb-present");
     host_thread_set_class(HostThreadClass::GpuFeed, "bb-present");  // core/host_clock.h
+    g_present_tid.store(host_thread_id(), std::memory_order_relaxed);
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(g_present_mu);
@@ -2682,6 +3267,7 @@ void host_window_stop() {
         std::lock_guard<std::mutex> lock(g_vk.mu);
         g_vk.ok = false;
         host_gpu_lock();
+        framegen_end_for_idle();
         host_gpu_queue_lock();
         vkDeviceWaitIdle(g_vk.device);
         host_gpu_queue_unlock();
@@ -2714,20 +3300,21 @@ MouseState host_mouse_state() {
     return m;
 }
 
-bool host_plugin_input(PluginInput& out) {
+bool host_plugin_input(const char* reader, PluginInput& out) {
     {
         std::lock_guard<std::mutex> lock(g_take_mu);
         std::memcpy(out.key, g_plugin_keys, sizeof(out.key));
     }
     std::lock_guard<std::mutex> lock(g_mouse_mu);
+    // A reader's first read starts its own count of what comes after.
+    PluginReads& r = g_plugin_reads[reader ? reader : ""];
     out.buttons = g_mouse.buttons;
-    out.pressed = g_plugin_pressed;
-    out.dx = g_plugin_dx;
-    out.dy = g_plugin_dy;
-    out.wheel = g_plugin_wheel;
+    out.pressed = r.pressed;
+    out.dx = r.dx;
+    out.dy = r.dy;
+    out.wheel = r.wheel;
     out.playing = g_mouse_relative_applied.load(std::memory_order_relaxed);
-    g_plugin_pressed = 0;
-    g_plugin_dx = g_plugin_dy = g_plugin_wheel = 0.0f;
+    r = PluginReads{};
 #if defined(BBHOST_HAVE_SDL3)
     return g_window != nullptr;
 #else
@@ -2735,18 +3322,123 @@ bool host_plugin_input(PluginInput& out) {
 #endif
 }
 
-void host_plugin_input_take(const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel, bool motion) {
-    {
-        std::lock_guard<std::mutex> lock(g_take_mu);
-        std::memset(g_take_key, 0, sizeof(g_take_key));
-        for (std::size_t i = 0; i < n; ++i) {
-            if (scancodes[i] < 512) g_take_key[scancodes[i]] = true;
+namespace {
+// The owners' takes added up (under g_take_mu).
+void take_sum_locked() {
+    std::memset(g_take_key, 0, sizeof(g_take_key));
+    bool any = false, wheel = false, motion = false;
+    std::uint32_t mouse = 0, pad = 0, axes = 0;
+    for (const auto& [owner, s] : g_take_slots) {
+        for (const std::uint16_t k : s.keys) {
+            if (k >= 512) continue;
+            g_take_key[k] = true;
+            g_take_give_key[k] = false;  // taken (again): nothing to give back
+            any = true;
         }
-        g_take_any_key.store(n > 0, std::memory_order_relaxed);
+        mouse |= s.mouse;
+        wheel = wheel || s.wheel;
+        motion = motion || s.motion;
+        pad |= s.pad;
+        axes |= s.axes;
     }
-    g_take_buttons.store(buttons, std::memory_order_relaxed);
+    g_take_any_key.store(any, std::memory_order_relaxed);
+    g_take_buttons.store(mouse, std::memory_order_relaxed);
     g_take_wheel.store(wheel, std::memory_order_relaxed);
     g_take_motion.store(motion, std::memory_order_relaxed);
+    const std::uint32_t was_b = g_ppad_take_buttons.exchange(pad, std::memory_order_relaxed);
+    const std::uint32_t was_a = g_ppad_take_axes.exchange(axes, std::memory_order_relaxed);
+    if (was_b != pad || was_a != axes)
+        host_log("pad: the plugins take buttons %05x and axes %x from the game (was %05x, %x)", pad, axes, was_b, was_a);
+}
+
+void take_settle_locked(const std::string& owner) {
+    const auto it = g_take_slots.find(owner);
+    if (it != g_take_slots.end() && it->second.empty()) g_take_slots.erase(it);
+    take_sum_locked();
+}
+}  // namespace
+
+void host_plugin_input_take(const char* owner, const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel,
+                            bool motion) {
+    const std::string who = owner ? owner : "";
+    std::lock_guard<std::mutex> lock(g_take_mu);
+    TakeSlot& s = g_take_slots[who];
+    std::vector<std::uint16_t> keys;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (scancodes[i] < 512) keys.push_back(scancodes[i]);
+    }
+    // A key left out of a take that goes on is the game's again at once; one
+    // held as the take ends altogether stays taken until let go.
+    if (!keys.empty()) {
+        for (const std::uint16_t k : s.keys) {
+            if (std::find(keys.begin(), keys.end(), k) == keys.end()) g_take_give_key[k] = true;
+        }
+    }
+    const bool changed = s.keys != keys || s.mouse != buttons || s.wheel != wheel || s.motion != motion;
+    s.keys = std::move(keys);
+    s.mouse = buttons;
+    s.wheel = wheel;
+    s.motion = motion;
+    if (changed) {
+        host_log("input: %s takes %zu key(s), mouse buttons %x%s%s", who.empty() ? "a plugin" : who.c_str(), s.keys.size(), buttons,
+                 wheel ? ", the wheel" : "", motion ? ", the motion" : "");
+    }
+    take_settle_locked(who);
+}
+
+void host_plugin_pad(PluginPad& out) {
+    std::lock_guard<std::mutex> lock(g_ppad_mu);
+    const PluginPad& a = g_ppad;
+    const PluginPad& t = g_ppad_test;
+    // A test's tap holds a stick over for the controller it stands for.
+    const auto pick = [](std::uint8_t pad, std::uint8_t tap) { return tap != kStickRest ? tap : pad; };
+    out.buttons = a.buttons | t.buttons;
+    out.play = a.play | t.buttons;  // a test's taps are the game's buttons already
+    out.lx = pick(a.lx, t.lx);
+    out.ly = pick(a.ly, t.ly);
+    out.rx = pick(a.rx, t.rx);
+    out.ry = pick(a.ry, t.ry);
+    out.l2 = std::max(a.l2, t.l2);
+    out.r2 = std::max(a.r2, t.r2);
+    out.connected = a.connected || t.connected;
+    out.pressed = g_ppad_frame;
+}
+
+void host_plugin_pad_frame() {
+    std::lock_guard<std::mutex> lock(g_ppad_mu);
+    g_ppad_frame = g_ppad_pressed;
+    g_ppad_pressed = 0;
+}
+
+void host_plugin_pad_take(const char* owner, std::uint32_t buttons, std::uint32_t axes) {
+    const std::string who = owner ? owner : "";
+    std::lock_guard<std::mutex> lock(g_take_mu);
+    TakeSlot& s = g_take_slots[who];
+    // As the keys: left out of a take that goes on, given back at once.
+    if (buttons) g_ppad_give.fetch_or(s.pad & ~buttons, std::memory_order_relaxed);
+    s.pad = buttons;
+    s.axes = axes;
+    take_settle_locked(who);
+}
+
+void host_plugin_take_drop(const char* owner) {
+    const std::string who = owner ? owner : "";
+    std::lock_guard<std::mutex> lock(g_take_mu);
+    if (g_take_slots.erase(who)) take_sum_locked();
+}
+
+std::uint32_t host_plugin_pad_taken_buttons() { return g_ppad_take_buttons.load(std::memory_order_relaxed); }
+std::uint32_t host_plugin_pad_taken_axes() { return g_ppad_take_axes.load(std::memory_order_relaxed); }
+
+void host_plugin_pad_test(std::uint32_t buttons, std::uint8_t lx, std::uint8_t ly, std::uint8_t rx, std::uint8_t ry) {
+    std::lock_guard<std::mutex> lock(g_ppad_mu);
+    g_ppad_test.buttons = buttons;
+    g_ppad_test.lx = lx;
+    g_ppad_test.ly = ly;
+    g_ppad_test.rx = rx;
+    g_ppad_test.ry = ry;
+    if (buttons || lx != kStickRest || ly != kStickRest || rx != kStickRest || ry != kStickRest) g_ppad_test.connected = true;
+    ppad_latch_locked();
 }
 
 std::uint32_t host_plugin_taken_buttons() { return g_take_buttons.load(std::memory_order_relaxed); }
@@ -2894,6 +3586,45 @@ void host_window_on_pixels(void (*fn)(int, int)) {
     g_on_pixels.store(fn, std::memory_order_release);
     int w = 0, h = 0;
     if (fn && host_window_pixels(&w, &h)) fn(w, h);
+}
+
+// The size of the display the window is on, as the window's thread last saw
+// it (note_window_display): w << 32 | h, 0 before the window is made. Read
+// from any thread (host_window_display_now) - the game's frame end polls it
+// for the display buffers (engine/live_resolution.cpp).
+std::atomic<std::uint64_t> g_window_display{0};
+void note_window_display() {
+    int w = 0, h = 0;
+    if (!host_window_desktop_size(&w, &h)) return;
+    const std::uint64_t v = static_cast<std::uint64_t>(w) << 32 | static_cast<std::uint32_t>(h);
+    const std::uint64_t was = g_window_display.exchange(v, std::memory_order_relaxed);
+    if (was != v && was) host_log("window: on a %dx%d display now (was %llux%llu)", w, h, static_cast<unsigned long long>(was >> 32),
+                                  static_cast<unsigned long long>(was & 0xffffffffu));
+}
+
+bool host_window_display_now(int* w, int* h) {
+    const std::uint64_t v = g_window_display.load(std::memory_order_relaxed);
+    if (!v) return false;
+    *w = static_cast<int>(v >> 32);
+    *h = static_cast<int>(v & 0xffffffffu);
+    return true;
+}
+
+bool host_window_desktop_size(int* w, int* h) {
+#if defined(BBHOST_HAVE_SDL3)
+    if (!g_window_made.load() || !g_window) return false;
+    const SDL_DisplayID d = SDL_GetDisplayForWindow(g_window);
+    const SDL_DisplayMode* m = d ? SDL_GetDesktopDisplayMode(d) : nullptr;
+    if (!m || m->w <= 0 || m->h <= 0) return false;
+    const float k = m->pixel_density > 0.0f ? m->pixel_density : 1.0f;
+    *w = static_cast<int>(static_cast<float>(m->w) * k + 0.5f);
+    *h = static_cast<int>(static_cast<float>(m->h) * k + 0.5f);
+    return true;
+#else
+    (void)w;
+    (void)h;
+    return false;
+#endif
 }
 
 bool host_window_pixels(int* w, int* h) {
